@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Start the development stack from scratch and wait for the broker. The
+# control plane keeps its state in memory, so the broker's log is reset with
+# it: a log that outlived its control plane would no longer match it.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+docker compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+mkdir -p state
+if ! docker compose up --detach; then
+  docker compose logs >&2
+  exit 1
+fi
+
+for _ in $(seq 1 90); do
+  if curl -fsS http://127.0.0.1:8080/ready >/dev/null 2>&1; then
+    echo "Felix is ready. For the gateway:"
+    echo "  export CANVAS_FELIX_TOKEN=\"\$(cat dev/state/gateway.token)\""
+    echo "  export CANVAS_FELIX_CA_FILE=dev/state/broker-cert.pem"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "the broker did not become ready" >&2
+docker compose ps --all >&2
+docker compose logs >&2
+exit 1

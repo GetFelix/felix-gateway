@@ -1,0 +1,75 @@
+# Felix for local development and CI: a control plane, one broker, a stand-in
+# IdP, and a one-shot seed that creates the room's streams and tokens.
+# `dev/up.sh` starts it and waits until the broker is ready.
+name: felix-canvas
+
+services:
+  idp:
+    image: node:24-alpine
+    command: ["node", "/app/idp.mjs"]
+    volumes:
+      - ./idp.mjs:/app/idp.mjs:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9400/jwks.json"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  controlplane:
+    image: ghcr.io/gabloe/felix-controlplane:0.6.0-preview
+    environment:
+      # In-memory store: a restart of the stack starts from nothing.
+      FELIX_BOOTSTRAP_ENABLED: "true"
+      FELIX_BOOTSTRAP_BIND_ADDR: 0.0.0.0:9095
+      FELIX_BOOTSTRAP_TOKEN: dev-bootstrap
+      # The dev IdP is plain HTTP on the compose network.
+      FELIX_CONTROLPLANE_OIDC_ALLOW_INSECURE_HTTP: "true"
+      # The gateway reads its token once from the environment, and the broker
+      # reads its credential once at startup, so the default 15 minutes would
+      # end a dev session early.
+      FELIX_EXCHANGE_TOKEN_TTL_SECONDS: "86400"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8443:8443"
+    depends_on:
+      idp:
+        condition: service_healthy
+
+  seed:
+    image: node:24-alpine
+    command: ["node", "/app/seed.mjs"]
+    volumes:
+      - ./seed.mjs:/app/seed.mjs:ro
+      - ./state:/state
+    depends_on:
+      controlplane:
+        condition: service_healthy
+
+  broker:
+    image: ghcr.io/gabloe/felix-broker:0.6.0-preview
+    environment:
+      FELIX_CONTROLPLANE_URL: http://controlplane:8443
+      FELIX_NODE_TOKEN_FILE: /state/node.token
+      FELIX_DURABLE_STORAGE_DIR: /var/lib/felix
+      FELIX_TLS_CERT_EXPORT: /state/broker-cert.pem
+      # One listener, so the one published UDP port is the only one clients use.
+      FELIX_QUIC_LISTENERS: "1"
+      # Acknowledge after the write, so acks carry the record's log offset.
+      FELIX_ACK_ON_COMMIT: "true"
+      # Small delivery batches: a canvas wants latency, not throughput.
+      FELIX_EVENT_BATCH_MAX_EVENTS: "8"
+      FELIX_EVENT_BATCH_MAX_DELAY_US: "100"
+      FELIX_FANOUT_BATCH: "8"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:5000:5000/udp"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./state:/state
+      - felix-data:/var/lib/felix
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+volumes:
+  felix-data:
