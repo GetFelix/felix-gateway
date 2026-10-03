@@ -22,8 +22,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::Router;
 use axum::extract::{State, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
-use axum::routing::get;
+use axum::routing::{get, post};
 
 pub use config::Config;
 pub use metrics::{Metrics, Snapshot, Summary};
@@ -50,10 +51,12 @@ impl Gateway {
         })
     }
 
-    /// The HTTP routes: `/ws` for browsers and `/metrics` for latency.
+    /// The HTTP routes: `/ws` for browsers, `/members/leave` for a closing
+    /// tab's goodbye, and `/metrics` for latency.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/ws", get(websocket))
+            .route("/members/leave", post(leave))
             .route("/metrics", get(metrics))
             .with_state(self.clone())
     }
@@ -72,6 +75,19 @@ async fn websocket(State(gateway): State<Gateway>, upgrade: WebSocketUpgrade) ->
             gateway.metrics,
         )
     })
+}
+
+/// Delete the member entry named by the body. A closing tab sends this with
+/// `navigator.sendBeacon`, which outlives the page; a WebSocket message sent
+/// while the page unloads may never leave it.
+async fn leave(State(gateway): State<Gateway>, key: String) -> impl IntoResponse {
+    if !relay::valid_key(&key) {
+        return (StatusCode::BAD_REQUEST, relay::BAD_KEY.to_string());
+    }
+    match gateway.felix.remove_member(&key).await {
+        Ok(()) => (StatusCode::NO_CONTENT, String::new()),
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("{err:#}")),
+    }
 }
 
 async fn metrics(State(gateway): State<Gateway>) -> Json<Snapshot> {

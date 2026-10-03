@@ -4,17 +4,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use felix_client::{CursorErrorReason, SubscribeCursorError};
+use felix_client::{CacheChange, CacheWatchItem, CursorErrorReason, SubscribeCursorError};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::felix::Felix;
 use crate::metrics::Metrics;
-use crate::protocol::{ClientMessage, CounterName, ErrorCode, ServerMessage, StartAt, StreamName};
+use crate::protocol::{
+    ClientMessage, CounterName, ErrorCode, MemberEntry, ServerMessage, StartAt, StreamName,
+};
 use crate::transport::{BrowserConnection, Incoming};
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -24,14 +26,22 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// loss shows up as an offset gap instead of happening silently here.
 const EVENT_QUEUE: usize = 1024;
 
-/// Publishes waiting for Felix. A browser that outruns this stops being read.
-const PUBLISH_QUEUE: usize = 256;
+/// Writes waiting for Felix. A browser that outruns this stops being read.
+const WRITE_QUEUE: usize = 256;
 
-struct Publish {
-    stream: StreamName,
-    payload: Vec<u8>,
-    ack: bool,
-    id: u64,
+/// A write that must reach Felix in the order the browser sent it.
+enum Write {
+    Publish {
+        stream: StreamName,
+        payload: Vec<u8>,
+        ack: bool,
+        id: u64,
+    },
+    /// Set (`Some`) or delete (`None`) a member entry.
+    Member {
+        key: String,
+        payload: Option<Vec<u8>>,
+    },
 }
 
 /// Relay one browser connection until it closes.
@@ -43,21 +53,23 @@ pub(crate) async fn run<C: BrowserConnection>(
     let (events_tx, mut events_rx) = mpsc::channel(EVENT_QUEUE);
     // Unbounded so the publish task never waits on the browser, which is what
     // lets the loop below block on a full publish queue without deadlocking.
-    // Its length is bounded by PUBLISH_QUEUE anyway: one reply per publish.
+    // Its length is bounded by WRITE_QUEUE anyway: one reply per write.
     let (replies_tx, mut replies_rx) = mpsc::unbounded_channel();
-    let (publish_tx, publish_rx) = mpsc::channel(PUBLISH_QUEUE);
-    let publisher = tokio::spawn(publish_in_order(
-        publish_rx,
+    let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE);
+    let writer = tokio::spawn(write_in_order(
+        write_rx,
         Arc::clone(&felix),
         Arc::clone(&metrics),
         replies_tx.clone(),
     ));
     let mut subscriptions: HashMap<StreamName, JoinHandle<()>> = HashMap::new();
+    let mut members_watch: Option<JoinHandle<()>> = None;
     let mut ping = tokio::time::interval(PING_INTERVAL);
 
     let hello = ServerMessage::Hello {
         namespace: felix.namespace().to_string(),
         room: felix.room().to_string(),
+        member_ttl_ms: u64::try_from(felix.member_ttl().as_millis()).unwrap_or(u64::MAX),
     };
     let hello = serde_json::to_string(&hello).expect("server messages serialize");
     if conn.send(hello).await.is_err() {
@@ -88,8 +100,8 @@ pub(crate) async fn run<C: BrowserConnection>(
                     Ok(ClientMessage::Publish { stream, payload, ack, id }) => {
                         match BASE64.decode(payload) {
                             Ok(payload) => {
-                                let publish = Publish { stream, payload, ack, id };
-                                if publish_tx.send(publish).await.is_err() {
+                                let publish = Write::Publish { stream, payload, ack, id };
+                                if write_tx.send(publish).await.is_err() {
                                     break;
                                 }
                                 continue;
@@ -97,9 +109,40 @@ pub(crate) async fn run<C: BrowserConnection>(
                             Err(err) => error(Some(id), Some(stream), ErrorCode::BadRequest, err),
                         }
                     }
+                    Ok(ClientMessage::SetMember { key, payload }) => {
+                        match BASE64.decode(payload) {
+                            Ok(_) if !valid_key(&key) => {
+                                error(None, None, ErrorCode::BadRequest, BAD_KEY)
+                            }
+                            Ok(payload) => {
+                                let write = Write::Member { key, payload: Some(payload) };
+                                if write_tx.send(write).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(err) => error(None, None, ErrorCode::BadRequest, err),
+                        }
+                    }
+                    Ok(ClientMessage::RemoveMember { key }) => {
+                        if valid_key(&key) {
+                            if write_tx.send(Write::Member { key, payload: None }).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        error(None, None, ErrorCode::BadRequest, BAD_KEY)
+                    }
+                    Ok(ClientMessage::WatchMembers) => {
+                        let task = tokio::spawn(relay_members(Arc::clone(&felix), events_tx.clone()));
+                        if let Some(previous) = members_watch.replace(task) {
+                            previous.abort();
+                        }
+                        continue;
+                    }
                     Ok(ClientMessage::CounterAdd { counter, key, delta, id }) => {
-                        if !valid_counter_key(&key) {
-                            error(Some(id), None, ErrorCode::BadRequest, BAD_COUNTER_KEY)
+                        if !valid_key(&key) {
+                            error(Some(id), None, ErrorCode::BadRequest, BAD_KEY)
                         } else {
                             tokio::spawn(add_to_counter(
                                 counter,
@@ -134,47 +177,62 @@ pub(crate) async fn run<C: BrowserConnection>(
         }
     }
 
-    for task in subscriptions.into_values() {
+    for task in subscriptions.into_values().chain(members_watch) {
         task.abort();
     }
-    // Publishes already handed over still complete; only their replies are lost.
-    drop(publish_tx);
-    let _ = publisher.await;
+    // Writes already handed over still complete, so a closing session's
+    // member delete lands; only their replies are lost.
+    drop(write_tx);
+    let _ = writer.await;
 }
 
-/// Publish one at a time, in the order the browser sent them, so a session's
-/// ops reach the log in its own `seq` order.
-async fn publish_in_order(
-    mut queue: mpsc::Receiver<Publish>,
+/// Write one at a time, in the order the browser sent them, so a session's
+/// ops reach the log in its own `seq` order and a member delete is never
+/// overtaken by the refresh before it.
+async fn write_in_order(
+    mut queue: mpsc::Receiver<Write>,
     felix: Arc<Felix>,
     metrics: Arc<Metrics>,
     replies: mpsc::UnboundedSender<ServerMessage>,
 ) {
-    while let Some(Publish {
-        stream,
-        payload,
-        ack,
-        id,
-    }) = queue.recv().await
-    {
-        let started = Instant::now();
-        let reply = match felix.publish(stream, payload, ack).await {
-            Ok(offset) if ack => {
-                metrics.record_felix_ack(stream, started.elapsed());
-                ServerMessage::Ack { id, offset }
+    while let Some(write) = queue.recv().await {
+        let reply = match write {
+            Write::Publish {
+                stream,
+                payload,
+                ack,
+                id,
+            } => {
+                let started = Instant::now();
+                match felix.publish(stream, payload, ack).await {
+                    Ok(offset) if ack => {
+                        metrics.record_felix_ack(stream, started.elapsed());
+                        ServerMessage::Ack { id, offset }
+                    }
+                    Ok(_) => continue,
+                    Err(err) => error(Some(id), Some(stream), ErrorCode::PublishFailed, err),
+                }
             }
-            Ok(_) => continue,
-            Err(err) => error(Some(id), Some(stream), ErrorCode::PublishFailed, err),
+            Write::Member { key, payload } => {
+                let written = match payload {
+                    Some(payload) => felix.set_member(&key, payload).await,
+                    None => felix.remove_member(&key).await,
+                };
+                match written {
+                    Ok(()) => continue,
+                    Err(err) => error(None, None, ErrorCode::MemberFailed, err),
+                }
+            }
         };
         let _ = replies.send(reply);
     }
 }
 
-const BAD_COUNTER_KEY: &str = "a counter key is 1 to 64 ASCII letters, digits, '-' or '_'";
+pub(crate) const BAD_KEY: &str = "a key is 1 to 64 ASCII letters, digits, '-' or '_'";
 
 // Keys become part of a Felix cache key shared by every connection, so they
 // are kept to a plain alphabet rather than passed through.
-fn valid_counter_key(key: &str) -> bool {
+pub(crate) fn valid_key(key: &str) -> bool {
     (1..=64).contains(&key.len())
         && key
             .bytes()
@@ -272,6 +330,77 @@ fn subscription_error(stream: StreamName, code: ErrorCode, err: anyhow::Error) -
             message: format!("{err:#}"),
         },
         None => error(None, Some(stream), code, err),
+    }
+}
+
+/// Relay the room's member entries: the current set as one message, then
+/// each change.
+async fn relay_members(felix: Arc<Felix>, events: mpsc::Sender<ServerMessage>) {
+    let mut watch = match felix.watch_members().await {
+        Ok(watch) => watch,
+        Err(err) => {
+            let _ = events
+                .send(error(None, None, ErrorCode::WatchFailed, err))
+                .await;
+            return;
+        }
+    };
+    let prefix = felix.member_prefix();
+    let mut retained = watch.retained_count().unwrap_or(0);
+    let mut initial = Some(Vec::new());
+    let ended = loop {
+        if retained == 0
+            && let Some(members) = initial.take()
+            && events
+                .send(ServerMessage::Members { members })
+                .await
+                .is_err()
+        {
+            return;
+        }
+        match watch.recv().await {
+            Some(CacheWatchItem::Change(change)) => {
+                let entry = member_entry(&prefix, change);
+                match initial.as_mut() {
+                    Some(members) => {
+                        retained -= 1;
+                        if entry.payload.is_some() {
+                            members.push(entry);
+                        }
+                    }
+                    None => {
+                        if events.send(ServerMessage::Member(entry)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Some(CacheWatchItem::Lagged { .. }) => break "the member watch fell behind",
+            // The watch follows a moved shard on the next recv.
+            Some(CacheWatchItem::ShardMoved(_)) => {}
+            None => break "the member watch ended",
+        }
+    };
+    let _ = events
+        .send(error(None, None, ErrorCode::WatchFailed, ended))
+        .await;
+}
+
+fn member_entry(prefix: &str, change: CacheChange) -> MemberEntry {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    MemberEntry {
+        key: change
+            .key
+            .strip_prefix(prefix)
+            .unwrap_or(&change.key)
+            .to_string(),
+        payload: change.value.map(|value| BASE64.encode(value)),
+        expires_in_ms: (change.expires_at_millis != 0)
+            .then(|| change.expires_at_millis.saturating_sub(now)),
     }
 }
 

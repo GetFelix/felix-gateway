@@ -1,11 +1,13 @@
 // The browser half of the gateway protocol. docs/protocol.md is the reference.
 
+import type { MemberEntry } from "./members.js";
+
 /** The room's two streams. */
 export type StreamName = "ops" | "presence";
 
 /** Messages the gateway sends. */
 export type ServerMessage =
-  | { type: "hello"; namespace: string; room: string }
+  | { type: "hello"; namespace: string; room: string; member_ttl_ms: number }
   | {
       type: "subscribed";
       stream: StreamName;
@@ -22,6 +24,8 @@ export type ServerMessage =
   | { type: "ack"; id: number; offset: number | null }
   | { type: "counter"; id: number; value: number }
   | { type: "snapshot"; id: number; payload: string | null }
+  | { type: "members"; members: WireMember[] }
+  | ({ type: "member" } & WireMember)
   | {
       type: "error";
       id?: number;
@@ -33,10 +37,18 @@ export type ServerMessage =
         | "subscription_ended"
         | "counter_failed"
         | "snapshot_failed"
-        | "trimmed";
+        | "trimmed"
+        | "member_failed"
+        | "watch_failed";
       oldest?: number;
       message: string;
     };
+
+interface WireMember {
+  key: string;
+  payload: string | null;
+  expires_in_ms: number | null;
+}
 
 /** One record delivered on a stream. */
 export interface GatewayEvent {
@@ -69,8 +81,15 @@ interface Pending {
  * through the callbacks; publishes resolve with the record's log offset.
  */
 export class GatewayClient {
-  /** Called once, first, with the room this gateway serves. */
-  onHello: (namespace: string, room: string) => void = () => {};
+  /**
+   * Called once, first, with the room this gateway serves and how long a
+   * member entry lasts without a refresh.
+   */
+  onHello: (namespace: string, room: string, memberTtlMs: number) => void = () => {};
+  /** Called with every member entry when a member watch starts. */
+  onMembers: (members: MemberEntry[]) => void = () => {};
+  /** Called for each member entry written or deleted after that. */
+  onMember: (member: MemberEntry) => void = () => {};
   /** Called for every event, in the order the broker delivered them. */
   onEvent: (event: GatewayEvent) => void = () => {};
   /** Called once a subscription is registered with the broker. */
@@ -147,6 +166,21 @@ export class GatewayClient {
     return payload === null ? null : fromBase64(payload);
   }
 
+  /** Write this session's member entry; it expires unless written again in time. */
+  setMember(key: string, payload: Uint8Array): void {
+    this.#send({ type: "set_member", key, payload: toBase64(payload) });
+  }
+
+  /** Delete this session's member entry. */
+  removeMember(key: string): void {
+    this.#send({ type: "remove_member", key });
+  }
+
+  /** Watch the room's member entries. Replaces an earlier watch. */
+  watchMembers(): void {
+    this.#send({ type: "watch_members" });
+  }
+
   close(): void {
     this.#socket.close();
   }
@@ -173,10 +207,16 @@ export class GatewayClient {
         });
         break;
       case "hello":
-        this.onHello(message.namespace, message.room);
+        this.onHello(message.namespace, message.room, message.member_ttl_ms);
         break;
       case "subscribed":
         this.onSubscribed(message.stream, message.start_offset, message.live_offset);
+        break;
+      case "members":
+        this.onMembers(message.members.map(memberEntry));
+        break;
+      case "member":
+        this.onMember(memberEntry(message));
         break;
       case "counter":
         this.#take(message.id)?.resolve(message.value);
@@ -206,6 +246,14 @@ export class GatewayClient {
     this.#pending.delete(id);
     return pending;
   }
+}
+
+function memberEntry(member: WireMember): MemberEntry {
+  return {
+    key: member.key,
+    payload: member.payload === null ? null : fromBase64(member.payload),
+    expiresInMs: member.expires_in_ms,
+  };
 }
 
 function toBase64(bytes: Uint8Array): string {

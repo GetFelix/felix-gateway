@@ -65,6 +65,14 @@ pub enum ClientMessage {
     /// Read the room's snapshot. The gateway answers with a
     /// [`ServerMessage::Snapshot`] carrying the same `id`.
     SnapshotGet { id: u64 },
+    /// Write this session's member entry, `canvas.presence/<room>:<key>`,
+    /// expiring after the gateway's member TTL unless written again.
+    SetMember { key: String, payload: String },
+    /// Delete a member entry, for a session that is closing.
+    RemoveMember { key: String },
+    /// Send the room's members as one [`ServerMessage::Members`], then every
+    /// change as a [`ServerMessage::Member`]. Replaces an earlier watch.
+    WatchMembers,
 }
 
 /// A message to the browser.
@@ -72,7 +80,12 @@ pub enum ClientMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// The first message on every connection: which room this gateway serves.
-    Hello { namespace: String, room: String },
+    Hello {
+        namespace: String,
+        room: String,
+        /// How long a member entry lasts without a refresh.
+        member_ttl_ms: u64,
+    },
     /// The subscription is registered with the broker: anything published
     /// from here on will be delivered.
     Subscribed {
@@ -104,6 +117,10 @@ pub enum ServerMessage {
     /// The room's snapshot for the `snapshot_get` with this `id`: base64 bytes
     /// as the snapshotter wrote them, or `null` when it has written none.
     Snapshot { id: u64, payload: Option<String> },
+    /// Every member entry in the room when the watch started.
+    Members { members: Vec<MemberEntry> },
+    /// One member entry was written or deleted.
+    Member(MemberEntry),
     /// Something the browser asked for failed.
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +155,22 @@ pub enum ErrorCode {
     /// The subscription asked for an offset the log no longer holds. Start
     /// again from the snapshot.
     Trimmed,
+    /// Felix refused or lost a member write or delete.
+    MemberFailed,
+    /// The member watch was refused or stopped. Watch again.
+    WatchFailed,
+}
+
+/// One member entry, keyed without the room prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberEntry {
+    pub key: String,
+    /// The entry's value, base64; `null` when it was deleted.
+    pub payload: Option<String>,
+    /// Milliseconds until the entry expires, by the gateway's clock; `null`
+    /// for an entry that never does. Felix sends nothing when an entry
+    /// expires, so the browser drops it itself at this deadline.
+    pub expires_in_ms: Option<u64>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -203,6 +236,36 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&none).unwrap(),
             json!({"type": "snapshot", "id": 5, "payload": null})
+        );
+    }
+
+    #[test]
+    fn parses_member_messages() {
+        let set: ClientMessage =
+            serde_json::from_value(json!({"type": "set_member", "key": "00ff", "payload": "AQI="}))
+                .unwrap();
+        assert_eq!(
+            set,
+            ClientMessage::SetMember {
+                key: "00ff".into(),
+                payload: "AQI=".into()
+            }
+        );
+        let watch: ClientMessage =
+            serde_json::from_value(json!({"type": "watch_members"})).unwrap();
+        assert_eq!(watch, ClientMessage::WatchMembers);
+    }
+
+    #[test]
+    fn serializes_a_member_change_flat() {
+        let left = ServerMessage::Member(MemberEntry {
+            key: "00ff".into(),
+            payload: None,
+            expires_in_ms: None,
+        });
+        assert_eq!(
+            serde_json::to_value(&left).unwrap(),
+            json!({"type": "member", "key": "00ff", "payload": null, "expires_in_ms": null})
         );
     }
 

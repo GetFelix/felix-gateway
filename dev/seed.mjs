@@ -74,7 +74,7 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
       { subject: "role:broker", object: "cluster:*", action: "node.view" },
       { subject: "role:gateway", object: streams, action: "stream.publish" },
       { subject: "role:gateway", object: streams, action: "stream.subscribe" },
-      // Counters authorize as cache writes.
+      // Counters authorize as cache writes; watching member entries is a read.
       { subject: "role:gateway", object: caches, action: "cache.write" },
       { subject: "role:gateway", object: caches, action: "cache.read" },
       // Subscribing also grants polling the snapshotter's consumer group.
@@ -118,14 +118,16 @@ for (const [name, durable] of [
   });
 }
 
+// One shard each: a prefix watch reads a single shard, and the member list is one.
 for (const [cache, display_name] of [
   ["canvas.seq", "Op sequence per session"],
   ["canvas.snap", "Room snapshots"],
+  ["canvas.presence", "Room members"],
 ]) {
   console.log(`cache ${cache}`);
   await request("POST", `${CONTROL_PLANE}/v1/tenants/${TENANT}/namespaces/${NAMESPACE}/caches`, {
     token: admin,
-    body: { cache, display_name },
+    body: { cache, display_name, shards: 1 },
   });
 }
 

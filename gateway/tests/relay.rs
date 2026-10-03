@@ -58,6 +58,7 @@ impl Browser {
         let hello = browser.recv().await;
         assert_eq!(hello["type"], "hello", "the first message names the room");
         assert!(hello["room"].is_string(), "{hello}");
+        assert!(hello["member_ttl_ms"].as_u64() > Some(0), "{hello}");
         browser
     }
 
@@ -96,6 +97,28 @@ impl Browser {
         self.send(json!({"type": "subscribe", "stream": stream, "from": from}))
             .await;
         self.recv_type("subscribed").await
+    }
+
+    /// The next change to the member entry `key`.
+    async fn member_change(&mut self, key: &str) -> Value {
+        loop {
+            let change = self.recv_type("member").await;
+            if change["key"] == key {
+                return change;
+            }
+        }
+    }
+
+    /// The keys in the next full member list.
+    async fn member_keys(&mut self) -> Vec<String> {
+        self.send(json!({"type": "watch_members"})).await;
+        let list = self.recv_type("members").await;
+        list["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["key"].as_str().unwrap().to_string())
+            .collect()
     }
 
     /// Publish without waiting for the ack; returns the request id.
@@ -365,6 +388,65 @@ async fn a_room_without_a_snapshot_answers_null() {
     browser.send(json!({"type": "snapshot_get", "id": 3})).await;
     let reply = browser.recv_type("snapshot").await;
     assert_eq!(reply, json!({"type": "snapshot", "id": 3, "payload": null}));
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn members_are_listed_watched_and_expire() {
+    let mut config = config();
+    config.member_ttl = Duration::from_secs(2);
+    let (_gateway, addr) = serve(config).await;
+    let key = run_tag("member").replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let mut watcher = Browser::open(addr).await;
+    assert!(!watcher.member_keys().await.contains(&key));
+
+    let mut member = Browser::open(addr).await;
+    let set = json!({"type": "set_member", "key": key, "payload": BASE64.encode("ana")});
+    member.send(set.clone()).await;
+    let change = watcher.member_change(&key).await;
+    assert_eq!(change["payload"], BASE64.encode("ana"));
+    let expires_in = change["expires_in_ms"]
+        .as_u64()
+        .expect("member entries expire");
+    assert!((1..=2000).contains(&expires_in), "{change}");
+
+    member
+        .send(json!({"type": "remove_member", "key": key}))
+        .await;
+    assert_eq!(watcher.member_change(&key).await["payload"], Value::Null);
+
+    member.send(set.clone()).await;
+    watcher.member_change(&key).await;
+    assert_eq!(http_post(addr, "/members/leave", &key).await, 204);
+    assert_eq!(watcher.member_change(&key).await["payload"], Value::Null);
+    assert_eq!(http_post(addr, "/members/leave", "a:b").await, 400);
+
+    member.send(set).await;
+    watcher.member_change(&key).await;
+    assert!(Browser::open(addr).await.member_keys().await.contains(&key));
+    // Not refreshed, so it expires.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        !Browser::open(addr).await.member_keys().await.contains(&key),
+        "an entry past its TTL is not listed"
+    );
+
+    member
+        .send(json!({"type": "set_member", "key": "a:b", "payload": ""}))
+        .await;
+    assert_eq!(member.recv().await["code"], "bad_request");
+}
+
+async fn http_post(addr: SocketAddr, path: &str, body: &str) -> u16 {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response[9..12].parse().unwrap()
 }
 
 async fn http_get(addr: SocketAddr, path: &str) -> Value {

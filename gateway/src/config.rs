@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -28,13 +29,16 @@ pub struct Config {
     pub namespace: String,
     /// `CANVAS_ROOM`: the one room this gateway serves. Default `lobby`.
     pub room: String,
+    /// `CANVAS_MEMBER_TTL_SECONDS`: how long a member entry outlives its last
+    /// refresh. Default 30.
+    pub member_ttl: Duration,
 }
 
 impl Config {
     /// Read the settings from the environment.
     ///
     /// # Errors
-    /// When `CANVAS_FELIX_TOKEN` is missing or an address does not parse.
+    /// When `CANVAS_FELIX_TOKEN` is missing or an address or number does not parse.
     pub fn from_env() -> Result<Self> {
         let var = |name: &str, default: &str| {
             std::env::var(name)
@@ -65,6 +69,15 @@ impl Config {
             tenant: var("CANVAS_TENANT", "canvas"),
             namespace: var("CANVAS_NAMESPACE", "default"),
             room: var("CANVAS_ROOM", "lobby"),
+            member_ttl: Duration::from_secs(
+                var("CANVAS_MEMBER_TTL_SECONDS", "30")
+                    .parse()
+                    .ok()
+                    .filter(|&seconds| seconds > 0)
+                    .context(
+                        "CANVAS_MEMBER_TTL_SECONDS must be a whole number of seconds above 0",
+                    )?,
+            ),
         })
     }
 }

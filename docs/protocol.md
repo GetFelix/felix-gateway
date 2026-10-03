@@ -5,12 +5,15 @@ frames over it. The gateway relays each request to Felix and each Felix event
 back, without decoding payloads. One gateway serves one room, named by
 `CANVAS_ROOM`.
 
-The protocol has two streams:
+The protocol has two streams and one member list:
 
 | Name | Felix stream | Kind | Offsets |
 |---|---|---|---|
 | `ops` | `canvas.ops.<room>` | Durable, retained 30 days | Every event has one |
 | `presence` | `canvas.presence.<room>` | In memory, at most once | Always `null` |
+
+The member list is the Felix cache keys `canvas.presence/<room>:<session>`, one
+per session, each expiring unless its session writes it again.
 
 ## Browser to gateway
 
@@ -93,16 +96,54 @@ A browser joins a room in this order:
 
 Reading the snapshot before subscribing would lose the ops published between
 the two. [design.md](design.md#join-and-snapshot) explains the rule.
+### `set_member`
+
+```json
+{"type": "set_member", "key": "3f9a0c12d4e5b6a7", "payload": "gqRuYW1lo0FuYaVjb2xvcgI="}
+```
+
+Writes this session's member entry, `canvas.presence/<room>:<key>`, with the
+TTL the gateway announced in `hello`. `key` follows the rule for `counter_add`.
+The canvas writes its entry on connecting and again every third of the TTL, so
+a session that stops writing drops out of everyone's list within one TTL. There
+is no reply; a failed write is an `error` with code `member_failed`.
+
+### `remove_member`
+
+```json
+{"type": "remove_member", "key": "3f9a0c12d4e5b6a7"}
+```
+
+Deletes the entry at once, for a tab that is closing. A connection's member
+writes and publishes reach Felix one at a time in the order sent, so a delete is
+never overtaken by the refresh before it.
+
+A message sent while a page unloads may never leave it, so a closing tab also
+sends the key as the body of `POST /members/leave` with `navigator.sendBeacon`,
+which the browser delivers after the page is gone. The gateway answers 204, or
+400 for a bad key.
+
+### `watch_members`
+
+```json
+{"type": "watch_members"}
+```
+
+Asks for the room's member list: one `members` message with every entry, then a
+`member` message for each later write or delete. Watching again replaces the
+earlier watch and starts with a fresh `members`.
 
 ## Gateway to browser
 
 ### `hello`
 
 ```json
-{"type": "hello", "namespace": "default", "room": "lobby"}
+{"type": "hello", "namespace": "default", "room": "lobby", "member_ttl_ms": 30000}
 ```
 
-The first message on every connection: the room this gateway serves.
+The first message on every connection: the room this gateway serves, and how
+long a member entry lasts without a write. `CANVAS_MEMBER_TTL_SECONDS` sets
+the TTL; it defaults to 30 seconds.
 
 ### `subscribed`
 
@@ -165,6 +206,23 @@ The counter's sum after the `counter_add` with this `id`.
 The answer to `snapshot_get`: the snapshot's bytes in base64, as the
 snapshotter wrote them, or `null` when the room has none yet. The gateway does
 not decode them. [Snapshot payload](#snapshot-payload) describes the format.
+### `members` and `member`
+
+```json
+{"type": "members", "members": [{"key": "3f9a0c12d4e5b6a7", "payload": "gqRu...", "expires_in_ms": 21500}]}
+{"type": "member", "key": "3f9a0c12d4e5b6a7", "payload": null, "expires_in_ms": null}
+```
+
+| Field | Meaning |
+|---|---|
+| `key` | The session, without the room prefix |
+| `payload` | The entry, base64, or `null` when it was deleted |
+| `expires_in_ms` | Milliseconds until the entry expires, measured on the gateway's clock when it relayed the change; `null` for an entry with no TTL |
+
+Felix expires entries lazily and sends nothing when one lapses
+([felix#960](https://github.com/gabloe/felix/issues/960)), so the browser
+drops an entry itself once `expires_in_ms` has passed without a newer write.
+A relative time keeps the browser's own clock out of it.
 
 ### `error`
 
@@ -185,6 +243,8 @@ any error.
 | `counter_failed` | Felix refused or lost a counter add. It may have been counted |
 | `snapshot_failed` | Felix could not read the snapshot. Ask again |
 | `trimmed` | The subscription asked for an offset retention has discarded. `oldest` is the oldest offset left. Join again from the snapshot |
+| `member_failed` | Felix refused or lost a member write or delete. The next refresh writes it again |
+| `watch_failed` | The member watch was refused or stopped. Send `watch_members` again |
 
 ## Slow browsers
 
@@ -255,6 +315,28 @@ otherwise. A session not heard from for 10 seconds is treated as gone.
 | `x`, `y` | float or nil | The pointer in canvas units, nil when it left the canvas |
 | `sel` | array of bin 16 | Ids of the selected shapes |
 | `gone` | bool | Present and true on a session's last message |
+
+The canvas samples the pointer once per animation frame and sends at most one
+message per 16 ms, so a 120 Hz screen still sends 60 a second. Cursors on other
+screens are eased toward each new position with a critically damped spring.
+
+## Member payload
+
+A member entry is a MessagePack map, encoded by `encodeMember` in `model/`.
+
+| Key | MessagePack type | Meaning |
+|---|---|---|
+| `name` | str | Display name, at most 24 characters |
+| `color` | uint | Index into the presence palette |
+| `person` | uint | A u64 the browser keeps in local storage across visits |
+
+The key is the session, which is new on every page load; `person` stays the
+same, so the canvas uses it for anything that should outlast a reload. A
+person's colour is their `person` modulo eight, moved on to the next free
+colour while someone with a smaller `person` holds it. Everyone sees the same
+member list, so everyone settles on the same colours, and a reload keeps them.
+The people list shows each person once, however many tabs they have open or
+however many entries an unclean reload left behind.
 
 ## Snapshot payload
 
