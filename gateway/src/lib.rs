@@ -7,6 +7,7 @@
 //! - `protocol`: the JSON messages exchanged with a browser.
 //! - `transport`: the browser connection seam and its WebSocket implementation.
 //! - `relay`: one browser session, relayed to Felix.
+//! - `throttle`: a pretend slow link, for the slow-client demonstration.
 //! - `access`: each session's sign-in exchanged for a token narrowed to its room.
 //! - `room`: room names and the Felix streams and caches each room owns.
 //! - `felix`: the brokers, and one session's connection to them.
@@ -19,6 +20,7 @@ mod metrics;
 pub mod protocol;
 mod relay;
 mod room;
+mod throttle;
 pub mod transport;
 
 use std::sync::Arc;

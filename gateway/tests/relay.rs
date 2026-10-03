@@ -625,6 +625,76 @@ async fn a_join_without_a_valid_sign_in_or_room_is_refused() {
     assert_eq!(early.refusal().await["code"], "bad_request");
 }
 
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_throttled_browser_sees_a_gap_and_catches_up_while_others_miss_nothing() {
+    const RECORDS: usize = 1000;
+    let (_gateway, addr) = start_gateway().await;
+    let tag = run_tag("throttled");
+    let padding = "x".repeat(200);
+    let mut writer = Browser::open(addr).await;
+    let mut fast = Browser::open(addr).await;
+    let mut slow = Browser::open(addr).await;
+    fast.subscribe("ops", json!("live")).await;
+    slow.send(json!({"type": "throttle", "bits_per_second": 100_000}))
+        .await;
+    slow.subscribe("ops", json!("live")).await;
+
+    for i in 0..RECORDS {
+        writer
+            .publish("ops", &format!("{tag}/{i:04}/{padding}"), true)
+            .await;
+    }
+    let (events, _) = fast.events(&tag, RECORDS).await;
+    let payloads: Vec<&str> = events.iter().map(|(_, payload)| payload.as_str()).collect();
+    let sent: Vec<String> = (0..RECORDS)
+        .map(|i| format!("{tag}/{i:04}/{padding}"))
+        .collect();
+    assert_eq!(payloads, sent, "the browser keeping up gets every record");
+
+    // The throttled browser falls behind until Felix drops records for it,
+    // which shows up as a jump in offsets.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut last: Option<u64> = None;
+    let resume_from = loop {
+        let message = slow.recv_type("event").await;
+        let offset = message["offset"].as_u64().unwrap();
+        let skipped = message["skipped_before"].as_u64().unwrap_or(0);
+        if let Some(last) = last
+            && offset > last + 1 + skipped
+        {
+            break last + 1;
+        }
+        last = Some(offset);
+        let payload = BASE64.decode(message["payload"].as_str().unwrap()).unwrap();
+        let payload = String::from_utf8(payload).unwrap();
+        if payload.starts_with(&tag) {
+            seen.insert(payload);
+        }
+        assert!(
+            seen.len() < RECORDS,
+            "the throttled browser got every record"
+        );
+    };
+
+    // Subscribing again from the last offset handled plus one fills the gap.
+    slow.send(json!({"type": "throttle", "bits_per_second": null}))
+        .await;
+    slow.subscribe("ops", json!(resume_from)).await;
+    while seen.len() < RECORDS {
+        let message = slow.recv().await;
+        if message["type"] != "event" {
+            continue;
+        }
+        let payload = BASE64.decode(message["payload"].as_str().unwrap()).unwrap();
+        let payload = String::from_utf8(payload).unwrap();
+        if payload.starts_with(&tag) {
+            seen.insert(payload);
+        }
+    }
+    assert_eq!(seen.into_iter().collect::<Vec<_>>(), sent);
+}
+
 async fn http_post(addr: SocketAddr, path: &str, body: &str) -> u16 {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let request = format!(

@@ -184,6 +184,20 @@ Asks for the room's member list: one `members` message with every entry, then a
 `member` message for each later write or delete. Watching again replaces the
 earlier watch and starts with a fresh `members`.
 
+### `throttle`
+
+```json
+{"type": "throttle", "bits_per_second": 100000}
+{"type": "throttle", "bits_per_second": null}
+```
+
+Reads this connection's subscriptions no faster than a link of
+`bits_per_second` would carry them, counting each event's JSON text. `null` or
+0 lifts the limit. It stands in for a slow network, so the slow-client
+demonstration runs anywhere: Felix keeps delivering at full speed, the
+subscription's bounded queue fills and drops new events, and the browser sees a
+gap. Other connections are not affected. There is no reply.
+
 ## Gateway to browser
 
 ### `hello`
@@ -305,6 +319,22 @@ that it stops reading the Felix subscription, and Felix's bounded
 per-subscriber queue drops new events. The gateway never drops on its own, so a
 loss always shows up as a gap in offsets.
 
+The browser finds a loss in two ways:
+
+1. An `ops` event whose offset is past the one its subscription should deliver
+   next, after allowing for `skipped_before`. It subscribes again from the last
+   offset it applied plus one.
+2. A peer's presence `at` (see [Presence payload](#presence-payload)) still
+   above its own applied count two seconds after it arrived. Felix drops the
+   newest records, so when the last records of a burst are the ones dropped,
+   nothing arrives after them to show the gap. Every session publishes presence
+   at least every 3 seconds, so this finds the loss within a few seconds. The
+   grace period covers the normal case where a cursor message overtakes the
+   change it reports.
+
+Either way the browser shows that it is catching up, reads the missing records
+from the log, and ends with the same state hash as everyone else.
+
 ## Latency
 
 `GET /metrics` returns the two legs of the gateway separately, in microseconds:
@@ -367,6 +397,7 @@ otherwise. A session not heard from for 10 seconds is treated as gone.
 | `x`, `y` | float or nil | The pointer in canvas units, nil when it left the canvas |
 | `sel` | array of bin 16 | Ids of the selected shapes |
 | `gone` | bool | Present and true on a session's last message |
+| `at` | uint | How many changes the session has applied: the next offset it needs. Optional |
 
 The canvas samples the pointer once per animation frame and sends at most one
 message per 16 ms, so a 120 Hz screen still sends 60 a second. Cursors on other

@@ -202,6 +202,14 @@ export class GatewayClient {
     this.#send({ type: "watch_members" });
   }
 
+  /**
+   * Have the gateway read this connection's subscriptions no faster than a
+   * link of `bitsPerSecond` would carry them, or at full speed with `null`.
+   */
+  throttle(bitsPerSecond: number | null): void {
+    this.#send({ type: "throttle", bits_per_second: bitsPerSecond });
+  }
+
   close(): void {
     this.#socket.close();
   }

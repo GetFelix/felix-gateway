@@ -19,6 +19,7 @@ use crate::protocol::{
     ClientMessage, CounterName, ErrorCode, MemberEntry, ServerMessage, StartAt, StreamName,
 };
 use crate::room::{BAD_NAME, Room, valid_name};
+use crate::throttle::Throttle;
 use crate::transport::{BrowserConnection, Incoming};
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -74,6 +75,7 @@ pub(crate) async fn run<C: BrowserConnection>(
     ));
     let mut subscriptions: HashMap<StreamName, JoinHandle<()>> = HashMap::new();
     let mut members_watch: Option<JoinHandle<()>> = None;
+    let throttle = Arc::new(Throttle::default());
     let mut ping = tokio::time::interval(PING_INTERVAL);
 
     let hello = ServerMessage::Hello {
@@ -99,6 +101,7 @@ pub(crate) async fn run<C: BrowserConnection>(
                             stream,
                             from,
                             Arc::clone(&felix),
+                            Arc::clone(&throttle),
                             events_tx.clone(),
                         ));
                         if let Some(previous) = subscriptions.insert(stream, task) {
@@ -166,6 +169,10 @@ pub(crate) async fn run<C: BrowserConnection>(
                             ));
                             continue;
                         }
+                    }
+                    Ok(ClientMessage::Throttle { bits_per_second }) => {
+                        throttle.set(bits_per_second);
+                        continue;
                     }
                     Ok(ClientMessage::SnapshotGet { id }) => {
                         tokio::spawn(get_snapshot(id, Arc::clone(&felix), replies_tx.clone()));
@@ -335,6 +342,7 @@ async fn relay_subscription(
     stream: StreamName,
     from: StartAt,
     felix: Arc<Felix>,
+    throttle: Arc<Throttle>,
     events: mpsc::Sender<ServerMessage>,
 ) {
     let mut subscription = match felix.subscribe(stream, from).await {
@@ -363,6 +371,7 @@ async fn relay_subscription(
                     skipped_before: event.skipped_before,
                     payload: BASE64.encode(&event.payload),
                 };
+                throttle.pass(&message).await;
                 if events.send(message).await.is_err() {
                     return;
                 }

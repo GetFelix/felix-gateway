@@ -77,6 +77,10 @@ pub enum ClientMessage {
     /// Send the room's members as one [`ServerMessage::Members`], then every
     /// change as a [`ServerMessage::Member`]. Replaces an earlier watch.
     WatchMembers,
+    /// Read this connection's subscriptions no faster than `bits_per_second`
+    /// would carry them, or at full speed again with `null` or 0. It stands
+    /// in for a slow link.
+    Throttle { bits_per_second: Option<u64> },
 }
 
 /// A message to the browser.
@@ -278,6 +282,27 @@ mod tests {
         let watch: ClientMessage =
             serde_json::from_value(json!({"type": "watch_members"})).unwrap();
         assert_eq!(watch, ClientMessage::WatchMembers);
+    }
+
+    #[test]
+    fn parses_a_throttle_and_its_release() {
+        let on: ClientMessage =
+            serde_json::from_value(json!({"type": "throttle", "bits_per_second": 100_000}))
+                .unwrap();
+        assert_eq!(
+            on,
+            ClientMessage::Throttle {
+                bits_per_second: Some(100_000)
+            }
+        );
+        let off: ClientMessage =
+            serde_json::from_value(json!({"type": "throttle", "bits_per_second": null})).unwrap();
+        assert_eq!(
+            off,
+            ClientMessage::Throttle {
+                bits_per_second: None
+            }
+        );
     }
 
     #[test]
