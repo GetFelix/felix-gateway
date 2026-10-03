@@ -1,7 +1,8 @@
 // Seeds the development stack the way a deployment would: bootstrap a tenant
 // that trusts the dev IdP, exchange IdP tokens for Felix tokens, and create
-// the room's streams. Writes the broker's credential and the gateway's token
-// to the state directory. Safe to run again: existing objects are kept.
+// the room's streams and caches. Writes the broker's credential and the
+// gateway's and snapshotter's tokens to the state directory. Safe to run
+// again: existing objects are kept.
 import { createHash } from "node:crypto";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 
@@ -75,11 +76,17 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
       { subject: "role:gateway", object: streams, action: "stream.subscribe" },
       // Counters authorize as cache writes.
       { subject: "role:gateway", object: caches, action: "cache.write" },
+      { subject: "role:gateway", object: caches, action: "cache.read" },
+      // Subscribing also grants polling the snapshotter's consumer group.
+      { subject: "role:snapshotter", object: streams, action: "stream.subscribe" },
+      { subject: "role:snapshotter", object: caches, action: "cache.read" },
+      { subject: "role:snapshotter", object: caches, action: "cache.write" },
     ],
     groupings: [
       { user: principal("canvas-admin"), role: "role:admin" },
       { user: principal("canvas-broker"), role: "role:broker" },
       { user: principal("canvas-gateway"), role: "role:gateway" },
+      { user: principal("canvas-snapshotter"), role: "role:snapshotter" },
     ],
   },
 });
@@ -111,11 +118,16 @@ for (const [name, durable] of [
   });
 }
 
-console.log("cache canvas.seq");
-await request("POST", `${CONTROL_PLANE}/v1/tenants/${TENANT}/namespaces/${NAMESPACE}/caches`, {
-  token: admin,
-  body: { cache: "canvas.seq", display_name: "Op sequence per session" },
-});
+for (const [cache, display_name] of [
+  ["canvas.seq", "Op sequence per session"],
+  ["canvas.snap", "Room snapshots"],
+]) {
+  console.log(`cache ${cache}`);
+  await request("POST", `${CONTROL_PLANE}/v1/tenants/${TENANT}/namespaces/${NAMESPACE}/caches`, {
+    token: admin,
+    body: { cache, display_name },
+  });
+}
 
 // The broker runs as uid 65532 and writes its certificate here too.
 await mkdir(STATE, { recursive: true });
@@ -123,7 +135,11 @@ await chmod(STATE, 0o777);
 const broker = await exchange("canvas-broker", { audience: "felix-controlplane" });
 await writeFile(`${STATE}/node.token`, broker, { mode: 0o644 });
 const gateway = await exchange("canvas-gateway", {
-  requested: ["stream.publish", "stream.subscribe", "cache.write"],
+  requested: ["stream.publish", "stream.subscribe", "cache.read", "cache.write"],
 });
 await writeFile(`${STATE}/gateway.token`, gateway, { mode: 0o644 });
-console.log(`wrote ${STATE}/node.token and ${STATE}/gateway.token`);
+const snapshotter = await exchange("canvas-snapshotter", {
+  requested: ["stream.subscribe", "cache.read", "cache.write"],
+});
+await writeFile(`${STATE}/snapshotter.token`, snapshotter, { mode: 0o644 });
+console.log(`wrote node.token, gateway.token and snapshotter.token to ${STATE}`);

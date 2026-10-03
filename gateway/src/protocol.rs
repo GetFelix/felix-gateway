@@ -62,6 +62,9 @@ pub enum ClientMessage {
         delta: i64,
         id: u64,
     },
+    /// Read the room's snapshot. The gateway answers with a
+    /// [`ServerMessage::Snapshot`] carrying the same `id`.
+    SnapshotGet { id: u64 },
 }
 
 /// A message to the browser.
@@ -98,6 +101,9 @@ pub enum ServerMessage {
     },
     /// The sum after the counter add with this `id`.
     Counter { id: u64, value: i64 },
+    /// The room's snapshot for the `snapshot_get` with this `id`: base64 bytes
+    /// as the snapshotter wrote them, or `null` when it has written none.
+    Snapshot { id: u64, payload: Option<String> },
     /// Something the browser asked for failed.
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,6 +111,9 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         stream: Option<StreamName>,
         code: ErrorCode,
+        /// With [`ErrorCode::Trimmed`]: the oldest offset the log still holds.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        oldest: Option<u64>,
         message: String,
     },
 }
@@ -124,6 +133,11 @@ pub enum ErrorCode {
     SubscriptionEnded,
     /// Felix refused or lost a counter add. It may have been counted.
     CounterFailed,
+    /// The snapshot could not be read.
+    SnapshotFailed,
+    /// The subscription asked for an offset the log no longer holds. Start
+    /// again from the snapshot.
+    Trimmed,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -174,6 +188,21 @@ mod tests {
                 delta: 256,
                 id: 4
             }
+        );
+    }
+
+    #[test]
+    fn parses_a_snapshot_get_and_serializes_the_answer() {
+        let get: ClientMessage =
+            serde_json::from_value(json!({"type": "snapshot_get", "id": 5})).unwrap();
+        assert_eq!(get, ClientMessage::SnapshotGet { id: 5 });
+        let none = ServerMessage::Snapshot {
+            id: 5,
+            payload: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&none).unwrap(),
+            json!({"type": "snapshot", "id": 5, "payload": null})
         );
     }
 

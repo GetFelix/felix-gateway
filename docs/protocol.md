@@ -30,6 +30,9 @@ Subscribing to a stream the connection is already subscribed to replaces the
 earlier subscription. That is the recovery path: after a gap or an ended
 subscription, subscribe again from the last offset handled plus one.
 
+An offset the log no longer holds is answered with a `trimmed` error naming the
+oldest offset left. The browser then joins again from the snapshot, as below.
+
 ### `publish`
 
 ```json
@@ -67,6 +70,30 @@ counter and uses the 1,024 numbers below the sum, fetching another block when
 half are gone. Felix counts an add retried after a lost answer twice, which
 only wastes numbers.
 
+### `snapshot_get`
+
+```json
+{"type": "snapshot_get", "id": 9}
+```
+
+Read the room's snapshot, the Felix cache key `canvas.snap/<room>`. The gateway
+answers with a `snapshot` message carrying the same `id`.
+
+### Joining
+
+A browser joins a room in this order:
+
+1. `subscribe` to `ops` from `"live"` and wait for `subscribed`. Its
+   `live_offset` is the tail `L`, and every op from `L` on will arrive as an
+   event, including any published while the next step is in flight.
+2. `snapshot_get`. Decode the snapshot with `decodeSnapshot` from `model/`; it
+   holds the room through offset `N`.
+3. Drop buffered events at or below `N`. If `N + 1 < L`, `subscribe` to `ops`
+   from `N + 1` to read the ops in between. With no snapshot, subscribe from 0.
+
+Reading the snapshot before subscribing would lose the ops published between
+the two. [design.md](design.md#join-and-snapshot) explains the rule.
+
 ## Gateway to browser
 
 ### `hello`
@@ -87,7 +114,7 @@ The subscription is registered with the broker. Anything published from this
 point on will be delivered, which is what the join path's subscribe-before-read
 rule waits for. `start_offset` is the first offset this subscription delivers
 and `live_offset` is the stream's tail when it was registered; both are `null`
-on `presence`.
+on `presence`. From `"live"` the two are equal.
 
 ### `event`
 
@@ -129,6 +156,16 @@ A publish with `"ack": false` gets no `ack`, only an `error` if it fails.
 
 The counter's sum after the `counter_add` with this `id`.
 
+### `snapshot`
+
+```json
+{"type": "snapshot", "id": 9, "payload": "hKF2AaZvZmZzZXTN..."}
+```
+
+The answer to `snapshot_get`: the snapshot's bytes in base64, as the
+snapshotter wrote them, or `null` when the room has none yet. The gateway does
+not decode them. [Snapshot payload](#snapshot-payload) describes the format.
+
 ### `error`
 
 ```json
@@ -136,7 +173,8 @@ The counter's sum after the `counter_add` with this `id`.
 ```
 
 `id` and `stream` are present when the error is about one request or one
-stream. The connection stays open after any error.
+stream. `oldest` is present only on `trimmed`. The connection stays open after
+any error.
 
 | Code | Meaning |
 |---|---|
@@ -145,6 +183,8 @@ stream. The connection stays open after any error.
 | `subscribe_failed` | Felix refused the subscription, for example an offset already trimmed |
 | `subscription_ended` | A subscription stopped delivering. Subscribe again from the last offset handled plus one |
 | `counter_failed` | Felix refused or lost a counter add. It may have been counted |
+| `snapshot_failed` | Felix could not read the snapshot. Ask again |
+| `trimmed` | The subscription asked for an offset retention has discarded. `oldest` is the oldest offset left. Join again from the snapshot |
 
 ## Slow browsers
 
@@ -215,3 +255,15 @@ otherwise. A session not heard from for 10 seconds is treated as gone.
 | `x`, `y` | float or nil | The pointer in canvas units, nil when it left the canvas |
 | `sel` | array of bin 16 | Ids of the selected shapes |
 | `gone` | bool | Present and true on a session's last message |
+
+## Snapshot payload
+
+The snapshotter writes `canvas.snap/<room>` with `encodeSnapshot` from
+`model/`: a MessagePack map with these keys.
+
+| Key | MessagePack type | Meaning |
+|---|---|---|
+| `v` | uint | Format version, 1 |
+| `offset` | uint | The last log offset folded in. Continue from `offset + 1` |
+| `shapes` | array | One `[id, fields, written]` per shape: the id as bin 16, the fields as in ops, and a map from field name to the offset that last wrote it |
+| `seqs` | array | One `[sid, seq]` per session: the highest `seq` folded in, so a retried op that lands later is still recognised as a repeat |

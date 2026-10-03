@@ -97,12 +97,20 @@ impl Felix {
         stream: StreamName,
         from: StartAt,
     ) -> Result<ClusterSubscription> {
+        // `Latest` rather than no position: only then does the broker report
+        // the tail it registered at, which a joining browser needs to know
+        // what lies between its snapshot and the live events.
         let start = match from {
-            StartAt::Offset(offset) => Some(StartPosition::Offset(offset)),
-            StartAt::Live(_) => None,
+            StartAt::Offset(offset) => StartPosition::Offset(offset),
+            StartAt::Live(_) => StartPosition::Latest,
         };
         self.client
-            .subscribe_from(&self.tenant, &self.namespace, self.stream(stream), start)
+            .subscribe_from(
+                &self.tenant,
+                &self.namespace,
+                self.stream(stream),
+                Some(start),
+            )
             .await
     }
 
@@ -123,5 +131,16 @@ impl Felix {
             .await
             .counter_add(&self.tenant, &self.namespace, cache, &key, delta)
             .await
+    }
+
+    /// The room's snapshot, `canvas.snap/<room>`, as the snapshotter wrote it.
+    pub(crate) async fn snapshot(&self) -> Result<Option<Vec<u8>>> {
+        let value = self
+            .client
+            .client()
+            .await
+            .cache_get(&self.tenant, &self.namespace, "canvas.snap", &self.room)
+            .await?;
+        Ok(value.map(|bytes| bytes.to_vec()))
     }
 }

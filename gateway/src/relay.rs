@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use felix_client::{CursorErrorReason, SubscribeCursorError};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -111,6 +112,10 @@ pub(crate) async fn run<C: BrowserConnection>(
                             continue;
                         }
                     }
+                    Ok(ClientMessage::SnapshotGet { id }) => {
+                        tokio::spawn(get_snapshot(id, Arc::clone(&felix), replies_tx.clone()));
+                        continue;
+                    }
                     Err(err) => error(None, None, ErrorCode::BadRequest, err),
                 },
             },
@@ -191,6 +196,17 @@ async fn add_to_counter(
     let _ = replies.send(reply);
 }
 
+async fn get_snapshot(id: u64, felix: Arc<Felix>, replies: mpsc::UnboundedSender<ServerMessage>) {
+    let reply = match felix.snapshot().await {
+        Ok(payload) => ServerMessage::Snapshot {
+            id,
+            payload: payload.map(|bytes| BASE64.encode(bytes)),
+        },
+        Err(err) => error(Some(id), None, ErrorCode::SnapshotFailed, err),
+    };
+    let _ = replies.send(reply);
+}
+
 async fn relay_subscription(
     stream: StreamName,
     from: StartAt,
@@ -201,7 +217,7 @@ async fn relay_subscription(
         Ok(subscription) => subscription,
         Err(err) => {
             let _ = events
-                .send(error(None, Some(stream), ErrorCode::SubscribeFailed, err))
+                .send(subscription_error(stream, ErrorCode::SubscribeFailed, err))
                 .await;
             return;
         }
@@ -227,18 +243,36 @@ async fn relay_subscription(
                     return;
                 }
             }
-            Ok(None) => break "the broker closed the subscription".to_string(),
-            Err(err) => break format!("{err:#}"),
+            Ok(None) => break anyhow::anyhow!("the broker closed the subscription"),
+            Err(err) => break err,
         }
     };
     let _ = events
-        .send(error(
-            None,
-            Some(stream),
+        .send(subscription_error(
+            stream,
             ErrorCode::SubscriptionEnded,
             ended,
         ))
         .await;
+}
+
+/// `trimmed`, naming the oldest offset left, when retention has passed the
+/// offset the subscription asked for; `code` otherwise.
+fn subscription_error(stream: StreamName, code: ErrorCode, err: anyhow::Error) -> ServerMessage {
+    let trimmed = err
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<SubscribeCursorError>())
+        .find(|cursor| cursor.reason == CursorErrorReason::TooOld);
+    match trimmed {
+        Some(cursor) => ServerMessage::Error {
+            id: None,
+            stream: Some(stream),
+            code: ErrorCode::Trimmed,
+            oldest: Some(cursor.available),
+            message: format!("{err:#}"),
+        },
+        None => error(None, Some(stream), code, err),
+    }
 }
 
 fn error(
@@ -251,6 +285,38 @@ fn error(
         id,
         stream,
         code,
+        oldest: None,
         message: format!("{err:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trimmed_offset_is_reported_with_the_oldest_left() {
+        let err = anyhow::Error::new(SubscribeCursorError {
+            reason: CursorErrorReason::TooOld,
+            requested: 3,
+            available: 120,
+        })
+        .context("subscribe to canvas.ops.lobby");
+        let message = subscription_error(StreamName::Ops, ErrorCode::SubscribeFailed, err);
+        let ServerMessage::Error { code, oldest, .. } = message else {
+            panic!("{message:?}");
+        };
+        assert_eq!((code, oldest), (ErrorCode::Trimmed, Some(120)));
+
+        let future = anyhow::Error::new(SubscribeCursorError {
+            reason: CursorErrorReason::InFuture,
+            requested: 900,
+            available: 10,
+        });
+        let message = subscription_error(StreamName::Ops, ErrorCode::SubscribeFailed, future);
+        let ServerMessage::Error { code, oldest, .. } = message else {
+            panic!("{message:?}");
+        };
+        assert_eq!((code, oldest), (ErrorCode::SubscribeFailed, None));
     }
 }

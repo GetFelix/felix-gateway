@@ -21,6 +21,7 @@ export type ServerMessage =
     }
   | { type: "ack"; id: number; offset: number | null }
   | { type: "counter"; id: number; value: number }
+  | { type: "snapshot"; id: number; payload: string | null }
   | {
       type: "error";
       id?: number;
@@ -30,7 +31,10 @@ export type ServerMessage =
         | "publish_failed"
         | "subscribe_failed"
         | "subscription_ended"
-        | "counter_failed";
+        | "counter_failed"
+        | "snapshot_failed"
+        | "trimmed";
+      oldest?: number;
       message: string;
     };
 
@@ -56,7 +60,7 @@ export class GatewayError extends Error {
 }
 
 interface Pending {
-  resolve: (value: number | null) => void;
+  resolve: (value: number | string | null) => void;
   reject: (error: GatewayError) => void;
 }
 
@@ -121,12 +125,12 @@ export class GatewayClient {
    * as soon as the request is sent.
    */
   publish(stream: StreamName, payload: Uint8Array, ack = true): Promise<number | null> {
-    const id = this.#nextId++;
-    this.#send({ type: "publish", stream, payload: toBase64(payload), ack, id });
+    const message = { type: "publish", stream, payload: toBase64(payload), ack };
     if (!ack) {
+      this.#send({ ...message, id: this.#nextId++ });
       return Promise.resolve(null);
     }
-    return new Promise((resolve, reject) => this.#pending.set(id, { resolve, reject }));
+    return this.#request(message) as Promise<number | null>;
   }
 
   /**
@@ -134,15 +138,23 @@ export class GatewayClient {
    * and resolve with the new sum.
    */
   counterAdd(key: string, delta: number): Promise<number> {
-    const id = this.#nextId++;
-    this.#send({ type: "counter_add", counter: "seq", key, delta, id });
-    return new Promise((resolve, reject) =>
-      this.#pending.set(id, { resolve: (value) => resolve(value as number), reject }),
-    );
+    return this.#request({ type: "counter_add", counter: "seq", key, delta }) as Promise<number>;
+  }
+
+  /** Read the room's snapshot: the bytes the snapshotter wrote, or `null` for none yet. */
+  async snapshot(): Promise<Uint8Array | null> {
+    const payload = (await this.#request({ type: "snapshot_get" })) as string | null;
+    return payload === null ? null : fromBase64(payload);
   }
 
   close(): void {
     this.#socket.close();
+  }
+
+  #request(message: object): Promise<number | string | null> {
+    const id = this.#nextId++;
+    this.#send({ ...message, id });
+    return new Promise((resolve, reject) => this.#pending.set(id, { resolve, reject }));
   }
 
   #send(message: object): void {
@@ -171,6 +183,9 @@ export class GatewayClient {
         break;
       case "ack":
         this.#take(message.id)?.resolve(message.offset);
+        break;
+      case "snapshot":
+        this.#take(message.id)?.resolve(message.payload);
         break;
       case "error": {
         const error = new GatewayError(message.code, message.message);

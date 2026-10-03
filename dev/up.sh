@@ -17,6 +17,7 @@ for _ in $(seq 1 90); do
     echo "Felix is ready. For the gateway:"
     echo "  export CANVAS_FELIX_TOKEN=\"\$(cat dev/state/gateway.token)\""
     echo "  export CANVAS_FELIX_CA_FILE=dev/state/broker-cert.pem"
+    echo "The snapshotter takes the same variables with dev/state/snapshotter.token."
     exit 0
   fi
   sleep 2

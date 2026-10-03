@@ -17,8 +17,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const WAIT: Duration = Duration::from_secs(10);
 
+fn config() -> Config {
+    Config::from_env().expect("CANVAS_* environment for the dev stack")
+}
+
 async fn start_gateway() -> (Gateway, SocketAddr) {
-    let config = Config::from_env().expect("CANVAS_* environment for the dev stack");
+    serve(config()).await
+}
+
+async fn serve(config: Config) -> (Gateway, SocketAddr) {
     let gateway = Gateway::connect(&config).await.expect("connect to Felix");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -304,6 +311,60 @@ async fn counter_adds_answer_with_the_running_sum() {
         (error["code"].as_str(), error["id"].as_u64()),
         (Some("bad_request"), Some(9))
     );
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn an_op_published_while_the_snapshot_is_read_reaches_a_browser_that_subscribed_first() {
+    let (_gateway, addr) = start_gateway().await;
+    let tag = run_tag("join");
+    let mut joiner = Browser::open(addr).await;
+    let mut writer = Browser::open(addr).await;
+
+    // The join path: subscribe at the live tail, then read the snapshot.
+    let subscribed = joiner.subscribe("ops", json!("live")).await;
+    let live = subscribed["live_offset"]
+        .as_u64()
+        .expect("a live subscription names the tail");
+    assert_eq!(subscribed["start_offset"].as_u64(), Some(live));
+    joiner.send(json!({"type": "snapshot_get", "id": 1})).await;
+    writer.publish("ops", &format!("{tag}/during"), true).await;
+    let written = writer.recv_type("ack").await["offset"].as_u64();
+
+    let mut snapshot = None;
+    let mut event = None;
+    while snapshot.is_none() || event.is_none() {
+        let message = joiner.recv().await;
+        match message["type"].as_str() {
+            Some("snapshot") => {
+                assert_eq!(message["id"], 1);
+                snapshot = Some(message);
+            }
+            Some("event") => {
+                let payload = BASE64.decode(message["payload"].as_str().unwrap()).unwrap();
+                if payload.starts_with(tag.as_bytes()) {
+                    event = message["offset"].as_u64();
+                }
+            }
+            _ => panic!("unexpected message: {message}"),
+        }
+    }
+    assert_eq!(event, written, "the op arrives on the live subscription");
+    assert!(event >= Some(live));
+    let payload = &snapshot.unwrap()["payload"];
+    assert!(payload.is_null() || payload.is_string(), "{payload}");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_room_without_a_snapshot_answers_null() {
+    let mut config = config();
+    config.room = run_tag("empty");
+    let (_gateway, addr) = serve(config).await;
+    let mut browser = Browser::open(addr).await;
+    browser.send(json!({"type": "snapshot_get", "id": 3})).await;
+    let reply = browser.recv_type("snapshot").await;
+    assert_eq!(reply, json!({"type": "snapshot", "id": 3, "payload": null}));
 }
 
 async fn http_get(addr: SocketAddr, path: &str) -> Value {
