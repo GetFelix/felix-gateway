@@ -268,8 +268,8 @@ async fn metrics_report_both_legs() {
     browser.publish("ops", "metrics", true).await;
     browser.recv_type("ack").await;
 
-    // The first ping goes out when the session starts, and tungstenite
-    // answers it while the socket is being read.
+    // The first ping goes out when the session starts. tungstenite only sends
+    // the pong while the socket is polled, so keep polling it between checks.
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         let metrics = http_get(addr, "/metrics").await;
@@ -281,7 +281,7 @@ async fn metrics_report_both_legs() {
             tokio::time::Instant::now() < deadline,
             "no RTT sample: {metrics}"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = tokio::time::timeout(Duration::from_millis(50), browser.socket.next()).await;
     }
     drop(browser);
 }
