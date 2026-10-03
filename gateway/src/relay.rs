@@ -1,8 +1,8 @@
-//! One browser session relayed to Felix. The gateway keeps no canvas state:
-//! payloads pass through as opaque bytes, and order and offsets are the
-//! broker's.
+//! One browser session relayed to Felix. The gateway keeps no application
+//! state: payloads pass through as opaque bytes, and order and offsets are
+//! the broker's.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,13 +12,14 @@ use felix_client::{CacheChange, CacheWatchItem, CursorErrorReason, SubscribeCurs
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::access::{ControlPlane, Refused};
-use crate::felix::{Brokers, Felix};
+use crate::Gateway;
+use crate::access::Refused;
+use crate::felix::Felix;
 use crate::metrics::Metrics;
 use crate::protocol::{
-    ClientMessage, CounterName, ErrorCode, MemberEntry, ServerMessage, StartAt, StreamName,
+    CacheEntry, ClientMessage, ErrorCode, FEATURES, Join, PROTOCOL, ServerMessage, StartAt,
 };
-use crate::room::{BAD_NAME, Room, valid_name};
+use crate::scope::{BAD_NAME, CacheAction, CounterAction, Scope, StreamAction, valid_name};
 use crate::throttle::Throttle;
 use crate::transport::{BrowserConnection, Incoming};
 
@@ -35,54 +36,75 @@ const EVENT_QUEUE: usize = 1024;
 /// Writes waiting for Felix. A browser that outruns this stops being read.
 const WRITE_QUEUE: usize = 256;
 
-/// A write that must reach Felix in the order the browser sent it.
+/// A write that must reach Felix in the order the browser sent it. Aliases
+/// are for replies; names are Felix's.
 enum Write {
     Publish {
-        stream: StreamName,
+        stream: String,
+        name: String,
         payload: Vec<u8>,
         ack: bool,
         id: u64,
     },
-    /// Set (`Some`) or delete (`None`) a member entry.
-    Member {
+    /// Put (`Some`) or delete (`None`) a cache entry.
+    Cache {
+        cache: String,
+        name: String,
         key: String,
         payload: Option<Vec<u8>>,
+        ttl: Option<Duration>,
     },
 }
 
+/// One joined connection's tasks and queues.
+struct Session {
+    felix: Arc<Felix>,
+    throttle: Arc<Throttle>,
+    events: mpsc::Sender<ServerMessage>,
+    replies: mpsc::UnboundedSender<ServerMessage>,
+    writes: mpsc::Sender<Write>,
+    /// Keyed by stream alias.
+    subscriptions: HashMap<String, JoinHandle<()>>,
+    /// Keyed by cache alias.
+    watches: HashMap<String, JoinHandle<()>>,
+}
+
+/// What to do after handling one browser message.
+enum Next {
+    Continue,
+    Reply(ServerMessage),
+    /// The writer is gone, so the session is over.
+    Stop,
+}
+
 /// Relay one browser connection until it closes.
-pub(crate) async fn run<C: BrowserConnection>(
-    mut conn: C,
-    brokers: Arc<Brokers>,
-    control_plane: ControlPlane,
-    metrics: Arc<Metrics>,
-) {
-    let Some(felix) = join(&mut conn, &brokers, &control_plane).await else {
+pub(crate) async fn run<C: BrowserConnection>(mut conn: C, gateway: Gateway) {
+    let Some((felix, hello)) = join(&mut conn, &gateway).await else {
         return;
     };
     let felix = Arc::new(felix);
     let (events_tx, mut events_rx) = mpsc::channel(EVENT_QUEUE);
-    // Unbounded so the publish task never waits on the browser, which is what
-    // lets the loop below block on a full publish queue without deadlocking.
-    // Its length is bounded by WRITE_QUEUE anyway: one reply per write.
+    // Unbounded so the writer never waits on the browser, which is what lets
+    // the loop below block on a full write queue without deadlocking. Its
+    // length is bounded by WRITE_QUEUE anyway: one reply per write.
     let (replies_tx, mut replies_rx) = mpsc::unbounded_channel();
     let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE);
     let writer = tokio::spawn(write_in_order(
         write_rx,
         Arc::clone(&felix),
-        Arc::clone(&metrics),
+        Arc::clone(&gateway.metrics),
         replies_tx.clone(),
     ));
-    let mut subscriptions: HashMap<StreamName, JoinHandle<()>> = HashMap::new();
-    let mut members_watch: Option<JoinHandle<()>> = None;
-    let throttle = Arc::new(Throttle::default());
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-
-    let hello = ServerMessage::Hello {
-        namespace: brokers.namespace().to_string(),
-        room: felix.room().to_string(),
-        member_ttl_ms: u64::try_from(brokers.member_ttl().as_millis()).unwrap_or(u64::MAX),
+    let mut session = Session {
+        felix,
+        throttle: Arc::new(Throttle::default()),
+        events: events_tx,
+        replies: replies_tx,
+        writes: write_tx,
+        subscriptions: HashMap::new(),
+        watches: HashMap::new(),
     };
+    let mut ping = tokio::time::interval(PING_INTERVAL);
     if send(&mut conn, &hello).await.is_err() {
         return;
     }
@@ -92,93 +114,13 @@ pub(crate) async fn run<C: BrowserConnection>(
             incoming = conn.recv() => match incoming {
                 None => break,
                 Some(Incoming::RoundTrip(elapsed)) => {
-                    metrics.record_browser_rtt(elapsed);
+                    gateway.metrics.record_browser_rtt(elapsed);
                     continue;
                 }
-                Some(Incoming::Message(text)) => match serde_json::from_str(&text) {
-                    Ok(ClientMessage::Subscribe { stream, from }) => {
-                        let task = tokio::spawn(relay_subscription(
-                            stream,
-                            from,
-                            Arc::clone(&felix),
-                            Arc::clone(&throttle),
-                            events_tx.clone(),
-                        ));
-                        if let Some(previous) = subscriptions.insert(stream, task) {
-                            previous.abort();
-                        }
-                        continue;
-                    }
-                    Ok(ClientMessage::Publish { stream, payload, ack, id }) => {
-                        match BASE64.decode(payload) {
-                            Ok(payload) => {
-                                let publish = Write::Publish { stream, payload, ack, id };
-                                if write_tx.send(publish).await.is_err() {
-                                    break;
-                                }
-                                continue;
-                            }
-                            Err(err) => error(Some(id), Some(stream), ErrorCode::BadRequest, err),
-                        }
-                    }
-                    Ok(ClientMessage::SetMember { key, payload }) => {
-                        match BASE64.decode(payload) {
-                            Ok(_) if !valid_name(&key) => {
-                                error(None, None, ErrorCode::BadRequest, BAD_NAME)
-                            }
-                            Ok(payload) => {
-                                let write = Write::Member { key, payload: Some(payload) };
-                                if write_tx.send(write).await.is_err() {
-                                    break;
-                                }
-                                continue;
-                            }
-                            Err(err) => error(None, None, ErrorCode::BadRequest, err),
-                        }
-                    }
-                    Ok(ClientMessage::RemoveMember { key }) => {
-                        if valid_name(&key) {
-                            if write_tx.send(Write::Member { key, payload: None }).await.is_err() {
-                                break;
-                            }
-                            continue;
-                        }
-                        error(None, None, ErrorCode::BadRequest, BAD_NAME)
-                    }
-                    Ok(ClientMessage::WatchMembers) => {
-                        let task = tokio::spawn(relay_members(Arc::clone(&felix), events_tx.clone()));
-                        if let Some(previous) = members_watch.replace(task) {
-                            previous.abort();
-                        }
-                        continue;
-                    }
-                    Ok(ClientMessage::Join { .. }) => {
-                        error(None, None, ErrorCode::BadRequest, "already joined")
-                    }
-                    Ok(ClientMessage::CounterAdd { counter, key, delta, id }) => {
-                        if !valid_name(&key) {
-                            error(Some(id), None, ErrorCode::BadRequest, BAD_NAME)
-                        } else {
-                            tokio::spawn(add_to_counter(
-                                counter,
-                                key,
-                                delta,
-                                id,
-                                Arc::clone(&felix),
-                                replies_tx.clone(),
-                            ));
-                            continue;
-                        }
-                    }
-                    Ok(ClientMessage::Throttle { bits_per_second }) => {
-                        throttle.set(bits_per_second);
-                        continue;
-                    }
-                    Ok(ClientMessage::SnapshotGet { id }) => {
-                        tokio::spawn(get_snapshot(id, Arc::clone(&felix), replies_tx.clone()));
-                        continue;
-                    }
-                    Err(err) => error(None, None, ErrorCode::BadRequest, err),
+                Some(Incoming::Message(text)) => match session.handle(&text).await {
+                    Next::Continue => continue,
+                    Next::Reply(reply) => reply,
+                    Next::Stop => break,
                 },
             },
             Some(event) = events_rx.recv() => event,
@@ -195,18 +137,230 @@ pub(crate) async fn run<C: BrowserConnection>(
         }
     }
 
-    for task in subscriptions.into_values().chain(members_watch) {
+    let Session {
+        subscriptions,
+        watches,
+        writes,
+        ..
+    } = session;
+    for task in subscriptions.into_values().chain(watches.into_values()) {
         task.abort();
     }
     // Writes already handed over still complete, so a closing session's
-    // member delete lands; only their replies are lost.
-    drop(write_tx);
+    // cache delete lands; only their replies are lost.
+    drop(writes);
     let _ = writer.await;
 }
 
+impl Session {
+    async fn handle(&mut self, text: &str) -> Next {
+        let message = match serde_json::from_str(text) {
+            Ok(message) => message,
+            Err(err) => return Next::Reply(error(ErrorCode::BadRequest, err)),
+        };
+        let scope = &self.felix.scope;
+        match message {
+            ClientMessage::Subscribe { stream, from } => {
+                let name = match scope.stream(&stream, StreamAction::Subscribe) {
+                    Ok(bound) => bound.name,
+                    Err(refusal) => {
+                        return Next::Reply(stream_error(stream, ErrorCode::BadRequest, refusal));
+                    }
+                };
+                let task = tokio::spawn(relay_subscription(
+                    stream.clone(),
+                    name,
+                    from,
+                    Arc::clone(&self.felix),
+                    Arc::clone(&self.throttle),
+                    self.events.clone(),
+                ));
+                if let Some(previous) = self.subscriptions.insert(stream, task) {
+                    previous.abort();
+                }
+                Next::Continue
+            }
+            ClientMessage::Publish {
+                stream,
+                payload,
+                ack,
+                id,
+            } => {
+                let bound = match scope.stream(&stream, StreamAction::Publish) {
+                    Ok(bound) => bound,
+                    Err(refusal) => {
+                        return Next::Reply(with_id(
+                            id,
+                            stream_error(stream, ErrorCode::BadRequest, refusal),
+                        ));
+                    }
+                };
+                let mut payload = match BASE64.decode(payload) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        return Next::Reply(with_id(
+                            id,
+                            stream_error(stream, ErrorCode::BadRequest, err),
+                        ));
+                    }
+                };
+                if bound.resource.stamp_sender {
+                    payload = stamped(&self.felix.principal, &payload);
+                }
+                let name = bound.name;
+                self.write(Write::Publish {
+                    stream,
+                    name,
+                    payload,
+                    ack,
+                    id,
+                })
+                .await
+            }
+            ClientMessage::CounterAdd {
+                counter,
+                key,
+                delta,
+                id,
+            } => {
+                let name = match scope.counter(&counter, CounterAction::Add) {
+                    Ok(bound) => bound.name,
+                    Err(refusal) => {
+                        return Next::Reply(with_id(id, error(ErrorCode::BadRequest, refusal)));
+                    }
+                };
+                if !valid_name(&key) {
+                    return Next::Reply(with_id(id, error(ErrorCode::BadRequest, BAD_NAME)));
+                }
+                let felix = Arc::clone(&self.felix);
+                let replies = self.replies.clone();
+                tokio::spawn(async move {
+                    let reply = match felix.counter_add(&name, &key, delta).await {
+                        Ok(value) => ServerMessage::Counter { id, value },
+                        Err(err) => with_id(id, error(ErrorCode::CounterFailed, err)),
+                    };
+                    let _ = replies.send(reply);
+                });
+                Next::Continue
+            }
+            ClientMessage::CacheGet { cache, key, id } => {
+                let name = match scope.cache(&cache, CacheAction::Read) {
+                    Ok(_) if !valid_name(&key) => {
+                        return Next::Reply(with_id(
+                            id,
+                            cache_error(cache, ErrorCode::BadRequest, BAD_NAME),
+                        ));
+                    }
+                    Ok(bound) => bound.name,
+                    Err(refusal) => {
+                        return Next::Reply(with_id(
+                            id,
+                            cache_error(cache, ErrorCode::BadRequest, refusal),
+                        ));
+                    }
+                };
+                let felix = Arc::clone(&self.felix);
+                let replies = self.replies.clone();
+                tokio::spawn(async move {
+                    let reply = match felix.cache_get(&name, &key).await {
+                        Ok(payload) => ServerMessage::CacheValue {
+                            id,
+                            payload: payload.map(|bytes| BASE64.encode(bytes)),
+                        },
+                        Err(err) => with_id(id, cache_error(cache, ErrorCode::CacheFailed, err)),
+                    };
+                    let _ = replies.send(reply);
+                });
+                Next::Continue
+            }
+            ClientMessage::CachePut {
+                cache,
+                key,
+                payload,
+            } => match BASE64.decode(payload) {
+                Ok(payload) => self.write_cache(cache, key, Some(payload)).await,
+                Err(err) => Next::Reply(cache_error(cache, ErrorCode::BadRequest, err)),
+            },
+            ClientMessage::CacheDelete { cache, key } => self.write_cache(cache, key, None).await,
+            ClientMessage::CacheWatch { cache } => {
+                let name = match scope.cache(&cache, CacheAction::Watch) {
+                    Ok(bound) => bound.name,
+                    Err(refusal) => {
+                        return Next::Reply(cache_error(cache, ErrorCode::BadRequest, refusal));
+                    }
+                };
+                let task = tokio::spawn(relay_cache(
+                    cache.clone(),
+                    name,
+                    Arc::clone(&self.felix),
+                    self.events.clone(),
+                ));
+                if let Some(previous) = self.watches.insert(cache, task) {
+                    previous.abort();
+                }
+                Next::Continue
+            }
+            ClientMessage::Throttle { bits_per_second } => {
+                if !scope.config().allow_throttle {
+                    return Next::Reply(error(
+                        ErrorCode::Unsupported,
+                        "this gateway does not throttle",
+                    ));
+                }
+                self.throttle.set(bits_per_second);
+                Next::Continue
+            }
+            ClientMessage::Join {} => Next::Reply(error(ErrorCode::BadRequest, "already joined")),
+            ClientMessage::Unsupported => Next::Reply(error(
+                ErrorCode::Unsupported,
+                "this gateway does not know that message type",
+            )),
+        }
+    }
+
+    async fn write_cache(&self, cache: String, key: String, payload: Option<Vec<u8>>) -> Next {
+        let bound = match self.felix.scope.cache(&cache, CacheAction::Write) {
+            Ok(_) if !valid_name(&key) => {
+                return Next::Reply(cache_error(cache, ErrorCode::BadRequest, BAD_NAME));
+            }
+            Ok(bound) => bound,
+            Err(refusal) => return Next::Reply(cache_error(cache, ErrorCode::BadRequest, refusal)),
+        };
+        let ttl = bound.resource.ttl();
+        let name = bound.name;
+        self.write(Write::Cache {
+            cache,
+            name,
+            key,
+            payload,
+            ttl,
+        })
+        .await
+    }
+
+    async fn write(&self, write: Write) -> Next {
+        match self.writes.send(write).await {
+            Ok(()) => Next::Continue,
+            Err(_) => Next::Stop,
+        }
+    }
+}
+
+/// `payload` prefixed with `principal` and its length as two big-endian
+/// bytes, so a reader knows who published it.
+fn stamped(principal: &str, payload: &[u8]) -> Vec<u8> {
+    let principal = &principal.as_bytes()[..principal.len().min(usize::from(u16::MAX))];
+    let length = u16::try_from(principal.len()).unwrap_or(u16::MAX);
+    let mut stamped = Vec::with_capacity(2 + principal.len() + payload.len());
+    stamped.extend_from_slice(&length.to_be_bytes());
+    stamped.extend_from_slice(principal);
+    stamped.extend_from_slice(payload);
+    stamped
+}
+
 /// Write one at a time, in the order the browser sent them, so a session's
-/// ops reach the log in its own `seq` order and a member delete is never
-/// overtaken by the refresh before it.
+/// records reach the log in the order it sent them and a cache delete is
+/// never overtaken by the write before it.
 async fn write_in_order(
     mut queue: mpsc::Receiver<Write>,
     felix: Arc<Felix>,
@@ -217,28 +371,35 @@ async fn write_in_order(
         let reply = match write {
             Write::Publish {
                 stream,
+                name,
                 payload,
                 ack,
                 id,
             } => {
                 let started = Instant::now();
-                match felix.publish(stream, payload, ack).await {
+                match felix.publish(&name, payload, ack).await {
                     Ok(offset) if ack => {
-                        metrics.record_felix_ack(stream, started.elapsed());
+                        metrics.record_felix_ack(&stream, started.elapsed());
                         ServerMessage::Ack { id, offset }
                     }
                     Ok(_) => continue,
-                    Err(err) => error(Some(id), Some(stream), ErrorCode::PublishFailed, err),
+                    Err(err) => with_id(id, stream_error(stream, ErrorCode::PublishFailed, err)),
                 }
             }
-            Write::Member { key, payload } => {
+            Write::Cache {
+                cache,
+                name,
+                key,
+                payload,
+                ttl,
+            } => {
                 let written = match payload {
-                    Some(payload) => felix.set_member(&key, payload).await,
-                    None => felix.remove_member(&key).await,
+                    Some(payload) => felix.cache_put(&name, &key, payload, ttl).await,
+                    None => felix.cache_delete(&name, &key).await,
                 };
                 match written {
                     Ok(()) => continue,
-                    Err(err) => error(None, None, ErrorCode::MemberFailed, err),
+                    Err(err) => cache_error(cache, ErrorCode::CacheFailed, err),
                 }
             }
         };
@@ -247,13 +408,12 @@ async fn write_in_order(
 }
 
 /// Wait for the browser's `join`, exchange its sign-in for a token that
-/// reaches only that room, and connect to Felix with it. Anything else first,
+/// reaches only that scope, and connect to Felix with it. Anything else first,
 /// or a refusal, is answered with an error and ends the session.
 async fn join<C: BrowserConnection>(
     conn: &mut C,
-    brokers: &Brokers,
-    control_plane: &ControlPlane,
-) -> Option<Felix> {
+    gateway: &Gateway,
+) -> Option<(Felix, ServerMessage)> {
     let first = tokio::time::timeout(JOIN_TIMEOUT, async {
         loop {
             match conn.recv().await? {
@@ -265,46 +425,87 @@ async fn join<C: BrowserConnection>(
     .await
     .ok()??;
     let refusal = match serde_json::from_str(&first) {
-        Ok(ClientMessage::Join { room, token }) => match Room::parse(&room) {
-            Some(room) => match open(room, &token, brokers, control_plane).await {
-                Ok(felix) => return Some(felix),
+        Ok(ClientMessage::Join {}) => match serde_json::from_str(&first) {
+            Ok(join) => match accept(join, gateway).await {
+                Ok(joined) => return Some(joined),
                 Err(refusal) => refusal,
             },
-            None => error(None, None, ErrorCode::BadRequest, BAD_NAME),
+            Err(err) => error(ErrorCode::BadRequest, err),
         },
-        Ok(_) => error(None, None, ErrorCode::BadRequest, "join a room first"),
-        Err(err) => error(None, None, ErrorCode::BadRequest, err),
+        Ok(_) => error(ErrorCode::BadRequest, "join first"),
+        Err(err) => error(ErrorCode::BadRequest, err),
     };
     let _ = send(conn, &refusal).await;
     None
 }
 
-/// Exchange `token` for `room` and connect with the result. The error is the
+/// Open the session `join` asks for, and the `hello` that answers it.
+async fn accept(join: Join, gateway: &Gateway) -> Result<(Felix, ServerMessage), ServerMessage> {
+    if join.protocol != PROTOCOL {
+        return Err(error(
+            ErrorCode::Unsupported,
+            format!("this gateway speaks protocol {PROTOCOL}"),
+        ));
+    }
+    let field = &gateway.scope.scope.field;
+    let scope = join
+        .fields
+        .get(field)
+        .and_then(|value| value.as_str())
+        .and_then(|value| Scope::parse(&gateway.scope, value))
+        .ok_or_else(|| error(ErrorCode::BadRequest, format!("{field}: {BAD_NAME}")))?;
+    let (felix, missing) = connect(scope, &join.token, gateway).await?;
+    let hello = ServerMessage::Hello {
+        protocol: PROTOCOL,
+        features: join
+            .features
+            .into_iter()
+            .filter(|feature| FEATURES.contains(&feature.as_str()))
+            .collect(),
+        namespace: gateway.brokers.namespace().to_string(),
+        scope: BTreeMap::from([(field.clone(), felix.scope.value().to_string())]),
+        cache_ttl_ms: gateway.scope.cache_ttl_ms(),
+        missing,
+    };
+    Ok((felix, hello))
+}
+
+/// Exchange `token` for `scope` and connect with the result. The error is the
 /// message to answer the browser with.
 pub(crate) async fn open(
-    room: Room,
+    scope: Scope,
     token: &str,
-    brokers: &Brokers,
-    control_plane: &ControlPlane,
+    gateway: &Gateway,
 ) -> Result<Felix, ServerMessage> {
-    let grant = control_plane
-        .exchange(token, &room)
+    Ok(connect(scope, token, gateway).await?.0)
+}
+
+/// As [`open`], with the optional resources the session does not reach.
+async fn connect(
+    scope: Scope,
+    token: &str,
+    gateway: &Gateway,
+) -> Result<(Felix, Vec<String>), ServerMessage> {
+    let grant = gateway
+        .control_plane
+        .exchange(token, &scope)
         .await
         .map_err(|refusal| match refusal {
-            Refused::SignedOut => error(None, None, ErrorCode::SignedOut, "sign in again"),
-            Refused::Forbidden => error(
-                None,
-                None,
-                ErrorCode::Forbidden,
-                "not a member of this room",
-            ),
-            Refused::Unavailable(err) => error(None, None, ErrorCode::Unavailable, err),
+            Refused::SignedOut => error(ErrorCode::SignedOut, "sign in again"),
+            Refused::Forbidden => error(ErrorCode::Forbidden, "not allowed in this scope"),
+            Refused::Unavailable(err) => error(ErrorCode::Unavailable, err),
         })?;
-    let client = brokers
-        .connect(control_plane.tokens(grant))
+    let principal = grant.principal.clone();
+    let missing = grant.missing.clone();
+    let client = gateway
+        .brokers
+        .connect(gateway.control_plane.tokens(grant))
         .await
-        .map_err(|err| error(None, None, ErrorCode::Unavailable, err))?;
-    Ok(Felix::new(client, brokers, room))
+        .map_err(|err| error(ErrorCode::Unavailable, err))?;
+    Ok((
+        Felix::new(client, &gateway.brokers, scope, principal),
+        missing,
+    ))
 }
 
 async fn send<C: BrowserConnection>(conn: &mut C, message: &ServerMessage) -> anyhow::Result<()> {
@@ -312,40 +513,15 @@ async fn send<C: BrowserConnection>(conn: &mut C, message: &ServerMessage) -> an
         .await
 }
 
-async fn add_to_counter(
-    counter: CounterName,
-    key: String,
-    delta: i64,
-    id: u64,
-    felix: Arc<Felix>,
-    replies: mpsc::UnboundedSender<ServerMessage>,
-) {
-    let reply = match felix.counter_add(counter, &key, delta).await {
-        Ok(value) => ServerMessage::Counter { id, value },
-        Err(err) => error(Some(id), None, ErrorCode::CounterFailed, err),
-    };
-    let _ = replies.send(reply);
-}
-
-async fn get_snapshot(id: u64, felix: Arc<Felix>, replies: mpsc::UnboundedSender<ServerMessage>) {
-    let reply = match felix.snapshot().await {
-        Ok(payload) => ServerMessage::Snapshot {
-            id,
-            payload: payload.map(|bytes| BASE64.encode(bytes)),
-        },
-        Err(err) => error(Some(id), None, ErrorCode::SnapshotFailed, err),
-    };
-    let _ = replies.send(reply);
-}
-
 async fn relay_subscription(
-    stream: StreamName,
+    stream: String,
+    name: String,
     from: StartAt,
     felix: Arc<Felix>,
     throttle: Arc<Throttle>,
     events: mpsc::Sender<ServerMessage>,
 ) {
-    let mut subscription = match felix.subscribe(stream, from).await {
+    let mut subscription = match felix.subscribe(&name, from).await {
         Ok(subscription) => subscription,
         Err(err) => {
             let _ = events
@@ -355,7 +531,7 @@ async fn relay_subscription(
         }
     };
     let subscribed = ServerMessage::Subscribed {
-        stream,
+        stream: stream.clone(),
         start_offset: subscription.start_offset(),
         live_offset: subscription.live_offset(),
     };
@@ -366,7 +542,7 @@ async fn relay_subscription(
         match subscription.next_event().await {
             Ok(Some(event)) => {
                 let message = ServerMessage::Event {
-                    stream,
+                    stream: stream.clone(),
                     offset: event.offset,
                     skipped_before: event.skipped_before,
                     payload: BASE64.encode(&event.payload),
@@ -391,31 +567,31 @@ async fn relay_subscription(
 
 /// `trimmed`, naming the oldest offset left, when retention has passed the
 /// offset the subscription asked for; `code` otherwise.
-fn subscription_error(stream: StreamName, code: ErrorCode, err: anyhow::Error) -> ServerMessage {
+fn subscription_error(stream: String, code: ErrorCode, err: anyhow::Error) -> ServerMessage {
     let trimmed = err
         .chain()
         .filter_map(|cause| cause.downcast_ref::<SubscribeCursorError>())
         .find(|cursor| cursor.reason == CursorErrorReason::TooOld);
-    match trimmed {
-        Some(cursor) => ServerMessage::Error {
-            id: None,
-            stream: Some(stream),
-            code: ErrorCode::Trimmed,
-            oldest: Some(cursor.available),
-            message: format!("{err:#}"),
-        },
-        None => error(None, Some(stream), code, err),
+    let mut message = stream_error(stream, code, &err);
+    if let (Some(cursor), ServerMessage::Error { code, oldest, .. }) = (trimmed, &mut message) {
+        *code = ErrorCode::Trimmed;
+        *oldest = Some(cursor.available);
     }
+    message
 }
 
-/// Relay the room's member entries: the current set as one message, then
-/// each change.
-async fn relay_members(felix: Arc<Felix>, events: mpsc::Sender<ServerMessage>) {
-    let mut watch = match felix.watch_members().await {
+/// Relay a cache's entries: the current set as one message, then each change.
+async fn relay_cache(
+    cache: String,
+    name: String,
+    felix: Arc<Felix>,
+    events: mpsc::Sender<ServerMessage>,
+) {
+    let mut watch = match felix.watch_cache(&name).await {
         Ok(watch) => watch,
         Err(err) => {
             let _ = events
-                .send(error(None, None, ErrorCode::WatchFailed, err))
+                .send(cache_error(cache, ErrorCode::WatchFailed, err))
                 .await;
             return;
         }
@@ -424,49 +600,55 @@ async fn relay_members(felix: Arc<Felix>, events: mpsc::Sender<ServerMessage>) {
     let mut initial = Some(Vec::new());
     let ended = loop {
         if retained == 0
-            && let Some(members) = initial.take()
-            && events
-                .send(ServerMessage::Members { members })
-                .await
-                .is_err()
+            && let Some(entries) = initial.take()
         {
-            return;
+            let entries = ServerMessage::CacheEntries {
+                cache: cache.clone(),
+                entries,
+            };
+            if events.send(entries).await.is_err() {
+                return;
+            }
         }
         match watch.recv().await {
             Some(CacheWatchItem::Change(change)) => {
-                let entry = member_entry(change);
+                let entry = cache_entry(change);
                 match initial.as_mut() {
-                    Some(members) => {
+                    Some(entries) => {
                         retained -= 1;
                         if entry.payload.is_some() {
-                            members.push(entry);
+                            entries.push(entry);
                         }
                     }
                     None => {
-                        if events.send(ServerMessage::Member(entry)).await.is_err() {
+                        let change = ServerMessage::CacheChange {
+                            cache: cache.clone(),
+                            entry,
+                        };
+                        if events.send(change).await.is_err() {
                             return;
                         }
                     }
                 }
             }
-            Some(CacheWatchItem::Lagged { .. }) => break "the member watch fell behind",
+            Some(CacheWatchItem::Lagged { .. }) => break "the cache watch fell behind",
             // The watch follows a moved shard on the next recv.
             Some(CacheWatchItem::ShardMoved(_)) => {}
-            None => break "the member watch ended",
+            None => break "the cache watch ended",
         }
     };
     let _ = events
-        .send(error(None, None, ErrorCode::WatchFailed, ended))
+        .send(cache_error(cache, ErrorCode::WatchFailed, ended))
         .await;
 }
 
-fn member_entry(change: CacheChange) -> MemberEntry {
+fn cache_entry(change: CacheChange) -> CacheEntry {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
-    MemberEntry {
+    CacheEntry {
         key: change.key,
         payload: change.value.map(|value| BASE64.encode(value)),
         expires_in_ms: (change.expires_at_millis != 0)
@@ -474,19 +656,39 @@ fn member_entry(change: CacheChange) -> MemberEntry {
     }
 }
 
-fn error(
-    id: Option<u64>,
-    stream: Option<StreamName>,
-    code: ErrorCode,
-    err: impl std::fmt::Display,
-) -> ServerMessage {
+fn error(code: ErrorCode, err: impl std::fmt::Display) -> ServerMessage {
     ServerMessage::Error {
-        id,
-        stream,
+        id: None,
+        stream: None,
+        cache: None,
         code,
         oldest: None,
         message: format!("{err:#}"),
     }
+}
+
+fn stream_error(stream: String, code: ErrorCode, err: impl std::fmt::Display) -> ServerMessage {
+    let mut message = error(code, err);
+    if let ServerMessage::Error { stream: about, .. } = &mut message {
+        *about = Some(stream);
+    }
+    message
+}
+
+fn cache_error(cache: String, code: ErrorCode, err: impl std::fmt::Display) -> ServerMessage {
+    let mut message = error(code, err);
+    if let ServerMessage::Error { cache: about, .. } = &mut message {
+        *about = Some(cache);
+    }
+    message
+}
+
+/// `message`, an error, as the answer to request `id`.
+fn with_id(id: u64, mut message: ServerMessage) -> ServerMessage {
+    if let ServerMessage::Error { id: about, .. } = &mut message {
+        *about = Some(id);
+    }
+    message
 }
 
 #[cfg(test)]
@@ -500,22 +702,36 @@ mod tests {
             requested: 3,
             available: 120,
         })
-        .context("subscribe to canvas.ops.lobby");
-        let message = subscription_error(StreamName::Ops, ErrorCode::SubscribeFailed, err);
-        let ServerMessage::Error { code, oldest, .. } = message else {
+        .context("subscribe to app.ops.lobby");
+        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, err);
+        let ServerMessage::Error {
+            code,
+            oldest,
+            stream,
+            ..
+        } = message
+        else {
             panic!("{message:?}");
         };
-        assert_eq!((code, oldest), (ErrorCode::Trimmed, Some(120)));
+        assert_eq!(
+            (code, oldest, stream.as_deref()),
+            (ErrorCode::Trimmed, Some(120), Some("ops"))
+        );
 
         let future = anyhow::Error::new(SubscribeCursorError {
             reason: CursorErrorReason::InFuture,
             requested: 900,
             available: 10,
         });
-        let message = subscription_error(StreamName::Ops, ErrorCode::SubscribeFailed, future);
+        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, future);
         let ServerMessage::Error { code, oldest, .. } = message else {
             panic!("{message:?}");
         };
         assert_eq!((code, oldest), (ErrorCode::SubscribeFailed, None));
+    }
+
+    #[test]
+    fn a_stamp_carries_the_principal_and_its_length() {
+        assert_eq!(stamped("ana", b"\x01\x02"), b"\x00\x03ana\x01\x02");
     }
 }

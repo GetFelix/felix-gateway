@@ -1,19 +1,18 @@
-//! Latency of the gateway's two legs, kept apart so a slow edit can be
+//! Latency of the gateway's two legs, kept apart so a slow request can be
 //! blamed on the right hop.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
 use serde::Serialize;
 
-use crate::protocol::StreamName;
-
 /// Latency histograms in microseconds.
 pub struct Metrics {
     browser_rtt: Mutex<Histogram<u64>>,
-    felix_ack_ops: Mutex<Histogram<u64>>,
-    felix_ack_presence: Mutex<Histogram<u64>>,
+    /// Keyed by stream alias.
+    felix_publish_ack: HashMap<String, Mutex<Histogram<u64>>>,
 }
 
 /// Percentiles of one histogram, in microseconds.
@@ -27,47 +26,50 @@ pub struct Summary {
 }
 
 /// What `GET /metrics` returns.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     /// Browser to gateway and back: WebSocket ping to pong.
     pub browser_rtt: Summary,
-    /// Gateway to Felix and back: an acknowledged publish on the ops stream.
-    pub felix_publish_ack_ops: Summary,
-    /// The same on the presence stream.
-    pub felix_publish_ack_presence: Summary,
+    /// Gateway to Felix and back: an acknowledged publish, for each stream.
+    pub felix_publish_ack: BTreeMap<String, Summary>,
 }
 
-impl Default for Metrics {
-    fn default() -> Self {
-        // 1 µs to 60 s at 3 significant digits.
-        let histogram = || Mutex::new(Histogram::new_with_bounds(1, 60_000_000, 3).unwrap());
-        Self {
-            browser_rtt: histogram(),
-            felix_ack_ops: histogram(),
-            felix_ack_presence: histogram(),
-        }
-    }
+fn histogram() -> Mutex<Histogram<u64>> {
+    // 1 µs to 60 s at 3 significant digits.
+    Mutex::new(Histogram::new_with_bounds(1, 60_000_000, 3).unwrap())
 }
 
 impl Metrics {
+    /// Histograms for the browser leg and for publishes on each of `streams`.
+    pub(crate) fn new<'a>(streams: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            browser_rtt: histogram(),
+            felix_publish_ack: streams
+                .into_iter()
+                .map(|stream| (stream.to_string(), histogram()))
+                .collect(),
+        }
+    }
+
     pub(crate) fn record_browser_rtt(&self, elapsed: Duration) {
         record(&self.browser_rtt, elapsed);
     }
 
-    pub(crate) fn record_felix_ack(&self, stream: StreamName, elapsed: Duration) {
-        let histogram = match stream {
-            StreamName::Ops => &self.felix_ack_ops,
-            StreamName::Presence => &self.felix_ack_presence,
-        };
-        record(histogram, elapsed);
+    pub(crate) fn record_felix_ack(&self, stream: &str, elapsed: Duration) {
+        if let Some(histogram) = self.felix_publish_ack.get(stream) {
+            record(histogram, elapsed);
+        }
     }
 
     /// The percentiles recorded so far.
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             browser_rtt: summarize(&self.browser_rtt),
-            felix_publish_ack_ops: summarize(&self.felix_ack_ops),
-            felix_publish_ack_presence: summarize(&self.felix_ack_presence),
+            felix_publish_ack: self
+                .felix_publish_ack
+                .iter()
+                .map(|(stream, histogram)| (stream.clone(), summarize(histogram)))
+                .collect(),
         }
     }
 }

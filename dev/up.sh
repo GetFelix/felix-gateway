@@ -37,6 +37,7 @@ for _ in $(seq 1 90); do
     fi
     echo "Felix is ready. For the gateway:"
     echo "  export CANVAS_FELIX_CA_FILE=dev/state/broker-cert.pem"
+    echo "  export CANVAS_SCOPE_FILE=deploy/scope.toml"
     if [[ ${#health[@]} -gt 1 ]]; then
       echo "  export CANVAS_FELIX_BROKERS=127.0.0.1:5000,127.0.0.1:5010,127.0.0.1:5020"
     fi

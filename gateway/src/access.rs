@@ -1,6 +1,6 @@
 //! Per-session Felix credentials. A browser's sign-in is exchanged at the
-//! Felix control plane for a token narrowed to one room, so the broker, not
-//! the gateway, is what keeps a session out of every other room.
+//! Felix control plane for a token narrowed to one scope, so the broker, not
+//! the gateway, is what keeps a session out of every other scope.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -13,24 +13,28 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::room::Room;
+use crate::scope::{Permission, Scope};
 
-/// Why a sign-in was not exchanged for a room token.
+/// Why a sign-in was not exchanged for a scope token.
 #[derive(Debug)]
 pub enum Refused {
     /// No usable sign-in: missing, expired, or from an identity provider the
     /// tenant does not trust. Signing in again may help.
     SignedOut,
-    /// Signed in, but not a member of the room, or the room does not exist.
+    /// Signed in, but not allowed in the scope, or the scope does not exist.
     Forbidden,
     /// The control plane could not be asked or gave an answer that made no sense.
     Unavailable(anyhow::Error),
 }
 
-/// A room token and the refresh token that replaces it.
+/// A scope token and the refresh token that replaces it.
 pub(crate) struct Grant {
     pub(crate) felix_token: String,
     refresh_token: String,
+    /// Who the token is for: its `sub` claim.
+    pub(crate) principal: String,
+    /// Aliases of the optional resources the token does not reach.
+    pub(crate) missing: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -58,14 +62,14 @@ impl ControlPlane {
         }
     }
 
-    /// Exchange `id_token` for a token that reaches `room` and nothing else.
+    /// Exchange `id_token` for a token that reaches `scope` and nothing else.
     ///
     /// The exchange only narrows what RBAC grants, so membership is decided
-    /// by the room's role in Felix. A sign-in whose token lacks any of the
-    /// room's grants is refused here rather than failing piecemeal later.
-    pub(crate) async fn exchange(&self, id_token: &str, room: &Room) -> Result<Grant, Refused> {
-        let grants = room.grants(&self.tenant, &self.namespace);
-        let (actions, objects) = split(&grants);
+    /// by the scope's role in Felix. A sign-in whose token lacks any required
+    /// grant is refused here rather than failing piecemeal later.
+    pub(crate) async fn exchange(&self, id_token: &str, scope: &Scope) -> Result<Grant, Refused> {
+        let permissions = scope.permissions(&self.tenant, &self.namespace);
+        let (actions, objects) = split(&permissions);
         let response = self
             .http
             .post(format!(
@@ -91,18 +95,19 @@ impl ControlPlane {
             .json()
             .await
             .map_err(|err| Refused::Unavailable(err.into()))?;
-        if !covers(&answer.felix_token, &grants) {
-            return Err(Refused::Forbidden);
-        }
+        let claims = claims(&answer.felix_token).ok_or(Refused::Forbidden)?;
+        let missing = missing(&claims, &permissions).ok_or(Refused::Forbidden)?;
         Ok(Grant {
             felix_token: answer.felix_token,
             refresh_token: answer.refresh_token,
+            principal: claims.sub,
+            missing,
         })
     }
 
     /// Tokens for one session, starting from `grant` and refreshed before
     /// each expires. A refresh re-runs RBAC with the same narrowing, so a
-    /// member removed from the room loses access at the next one.
+    /// member removed from the scope loses access at the next one.
     pub(crate) fn tokens(&self, grant: Grant) -> Arc<dyn TokenProvider> {
         let control_plane = self.clone();
         let refresh_token = Arc::new(Mutex::new(grant.refresh_token));
@@ -130,53 +135,68 @@ impl ControlPlane {
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .context("refresh the room token")?
+            .context("refresh the scope token")?
             .json()
             .await
-            .context("read the refreshed room token")?;
+            .context("read the refreshed scope token")?;
         *refresh_token.lock().expect("refresh token lock") = answer.refresh_token;
         Ok(answer.felix_token)
     }
 }
 
-/// The distinct actions and objects in `grants`, which is how the exchange
-/// takes a narrowing.
-fn split(grants: &[String]) -> (BTreeSet<&str>, BTreeSet<&str>) {
-    grants
+/// The distinct actions and objects in `permissions`, which is how the
+/// exchange takes a narrowing.
+fn split(permissions: &[Permission]) -> (BTreeSet<&str>, BTreeSet<&str>) {
+    permissions
         .iter()
-        .filter_map(|grant| grant.split_once(':'))
+        .filter_map(|permission| permission.grant.split_once(':'))
         .unzip()
 }
 
-/// Whether a Felix token's `perms` claim holds every one of `grants`. The
-/// token came straight from the control plane; checking its signature is the
-/// broker's job.
-fn covers(token: &str, grants: &[String]) -> bool {
-    #[derive(Deserialize)]
-    struct Claims {
-        perms: Vec<String>,
+#[derive(Deserialize)]
+struct Claims {
+    #[serde(default)]
+    sub: String,
+    perms: Vec<String>,
+}
+
+/// A Felix token's claims. The token came straight from the control plane;
+/// checking its signature is the broker's job.
+fn claims(token: &str) -> Option<Claims> {
+    let payload = token.split('.').nth(1)?;
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()
+}
+
+/// The optional resources `claims` do not reach, or `None` when they miss a
+/// required permission.
+fn missing(claims: &Claims, permissions: &[Permission]) -> Option<Vec<String>> {
+    let mut missing = Vec::new();
+    for permission in permissions {
+        if claims.perms.contains(&permission.grant) {
+            continue;
+        }
+        let alias = permission.optional.as_ref()?;
+        if !missing.contains(alias) {
+            missing.push(alias.clone());
+        }
     }
-    let claims = token
-        .split('.')
-        .nth(1)
-        .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
-        .and_then(|bytes| serde_json::from_slice::<Claims>(&bytes).ok());
-    claims.is_some_and(|claims| grants.iter().all(|grant| claims.perms.contains(grant)))
+    Some(missing)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope::tests::lobby;
 
     fn token(perms: &[&str]) -> String {
-        let claims = URL_SAFE_NO_PAD.encode(json!({ "perms": perms }).to_string());
+        let claims = URL_SAFE_NO_PAD.encode(json!({ "sub": "ana", "perms": perms }).to_string());
         format!("e30.{claims}.c2ln")
     }
 
     #[test]
     fn the_narrowing_names_each_action_and_object_once() {
-        let grants = Room::parse("lobby").unwrap().grants("canvas", "default");
-        let (actions, objects) = split(&grants);
+        let permissions = lobby().permissions("t", "default");
+        let (actions, objects) = split(&permissions);
         assert_eq!(
             actions.into_iter().collect::<Vec<_>>(),
             [
@@ -189,22 +209,38 @@ mod tests {
         assert_eq!(
             objects.into_iter().collect::<Vec<_>>(),
             [
-                "cache:canvas/default/canvas.members.lobby",
-                "cache:canvas/default/canvas.seq.lobby",
-                "cache:canvas/default/canvas.snap.lobby",
-                "stream:canvas/default/canvas.ops.lobby",
-                "stream:canvas/default/canvas.presence.lobby",
+                "cache:t/default/app.members.lobby",
+                "cache:t/default/app.seq.lobby",
+                "stream:t/default/app.input.lobby",
+                "stream:t/default/app.ops.lobby",
             ]
         );
     }
 
     #[test]
-    fn a_token_missing_any_grant_does_not_cover_the_room() {
-        let grants = Room::parse("lobby").unwrap().grants("canvas", "default");
-        let all: Vec<&str> = grants.iter().map(String::as_str).collect();
-        assert!(covers(&token(&all), &grants));
-        assert!(!covers(&token(&all[1..]), &grants));
-        assert!(!covers(&token(&[]), &grants));
-        assert!(!covers("not a token", &grants));
+    fn a_token_missing_a_required_grant_does_not_cover_the_scope() {
+        let permissions = lobby().permissions("t", "default");
+        let all: Vec<&str> = permissions.iter().map(|p| p.grant.as_str()).collect();
+        let covered = |token: &str| claims(token).and_then(|claims| missing(&claims, &permissions));
+        assert_eq!(covered(&token(&all)), Some(vec![]));
+        assert_eq!(claims(&token(&all)).unwrap().sub, "ana");
+        assert_eq!(covered(&token(&all[1..])), None);
+        assert_eq!(covered(&token(&[])), None);
+        assert_eq!(covered("not a token"), None);
+    }
+
+    #[test]
+    fn a_token_without_an_optional_grant_reports_it_missing() {
+        let permissions = lobby().permissions("t", "default");
+        let without_input: Vec<&str> = permissions
+            .iter()
+            .filter(|p| p.optional.is_none())
+            .map(|p| p.grant.as_str())
+            .collect();
+        let claims = claims(&token(&without_input)).unwrap();
+        assert_eq!(
+            missing(&claims, &permissions),
+            Some(vec!["input".to_string()])
+        );
     }
 }

@@ -32,8 +32,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=gateway /usr/local/bin/felix-canvas-gateway /usr/local/bin/
 COPY --from=web /src/web/dist /usr/share/felix-canvas/web
+COPY deploy/scope.toml /usr/share/felix-canvas/scope.toml
 ENV CANVAS_LISTEN=0.0.0.0:8787 \
-    CANVAS_WEB_DIR=/usr/share/felix-canvas/web
+    CANVAS_WEB_DIR=/usr/share/felix-canvas/web \
+    CANVAS_SCOPE_FILE=/usr/share/felix-canvas/scope.toml
 USER 65532:65532
 EXPOSE 8787/tcp
 HEALTHCHECK --interval=10s --timeout=2s --start-period=5s --retries=6 \

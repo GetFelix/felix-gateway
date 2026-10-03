@@ -6,18 +6,84 @@ back, without decoding payloads. One gateway serves every room: a connection
 names its room and signs in with its first message, `join`, and from then on
 reaches that room and nothing else.
 
-Each room has two streams and one member list:
+The gateway itself knows nothing about canvases. A scope file, described
+[below](#the-scope-file), tells it what a connection opens (for the canvas, a
+room) and which Felix streams, caches and counters each one owns. Messages
+name those by alias. The canvas's scope file is `deploy/scope.toml`:
 
-| Name | Felix stream | Kind | Offsets |
+| Alias | Kind | Felix name | Notes |
 |---|---|---|---|
-| `ops` | `canvas.ops.<room>` | Durable, kept until the broker's retention trims it | Every event has one |
-| `presence` | `canvas.presence.<room>` | In memory, at most once | Always `null` |
+| `ops` | Stream | `canvas.ops.<room>` | Durable, kept until the broker's retention trims it. Every event has an offset |
+| `presence` | Stream | `canvas.presence.<room>` | In memory, at most once. Offsets are always `null` |
+| `snap` | Cache | `canvas.snap.<room>` | The snapshot, key `latest` |
+| `members` | Cache | `canvas.members.<room>` | One key per session, each expiring unless its session writes it again |
+| `seq` | Counter | `canvas.seq.<room>` | Per-session op sequence numbers |
 
-The member list is the Felix cache `canvas.members.<room>`, one key per
-session, each expiring unless its session writes it again. The room's other
-caches are `canvas.seq.<room>` for sequence numbers and `canvas.snap.<room>`
-for the snapshot. Every room has its own streams and caches because Felix
-authorizes a cache as a whole, never one key of it.
+Every room has its own streams and caches because Felix authorizes a cache as
+a whole, never one key of it.
+
+## The scope file
+
+The gateway reads it from the path in `CANVAS_SCOPE_FILE` when it starts, and
+refuses to start if it breaks any rule below.
+
+```toml
+# Whether a browser may slow its own connection with `throttle`. Default false.
+allow_throttle = true
+
+[scope]
+# The key `join` carries the scope's value under.
+field = "room"
+
+[[scope.streams]]
+alias = "ops"
+name = "canvas.ops.{scope}"
+actions = ["publish", "subscribe"]
+
+[[scope.caches]]
+alias = "members"
+name = "canvas.members.{scope}"
+actions = ["read", "write", "watch"]
+ttl_s = 30
+
+[[scope.counters]]
+alias = "seq"
+name = "canvas.seq.{scope}"
+actions = ["add"]
+```
+
+| Key | Meaning |
+|---|---|
+| `field` | 1 to 64 ASCII letters, digits, `-` or `_`, and not `type`, `token`, `protocol` or `features` |
+| `alias` | What messages call the resource. The same rule as `field`, unique within its kind |
+| `name` | The Felix name. `{scope}` is replaced by the scope's value, and must appear, or every scope would share the resource |
+| `actions` | What a session may do. Streams: `publish`, `subscribe`. Caches: `read` (`cache_get`), `write` (`cache_put`, `cache_delete`), `watch` (`cache_watch`). Counters: `add` |
+| `optional` | Default `false`. When `true`, a sign-in that does not reach this resource still joins, and `hello` lists the alias under `missing` |
+| `stamp_sender` | Streams only, default `false`. Each publish is prefixed with the publisher's Felix principal (the `sub` of its scope token) as a 2-byte big-endian length and the UTF-8 bytes, so a reader knows who sent it and a browser cannot speak for someone else |
+| `ttl_s` | Caches only. How long an entry written with `cache_put` lasts without another write, in seconds, above 0. Without it entries never expire |
+
+Each action needs one Felix permission on the resource: `stream.publish`,
+`stream.subscribe`, `cache.read` (read and watch), or `cache.write` (write,
+and a counter's add, since Felix keeps counters in caches). A join asks for
+exactly those.
+
+## Versions and features
+
+The protocol has a version and a list of features, the way Felix's own wire
+protocol negotiates capabilities instead of bumping versions. A `join` names
+the version it speaks in `protocol` and the optional features it wants in
+`features`; `hello` answers with the version and the subset of those features
+the gateway accepted. A browser uses a feature only if `hello` lists it.
+
+- A `join` without `protocol` is version 1, and one without `features` asks
+  for none. Version 1 is frozen: a change that an older browser would misread
+  is a new feature or a new version, never an edit to version 1.
+- This gateway speaks version 1 and has no features yet.
+- A `join` asking for another version is refused with `unsupported`.
+- A message type the gateway does not know is answered with an `unsupported`
+  error, and the connection stays open.
+- A field added to a message later is optional, and leaving it out means what
+  the message meant before the field existed.
 
 ## Signing in
 
@@ -44,24 +110,27 @@ describes what the gateway does with it.
 ### `join`
 
 ```json
-{"type": "join", "room": "lobby", "token": "eyJhbGciOiJFUzI1NiIs..."}
+{"type": "join", "protocol": 1, "features": [], "room": "lobby", "token": "eyJhbGciOiJFUzI1NiIs..."}
 ```
 
 | Field | Meaning |
 |---|---|
-| `room` | The room to open: 1 to 64 ASCII letters, digits, `-` or `_` |
+| `protocol` | The protocol version. Optional; leaving it out means 1 |
+| `features` | Optional features to turn on. Optional; leaving it out asks for none |
+| `room` | The scope's value, under the scope file's `field`: 1 to 64 ASCII letters, digits, `-` or `_` |
 | `token` | The ID token from signing in |
 
 The first message on every connection, and the only one allowed before
 `hello`. The gateway exchanges the ID token at the Felix control plane for a
-Felix token narrowed to this room and opens its Felix connection with it. It
-answers `hello`, or one `error` and then closes the connection:
+Felix token narrowed to this room's permissions and opens its Felix connection
+with it. It answers `hello`, or one `error` and then closes the connection:
 
 | Code | Meaning | What the canvas does |
 |---|---|---|
 | `forbidden` | The signed-in person is not a member of the room, or the room does not exist | Shows "You don't have access to this canvas" and stops |
 | `signed_out` | The ID token is missing, expired or from a provider the deployment does not trust | Offers to sign in again |
 | `unavailable` | The control plane or the brokers could not be reached | Reconnects as after any drop |
+| `unsupported` | The `join` asked for a protocol version this gateway does not speak | |
 | `bad_request` | The first message was not a `join`, or the room name is not allowed | |
 
 Messages sent after `join` and before `hello` wait for the answer, so a page
@@ -77,7 +146,7 @@ nothing for 10 seconds is closed.
 
 | Field | Meaning |
 |---|---|
-| `stream` | `"ops"` or `"presence"` |
+| `stream` | A stream alias whose actions include `subscribe` |
 | `from` | `"live"` for only what is published from now on, or a log offset: the first record wanted, which is the last offset handled plus one |
 
 Subscribing to a stream the connection is already subscribed to replaces the
@@ -95,15 +164,16 @@ oldest offset left. The browser then joins again from the snapshot, as below.
 
 | Field | Meaning |
 |---|---|
-| `stream` | `"ops"` or `"presence"` |
-| `payload` | The record, base64. The gateway passes the bytes through unread. |
+| `stream` | A stream alias whose actions include `publish` |
+| `payload` | The record, base64. The gateway passes the bytes through unread, after the sender's stamp on a `stamp_sender` stream |
 | `ack` | `true` to be told when Felix has the record. `false` publishes fire-and-forget, which is what cursors want. |
 | `id` | An integer chosen by the browser. It comes back on the `ack` or `error` for this publish. |
 
-A connection's publishes reach Felix one at a time, in the order the browser
-sent them, so one session's ops land in the log in its own `seq` order. The
-gateway never resends a publish. When one fails the browser decides whether to
-retry, because only the op's `(sid, seq)` makes a retry safe to deduplicate.
+A connection's publishes and cache writes reach Felix one at a time, in the
+order the browser sent them, so one session's ops land in the log in its own
+`seq` order. The gateway never resends a publish. When one fails the browser
+decides whether to retry, because only the op's `(sid, seq)` makes a retry safe
+to deduplicate.
 
 ### `counter_add`
 
@@ -113,7 +183,7 @@ retry, because only the op's `(sid, seq)` makes a retry safe to deduplicate.
 
 | Field | Meaning |
 |---|---|
-| `counter` | `"seq"`, the only counter: per-session op sequence numbers, key `key` in the Felix counter cache `canvas.seq.<room>` |
+| `counter` | A counter alias. The canvas has one, `seq`: per-session op sequence numbers |
 | `key` | 1 to 64 ASCII letters, digits, `-` or `_` |
 | `delta` | A signed 64-bit amount to add |
 | `id` | As for `publish`; it comes back on the `counter` or `error` |
@@ -124,14 +194,15 @@ counter and uses the 1,024 numbers below the sum, fetching another block when
 half are gone. Felix counts an add retried after a lost answer twice, which
 only wastes numbers.
 
-### `snapshot_get`
+### `cache_get`
 
 ```json
-{"type": "snapshot_get", "id": 9}
+{"type": "cache_get", "cache": "snap", "key": "latest", "id": 9}
 ```
 
-Read the room's snapshot, key `latest` in the Felix cache `canvas.snap.<room>`. The gateway
-answers with a `snapshot` message carrying the same `id`.
+Reads one entry of a cache whose actions include `read`. `key` follows the
+rule for `counter_add`. The gateway answers with a `cache_value` message
+carrying the same `id`. The canvas reads its snapshot this way.
 
 ### Joining
 
@@ -140,8 +211,8 @@ A browser joins a room in this order:
 1. `subscribe` to `ops` from `"live"` and wait for `subscribed`. Its
    `live_offset` is the tail `L`, and every op from `L` on will arrive as an
    event, including any published while the next step is in flight.
-2. `snapshot_get`. Decode the snapshot with `decodeSnapshot` from `model/`; it
-   holds the room through offset `N`.
+2. `cache_get` key `latest` of `snap`. Decode the snapshot with
+   `decodeSnapshot` from `model/`; it holds the room through offset `N`.
 3. Drop buffered events at or below `N`. If `N + 1 < L`, `subscribe` to `ops`
    from `N + 1` to read the ops in between. With no snapshot, subscribe from 0.
 
@@ -160,52 +231,58 @@ its live subscription is never replaced:
 2. A jump in offsets is a drop, as on any subscription: `subscribe` again from
    the first offset missing.
 3. A `trimmed` answer means retention has discarded the start of the log. Read
-   the snapshot with `snapshot_get` and `subscribe` from its offset plus one;
+   the snapshot with `cache_get` and `subscribe` from its offset plus one;
    history starts there.
 
 Closing the connection ends the read. The gateway keeps nothing about it, and
 reading again later subscribes from the first offset the page does not hold.
 [design.md](design.md#history-and-the-time-scrubber) describes what the page
 does with it.
-### `set_member`
+
+### `cache_put`
 
 ```json
-{"type": "set_member", "key": "3f9a0c12d4e5b6a7", "payload": "gqRuYW1lo0FuYaVjb2xvcgI="}
+{"type": "cache_put", "cache": "members", "key": "3f9a0c12d4e5b6a7", "payload": "gqRuYW1lo0FuYaVjb2xvcgI="}
 ```
 
-Writes this session's member entry, key `key` in `canvas.members.<room>`, with the
-TTL the gateway announced in `hello`. `key` follows the rule for `counter_add`.
-The canvas writes its entry on connecting and again every third of the TTL, so
-a session that stops writing drops out of everyone's list within one TTL. There
-is no reply; a failed write is an `error` with code `member_failed`.
+Writes one entry of a cache whose actions include `write`, with the cache's
+`ttl_s` when it has one; `hello` gives each TTL in milliseconds. `key` follows
+the rule for `counter_add`. There is no reply; a failed write is an `error`
+with code `cache_failed` and the cache's alias.
 
-### `remove_member`
+The canvas keeps its member list this way: each session writes its entry in
+`members`, keyed by session, on connecting and again every third of the TTL,
+so a session that stops writing drops out of everyone's list within one TTL.
+
+### `cache_delete`
 
 ```json
-{"type": "remove_member", "key": "3f9a0c12d4e5b6a7"}
+{"type": "cache_delete", "cache": "members", "key": "3f9a0c12d4e5b6a7"}
 ```
 
-Deletes the entry at once, for a tab that is closing. A connection's member
-writes and publishes reach Felix one at a time in the order sent, so a delete is
-never overtaken by the refresh before it.
+Deletes one entry at once, needing `write` as `cache_put` does. A
+connection's cache writes and publishes reach Felix one at a time in the order
+sent, so a delete is never overtaken by the write before it.
 
 A message sent while a page unloads may never leave it, so a closing tab also
 sends `POST /members/leave` with `navigator.sendBeacon`, which the browser
 delivers after the page is gone. The body is
-`{"room": "lobby", "token": "<ID token>", "key": "3f9a0c12d4e5b6a7"}`, and the
-gateway exchanges the token exactly as for `join` before it deletes anything.
-It answers 204, 400 for a bad room or key, or 403 with the refusal as an
-`error` message.
+`{"room": "lobby", "token": "<ID token>", "cache": "members", "key": "3f9a0c12d4e5b6a7"}`,
+with the room under the scope file's `field`, and the gateway exchanges the
+token exactly as for `join` before it deletes anything. It answers 204, 400
+for a bad room or key or a cache that does not allow `write`, or 403 with the
+refusal as an `error` message.
 
-### `watch_members`
+### `cache_watch`
 
 ```json
-{"type": "watch_members"}
+{"type": "cache_watch", "cache": "members"}
 ```
 
-Asks for the room's member list: one `members` message with every entry, then a
-`member` message for each later write or delete. Watching again replaces the
-earlier watch and starts with a fresh `members`.
+Asks for a cache's entries, needing `watch`: one `cache_entries` message with
+every entry, then a `cache_change` message for each later write or delete.
+Watching the same cache again replaces the earlier watch and starts with a
+fresh `cache_entries`.
 
 ### `throttle`
 
@@ -219,19 +296,27 @@ Reads this connection's subscriptions no faster than a link of
 0 lifts the limit. It stands in for a slow network, so the slow-client
 demonstration runs anywhere: Felix keeps delivering at full speed, the
 subscription's bounded queue fills and drops new events, and the browser sees a
-gap. Other connections are not affected. There is no reply.
+gap. Other connections are not affected. There is no reply. A gateway whose
+scope file does not set `allow_throttle` answers `unsupported`.
 
 ## Gateway to browser
 
 ### `hello`
 
 ```json
-{"type": "hello", "namespace": "default", "room": "lobby", "member_ttl_ms": 30000}
+{"type": "hello", "protocol": 1, "features": [], "namespace": "default", "room": "lobby", "cache_ttl_ms": {"members": 30000}}
 ```
 
-The answer to `join`: the session is open on this room, and this is how long
-a member entry lasts without a write. `CANVAS_MEMBER_TTL_SECONDS` sets
-the TTL; it defaults to 30 seconds.
+The answer to `join`: the session is open on this room.
+
+| Field | Meaning |
+|---|---|
+| `protocol` | The version the session speaks |
+| `features` | The features of the `join` the gateway accepted |
+| `namespace` | The Felix namespace the room lives in |
+| `room` | The scope's value, under the scope file's `field` |
+| `cache_ttl_ms` | How long an entry lasts without a write, for each cache with a `ttl_s` |
+| `missing` | Present only when not empty: aliases of `optional` resources this sign-in does not reach |
 
 ### `subscribed`
 
@@ -243,7 +328,7 @@ The subscription is registered with the broker. Anything published from this
 point on will be delivered, which is what the join path's subscribe-before-read
 rule waits for. `start_offset` is the first offset this subscription delivers
 and `live_offset` is the stream's tail when it was registered; both are `null`
-on `presence`. From `"live"` the two are equal.
+on a stream with no log, such as `presence`. From `"live"` the two are equal.
 
 ### `event`
 
@@ -270,7 +355,7 @@ what one room's log reaches.
 Felix accepted publish `id`. `offset` is the record's log offset when the broker
 had one to give, and `null` when:
 
-- the stream is `presence`, which has no log;
+- the stream has no log, as `presence`;
 - the broker acknowledged when it queued the record rather than after writing
   it. That is Felix's default; the development stack in `dev/` sets
   `FELIX_ACK_ON_COMMIT=true` so that ops acks carry offsets.
@@ -285,32 +370,35 @@ A publish with `"ack": false` gets no `ack`, only an `error` if it fails.
 
 The counter's sum after the `counter_add` with this `id`.
 
-### `snapshot`
+### `cache_value`
 
 ```json
-{"type": "snapshot", "id": 9, "payload": "hKF2AaZvZmZzZXTN..."}
+{"type": "cache_value", "id": 9, "payload": "hKF2AaZvZmZzZXTN..."}
 ```
 
-The answer to `snapshot_get`: the snapshot's bytes in base64, as the
-snapshotter wrote them, or `null` when the room has none yet. The gateway does
-not decode them. [Snapshot payload](#snapshot-payload) describes the format.
-### `members` and `member`
+The answer to `cache_get`: the entry's bytes in base64, or `null` when there
+is none. For `snap`, that is the snapshot as the snapshotter wrote it, or
+`null` when the room has none yet. The gateway does not decode it.
+[Snapshot payload](#snapshot-payload) describes the format.
+
+### `cache_entries` and `cache_change`
 
 ```json
-{"type": "members", "members": [{"key": "3f9a0c12d4e5b6a7", "payload": "gqRu...", "expires_in_ms": 21500}]}
-{"type": "member", "key": "3f9a0c12d4e5b6a7", "payload": null, "expires_in_ms": null}
+{"type": "cache_entries", "cache": "members", "entries": [{"key": "3f9a0c12d4e5b6a7", "payload": "gqRu...", "expires_in_ms": 21500}]}
+{"type": "cache_change", "cache": "members", "key": "3f9a0c12d4e5b6a7", "payload": null, "expires_in_ms": null}
 ```
 
 | Field | Meaning |
 |---|---|
-| `key` | The session, without the room prefix |
+| `cache` | The cache's alias |
+| `key` | The entry's key |
 | `payload` | The entry, base64, or `null` when it was deleted |
 | `expires_in_ms` | Milliseconds until the entry expires, measured on the gateway's clock when it relayed the change; `null` for an entry with no TTL |
 
-Felix expires entries lazily and sends nothing when one lapses
-([felix#960](https://github.com/gabloe/felix/issues/960)), so the browser
-drops an entry itself once `expires_in_ms` has passed without a newer write.
-A relative time keeps the browser's own clock out of it.
+The Felix release the canvas uses expires entries lazily and sends nothing when one
+lapses ([felix#960](https://github.com/gabloe/felix/issues/960)), so the
+browser drops an entry itself once `expires_in_ms` has passed without a newer
+write. A relative time keeps the browser's own clock out of it.
 
 ### `error`
 
@@ -318,21 +406,21 @@ A relative time keeps the browser's own clock out of it.
 {"type": "error", "id": 7, "stream": "ops", "code": "publish_failed", "message": "..."}
 ```
 
-`id` and `stream` are present when the error is about one request or one
-stream. `oldest` is present only on `trimmed`. The connection stays open after
-any error except an answer to `join`.
+`id` is present when the error answers one request, and `stream` or `cache`
+when it is about one stream or cache. `oldest` is present only on `trimmed`.
+The connection stays open after any error except an answer to `join`.
 
 | Code | Meaning |
 |---|---|
-| `bad_request` | The message did not parse, or its payload was not base64 |
+| `bad_request` | The message did not parse, its payload was not base64, a key or room was not allowed, or it named an alias the scope file does not have or an action that alias does not allow |
+| `unsupported` | The message type is not one this gateway knows, a `join` asked for another protocol version, or `throttle` is not allowed |
 | `publish_failed` | Felix refused or lost the publish. It may have landed: retry with the same `(sid, seq)` |
 | `subscribe_failed` | Felix refused the subscription, for example an offset already trimmed |
 | `subscription_ended` | A subscription stopped delivering. Subscribe again from the last offset handled plus one |
 | `counter_failed` | Felix refused or lost a counter add. It may have been counted |
-| `snapshot_failed` | Felix could not read the snapshot. Ask again |
+| `cache_failed` | Felix refused or lost a cache read, write or delete. Ask again; for `members`, the next refresh writes it again |
 | `trimmed` | The subscription asked for an offset retention has discarded. `oldest` is the oldest offset left. Join again from the snapshot |
-| `member_failed` | Felix refused or lost a member write or delete. The next refresh writes it again |
-| `watch_failed` | The member watch was refused or stopped. Send `watch_members` again |
+| `watch_failed` | A cache watch was refused or stopped. Send `cache_watch` again |
 | `forbidden`, `signed_out`, `unavailable` | Only in answer to `join`; see [`join`](#join) |
 
 ## Slow browsers
@@ -365,16 +453,17 @@ from the log, and ends with the same state hash as everyone else.
 ```json
 {
   "browser_rtt": {"count": 12, "p50_us": 210, "p90_us": 380, "p99_us": 900, "max_us": 1200},
-  "felix_publish_ack_ops": {"count": 40, "p50_us": 650, "p90_us": 900, "p99_us": 1500, "max_us": 2100},
-  "felix_publish_ack_presence": {"count": 0, "p50_us": 0, "p90_us": 0, "p99_us": 0, "max_us": 0}
+  "felix_publish_ack": {
+    "ops": {"count": 40, "p50_us": 650, "p90_us": 900, "p99_us": 1500, "max_us": 2100},
+    "presence": {"count": 0, "p50_us": 0, "p90_us": 0, "p99_us": 0, "max_us": 0}
+  }
 }
 ```
 
 | Histogram | What it times |
 |---|---|
 | `browser_rtt` | Browser to gateway and back: a WebSocket ping every 5 seconds per connection, answered by the browser itself |
-| `felix_publish_ack_ops` | Gateway to Felix and back: from handing an acknowledged publish to Felix until its ack, on `ops` |
-| `felix_publish_ack_presence` | The same on `presence` |
+| `felix_publish_ack` | Gateway to Felix and back, one histogram per stream alias in the scope file: from handing an acknowledged publish to Felix until its ack |
 
 ## Op payload
 

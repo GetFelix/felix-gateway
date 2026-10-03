@@ -1,5 +1,5 @@
 //! Felix connections: one per browser session, each with that session's own
-//! room token.
+//! scope token.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,8 +16,8 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 
 use crate::config::Config;
-use crate::protocol::{CounterName, StartAt, StreamName};
-use crate::room::{Room, SNAPSHOT_KEY};
+use crate::protocol::StartAt;
+use crate::scope::Scope;
 
 /// Where the brokers are and how to trust them, read once at startup.
 pub(crate) struct Brokers {
@@ -26,7 +26,6 @@ pub(crate) struct Brokers {
     roots: Option<Arc<RootCertStore>>,
     tenant: String,
     namespace: String,
-    member_ttl: Duration,
     /// Which broker the next connection tries first.
     next: AtomicUsize,
 }
@@ -51,17 +50,12 @@ impl Brokers {
             roots,
             tenant: config.tenant.clone(),
             namespace: config.namespace.clone(),
-            member_ttl: config.member_ttl,
             next: AtomicUsize::new(0),
         })
     }
 
     pub(crate) fn namespace(&self) -> &str {
         &self.namespace
-    }
-
-    pub(crate) fn member_ttl(&self) -> Duration {
-        self.member_ttl
     }
 
     /// Connect with tokens from `tokens`, which decide what this connection
@@ -89,48 +83,38 @@ impl Brokers {
     }
 }
 
-/// One session's Felix connection, scoped to its room's streams and caches.
+/// One session's Felix connection, reaching only its scope's resources.
+/// Resources are named by their Felix names, resolved from the scope.
 pub(crate) struct Felix {
     client: Arc<ClusterClient>,
     tenant: String,
     namespace: String,
-    room: Room,
-    ops: String,
-    presence: String,
-    members: String,
-    member_ttl: Duration,
+    pub(crate) scope: Scope,
+    /// Who signed in, for streams that stamp the sender.
+    pub(crate) principal: String,
 }
 
 impl Felix {
-    pub(crate) fn new(client: ClusterClient, brokers: &Brokers, room: Room) -> Self {
+    pub(crate) fn new(
+        client: ClusterClient,
+        brokers: &Brokers,
+        scope: Scope,
+        principal: String,
+    ) -> Self {
         Self {
             client: Arc::new(client),
             tenant: brokers.tenant.clone(),
             namespace: brokers.namespace.clone(),
-            ops: room.ops(),
-            presence: room.presence(),
-            members: room.members(),
-            member_ttl: brokers.member_ttl,
-            room,
-        }
-    }
-
-    pub(crate) fn room(&self) -> &str {
-        self.room.name()
-    }
-
-    fn stream(&self, stream: StreamName) -> &str {
-        match stream {
-            StreamName::Ops => &self.ops,
-            StreamName::Presence => &self.presence,
+            scope,
+            principal,
         }
     }
 
     /// Publish once, never resent by the gateway: the browser owns retries,
-    /// because only it holds the `(sid, seq)` that makes a retry deduplicable.
+    /// because only it knows what makes a retry safe to deduplicate.
     pub(crate) async fn publish(
         &self,
-        stream: StreamName,
+        stream: &str,
         payload: Vec<u8>,
         ack: bool,
     ) -> Result<Option<u64>> {
@@ -140,19 +124,13 @@ impl Felix {
             AckMode::None
         };
         self.client
-            .publish(
-                &self.tenant,
-                &self.namespace,
-                self.stream(stream),
-                payload,
-                ack,
-            )
+            .publish(&self.tenant, &self.namespace, stream, payload, ack)
             .await
     }
 
     pub(crate) async fn subscribe(
         &self,
-        stream: StreamName,
+        stream: &str,
         from: StartAt,
     ) -> Result<ClusterSubscription> {
         // `Latest` rather than no position: only then does the broker report
@@ -163,82 +141,69 @@ impl Felix {
             StartAt::Live(_) => StartPosition::Latest,
         };
         self.client
-            .subscribe_from(
-                &self.tenant,
-                &self.namespace,
-                self.stream(stream),
-                Some(start),
-            )
+            .subscribe_from(&self.tenant, &self.namespace, stream, Some(start))
             .await
     }
 
-    /// Add to one of the room's counters. Like a publish it is sent once;
-    /// Felix counts a retried add twice.
-    pub(crate) async fn counter_add(
-        &self,
-        counter: CounterName,
-        key: &str,
-        delta: i64,
-    ) -> Result<i64> {
-        let cache = match counter {
-            CounterName::Seq => self.room.seq(),
-        };
+    /// Add to a counter. Like a publish it is sent once; Felix counts a
+    /// retried add twice.
+    pub(crate) async fn counter_add(&self, counter: &str, key: &str, delta: i64) -> Result<i64> {
         self.client
             .client()
             .await
-            .counter_add(&self.tenant, &self.namespace, &cache, key, delta)
+            .counter_add(&self.tenant, &self.namespace, counter, key, delta)
             .await
     }
 
-    /// The room's snapshot, as the snapshotter wrote it.
-    pub(crate) async fn snapshot(&self) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn cache_get(&self, cache: &str, key: &str) -> Result<Option<Vec<u8>>> {
         let value = self
             .client
             .client()
             .await
-            .cache_get(
-                &self.tenant,
-                &self.namespace,
-                &self.room.snapshots(),
-                SNAPSHOT_KEY,
-            )
+            .cache_get(&self.tenant, &self.namespace, cache, key)
             .await?;
         Ok(value.map(|bytes| bytes.to_vec()))
     }
 
-    pub(crate) async fn set_member(&self, key: &str, payload: Vec<u8>) -> Result<()> {
-        let ttl = u64::try_from(self.member_ttl.as_millis()).unwrap_or(u64::MAX);
+    pub(crate) async fn cache_put(
+        &self,
+        cache: &str,
+        key: &str,
+        payload: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<()> {
+        let ttl = ttl.map(|ttl| u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
         self.client
             .client()
             .await
             .cache_put(
                 &self.tenant,
                 &self.namespace,
-                &self.members,
+                cache,
                 key,
                 payload.into(),
-                Some(ttl),
+                ttl,
             )
             .await
     }
 
-    pub(crate) async fn remove_member(&self, key: &str) -> Result<()> {
+    pub(crate) async fn cache_delete(&self, cache: &str, key: &str) -> Result<()> {
         self.client
             .client()
             .await
-            .cache_delete(&self.tenant, &self.namespace, &self.members, key)
+            .cache_delete(&self.tenant, &self.namespace, cache, key)
             .await
             .map(drop)
     }
 
-    /// Every member entry in the room, then each change to one. The member
-    /// cache has one shard, so an empty prefix covers the whole room.
-    pub(crate) async fn watch_members(&self) -> Result<ClusterCacheWatch> {
+    /// Every entry in the cache, then each change to one. The empty prefix
+    /// covers the whole cache only when it has one shard.
+    pub(crate) async fn watch_cache(&self, cache: &str) -> Result<ClusterCacheWatch> {
         self.client
             .watch_cache_retained(
                 &self.tenant,
                 &self.namespace,
-                &self.members,
+                cache,
                 CacheWatchFilter::Prefix(String::new()),
             )
             .await

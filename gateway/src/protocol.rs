@@ -1,26 +1,17 @@
 //! The JSON messages a browser and the gateway exchange. `docs/protocol.md`
 //! is the reference for what each one means on the wire.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
-/// Which of the room's two streams a message is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamName {
-    /// The durable edit log, `canvas.ops.<room>`.
-    Ops,
-    /// The in-memory cursor and presence feed, `canvas.presence.<room>`.
-    Presence,
-}
+/// The protocol version this gateway speaks. A `join` without one means 1.
+pub const PROTOCOL: u32 = 1;
 
-/// A counter the browser may add to. Each maps to one of the room's Felix
-/// counter caches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CounterName {
-    /// Per-session op sequence numbers, `canvas.seq.<room>/<key>`.
-    Seq,
-}
+/// Optional capabilities a `join` may ask for in `features`. None exist yet;
+/// `hello` answers with the ones asked for that are listed here.
+pub const FEATURES: &[&str] = &[];
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -39,21 +30,39 @@ pub enum Live {
     Live,
 }
 
-/// A message from the browser.
+/// The first message on every connection. The scope's value is under the key
+/// the scope file names, so it is collected with every other key in `fields`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Join {
+    /// The browser's OpenID Connect ID token.
+    pub token: String,
+    #[serde(default = "first_protocol")]
+    pub protocol: u32,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(flatten)]
+    pub fields: Map<String, Value>,
+}
+
+fn first_protocol() -> u32 {
+    1
+}
+
+/// A message from the browser. Streams, caches and counters are named by
+/// their alias in the scope file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    /// The first message on every connection: which room to open, and the
-    /// browser's OpenID Connect ID token. Answered with
-    /// [`ServerMessage::Hello`], or with an error before the gateway closes.
-    Join { room: String, token: String },
+    /// See [`Join`]. Answered with [`ServerMessage::Hello`], or with an error
+    /// before the gateway closes.
+    Join {},
     /// Start relaying a stream's events. Replaces any earlier subscription to
     /// the same stream on this connection.
-    Subscribe { stream: StreamName, from: StartAt },
+    Subscribe { stream: String, from: StartAt },
     /// Publish one record. `payload` is base64. With `ack`, the gateway
     /// answers with an [`ServerMessage::Ack`] carrying the same `id`.
     Publish {
-        stream: StreamName,
+        stream: String,
         payload: String,
         ack: bool,
         id: u64,
@@ -61,43 +70,59 @@ pub enum ClientMessage {
     /// Add `delta` to a counter. The gateway answers with a
     /// [`ServerMessage::Counter`] carrying the same `id` and the new sum.
     CounterAdd {
-        counter: CounterName,
+        counter: String,
         key: String,
         delta: i64,
         id: u64,
     },
-    /// Read the room's snapshot. The gateway answers with a
-    /// [`ServerMessage::Snapshot`] carrying the same `id`.
-    SnapshotGet { id: u64 },
-    /// Write this session's member entry, `canvas.members.<room>/<key>`,
-    /// expiring after the gateway's member TTL unless written again.
-    SetMember { key: String, payload: String },
-    /// Delete a member entry, for a session that is closing.
-    RemoveMember { key: String },
-    /// Send the room's members as one [`ServerMessage::Members`], then every
-    /// change as a [`ServerMessage::Member`]. Replaces an earlier watch.
-    WatchMembers,
+    /// Read one cache entry. Answered with a [`ServerMessage::CacheValue`]
+    /// carrying the same `id`.
+    CacheGet { cache: String, key: String, id: u64 },
+    /// Write one cache entry, expiring after the cache's TTL when it has one.
+    CachePut {
+        cache: String,
+        key: String,
+        payload: String,
+    },
+    /// Delete one cache entry.
+    CacheDelete { cache: String, key: String },
+    /// Send the cache's entries as one [`ServerMessage::CacheEntries`], then
+    /// every change as a [`ServerMessage::CacheChange`]. Replaces an earlier
+    /// watch of the same cache.
+    CacheWatch { cache: String },
     /// Read this connection's subscriptions no faster than `bits_per_second`
     /// would carry them, or at full speed again with `null` or 0. It stands
     /// in for a slow link.
     Throttle { bits_per_second: Option<u64> },
+    /// A type this gateway does not know, answered with
+    /// [`ErrorCode::Unsupported`].
+    #[serde(other)]
+    Unsupported,
 }
 
 /// A message to the browser.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// The answer to [`ClientMessage::Join`]: the session is open on this room.
+    /// The answer to a join: the session is open on this scope.
     Hello {
+        protocol: u32,
+        /// The features of the join this gateway accepted.
+        features: Vec<String>,
         namespace: String,
-        room: String,
-        /// How long a member entry lasts without a refresh.
-        member_ttl_ms: u64,
+        /// The scope's value, under the scope file's `field`.
+        #[serde(flatten)]
+        scope: BTreeMap<String, String>,
+        /// How long an entry lasts without a write, for each cache with a TTL.
+        cache_ttl_ms: BTreeMap<String, u64>,
+        /// Optional resources this session's sign-in does not reach.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        missing: Vec<String>,
     },
     /// The subscription is registered with the broker: anything published
     /// from here on will be delivered.
     Subscribed {
-        stream: StreamName,
+        stream: String,
         /// The first offset this subscription delivers, when the stream has a log.
         start_offset: Option<u64>,
         /// The stream's tail when the subscription was registered.
@@ -105,8 +130,8 @@ pub enum ServerMessage {
     },
     /// One record, in the order the broker delivered it.
     Event {
-        stream: StreamName,
-        /// Log offset; `null` on the presence stream, which has no log.
+        stream: String,
+        /// Log offset; `null` on a stream with no log.
         offset: Option<u64>,
         /// Offsets just before this one that hold no event. A gap in offsets
         /// larger than this is a drop.
@@ -122,19 +147,28 @@ pub enum ServerMessage {
     },
     /// The sum after the counter add with this `id`.
     Counter { id: u64, value: i64 },
-    /// The room's snapshot for the `snapshot_get` with this `id`: base64 bytes
-    /// as the snapshotter wrote them, or `null` when it has written none.
-    Snapshot { id: u64, payload: Option<String> },
-    /// Every member entry in the room when the watch started.
-    Members { members: Vec<MemberEntry> },
-    /// One member entry was written or deleted.
-    Member(MemberEntry),
+    /// The entry for the `cache_get` with this `id`, base64, or `null` when
+    /// there is none.
+    CacheValue { id: u64, payload: Option<String> },
+    /// Every entry in the cache when the watch started.
+    CacheEntries {
+        cache: String,
+        entries: Vec<CacheEntry>,
+    },
+    /// One cache entry was written or deleted.
+    CacheChange {
+        cache: String,
+        #[serde(flatten)]
+        entry: CacheEntry,
+    },
     /// Something the browser asked for failed.
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        stream: Option<StreamName>,
+        stream: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache: Option<String>,
         code: ErrorCode,
         /// With [`ErrorCode::Trimmed`]: the oldest offset the log still holds.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,8 +181,12 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
-    /// The message did not parse, or its payload was not base64.
+    /// The message did not parse, named something the scope does not allow,
+    /// or its payload was not base64.
     BadRequest,
+    /// The message type, protocol version or request is not one this
+    /// gateway serves.
+    Unsupported,
     /// Felix refused or lost the publish. It may or may not have landed.
     PublishFailed,
     /// Felix refused the subscribe, for example an offset already trimmed.
@@ -158,32 +196,28 @@ pub enum ErrorCode {
     SubscriptionEnded,
     /// Felix refused or lost a counter add. It may have been counted.
     CounterFailed,
-    /// The snapshot could not be read.
-    SnapshotFailed,
-    /// The subscription asked for an offset the log no longer holds. Start
-    /// again from the snapshot.
+    /// Felix refused or lost a cache read, write or delete.
+    CacheFailed,
+    /// The subscription asked for an offset the log no longer holds.
     Trimmed,
     /// The join carried no usable sign-in. Sign in again.
     SignedOut,
-    /// The signed-in user may not open this room.
+    /// The signed-in user may not open this scope.
     Forbidden,
     /// The join could not be completed for now. Try again.
     Unavailable,
-    /// Felix refused or lost a member write or delete.
-    MemberFailed,
-    /// The member watch was refused or stopped. Watch again.
+    /// A cache watch was refused or stopped. Watch again.
     WatchFailed,
 }
 
-/// One member entry, keyed without the room prefix.
+/// One cache entry, keyed without the cache's name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MemberEntry {
+pub struct CacheEntry {
     pub key: String,
     /// The entry's value, base64; `null` when it was deleted.
     pub payload: Option<String>,
     /// Milliseconds until the entry expires, by the gateway's clock; `null`
-    /// for an entry that never does. Felix sends nothing when an entry
-    /// expires, so the browser drops it itself at this deadline.
+    /// for an entry that never does.
     pub expires_in_ms: Option<u64>,
 }
 
@@ -196,109 +230,93 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn parse(message: Value) -> ClientMessage {
+        serde_json::from_value(message).unwrap()
+    }
+
     #[test]
     fn parses_subscribe_from_an_offset_and_from_live() {
-        let at: ClientMessage =
-            serde_json::from_value(json!({"type": "subscribe", "stream": "ops", "from": 42}))
-                .unwrap();
         assert_eq!(
-            at,
+            parse(json!({"type": "subscribe", "stream": "ops", "from": 42})),
             ClientMessage::Subscribe {
-                stream: StreamName::Ops,
+                stream: "ops".into(),
                 from: StartAt::Offset(42)
             }
         );
-        let live: ClientMessage = serde_json::from_value(
-            json!({"type": "subscribe", "stream": "presence", "from": "live"}),
-        )
-        .unwrap();
         assert_eq!(
-            live,
+            parse(json!({"type": "subscribe", "stream": "presence", "from": "live"})),
             ClientMessage::Subscribe {
-                stream: StreamName::Presence,
+                stream: "presence".into(),
                 from: StartAt::Live(Live::Live)
             }
         );
     }
 
     #[test]
-    fn parses_a_join() {
-        let join: ClientMessage =
-            serde_json::from_value(json!({"type": "join", "room": "lobby", "token": "eyJ"}))
-                .unwrap();
+    fn a_join_without_a_protocol_is_version_1() {
+        let message = json!({"type": "join", "room": "lobby", "token": "eyJ"});
+        assert_eq!(parse(message.clone()), ClientMessage::Join {});
+        let join: Join = serde_json::from_value(message).unwrap();
+        assert_eq!((join.protocol, join.features.len()), (1, 0));
+        assert_eq!(join.token, "eyJ");
+        assert_eq!(join.fields["room"], "lobby");
+    }
+
+    #[test]
+    fn unknown_types_parse_as_unsupported() {
         assert_eq!(
-            join,
-            ClientMessage::Join {
-                room: "lobby".into(),
-                token: "eyJ".into()
-            }
+            parse(json!({"type": "x.teleport", "to": 3})),
+            ClientMessage::Unsupported
         );
     }
 
     #[test]
-    fn parses_a_counter_add() {
-        let add: ClientMessage = serde_json::from_value(json!({
-            "type": "counter_add", "counter": "seq", "key": "00ff", "delta": 256, "id": 4
-        }))
-        .unwrap();
+    fn parses_counter_and_cache_requests() {
         assert_eq!(
-            add,
+            parse(json!({
+                "type": "counter_add", "counter": "seq", "key": "00ff", "delta": 256, "id": 4
+            })),
             ClientMessage::CounterAdd {
-                counter: CounterName::Seq,
+                counter: "seq".into(),
                 key: "00ff".into(),
                 delta: 256,
                 id: 4
             }
         );
-    }
-
-    #[test]
-    fn parses_a_snapshot_get_and_serializes_the_answer() {
-        let get: ClientMessage =
-            serde_json::from_value(json!({"type": "snapshot_get", "id": 5})).unwrap();
-        assert_eq!(get, ClientMessage::SnapshotGet { id: 5 });
-        let none = ServerMessage::Snapshot {
-            id: 5,
-            payload: None,
-        };
         assert_eq!(
-            serde_json::to_value(&none).unwrap(),
-            json!({"type": "snapshot", "id": 5, "payload": null})
+            parse(json!({"type": "cache_get", "cache": "snap", "key": "latest", "id": 5})),
+            ClientMessage::CacheGet {
+                cache: "snap".into(),
+                key: "latest".into(),
+                id: 5
+            }
         );
-    }
-
-    #[test]
-    fn parses_member_messages() {
-        let set: ClientMessage =
-            serde_json::from_value(json!({"type": "set_member", "key": "00ff", "payload": "AQI="}))
-                .unwrap();
         assert_eq!(
-            set,
-            ClientMessage::SetMember {
-                key: "00ff".into(),
+            parse(json!({"type": "cache_put", "cache": "members", "key": "a", "payload": "AQI="})),
+            ClientMessage::CachePut {
+                cache: "members".into(),
+                key: "a".into(),
                 payload: "AQI=".into()
             }
         );
-        let watch: ClientMessage =
-            serde_json::from_value(json!({"type": "watch_members"})).unwrap();
-        assert_eq!(watch, ClientMessage::WatchMembers);
+        assert_eq!(
+            parse(json!({"type": "cache_watch", "cache": "members"})),
+            ClientMessage::CacheWatch {
+                cache: "members".into()
+            }
+        );
     }
 
     #[test]
     fn parses_a_throttle_and_its_release() {
-        let on: ClientMessage =
-            serde_json::from_value(json!({"type": "throttle", "bits_per_second": 100_000}))
-                .unwrap();
         assert_eq!(
-            on,
+            parse(json!({"type": "throttle", "bits_per_second": 100_000})),
             ClientMessage::Throttle {
                 bits_per_second: Some(100_000)
             }
         );
-        let off: ClientMessage =
-            serde_json::from_value(json!({"type": "throttle", "bits_per_second": null})).unwrap();
         assert_eq!(
-            off,
+            parse(json!({"type": "throttle", "bits_per_second": null})),
             ClientMessage::Throttle {
                 bits_per_second: None
             }
@@ -306,26 +324,59 @@ mod tests {
     }
 
     #[test]
-    fn serializes_a_member_change_flat() {
-        let left = ServerMessage::Member(MemberEntry {
-            key: "00ff".into(),
-            payload: None,
-            expires_in_ms: None,
-        });
+    fn serializes_hello_with_the_scope_under_its_field() {
+        let hello = ServerMessage::Hello {
+            protocol: 1,
+            features: vec![],
+            namespace: "default".into(),
+            scope: BTreeMap::from([("room".into(), "lobby".into())]),
+            cache_ttl_ms: BTreeMap::from([("members".into(), 30_000)]),
+            missing: vec![],
+        };
         assert_eq!(
-            serde_json::to_value(&left).unwrap(),
-            json!({"type": "member", "key": "00ff", "payload": null, "expires_in_ms": null})
+            serde_json::to_value(&hello).unwrap(),
+            json!({
+                "type": "hello", "protocol": 1, "features": [], "namespace": "default",
+                "room": "lobby", "cache_ttl_ms": {"members": 30000}
+            })
         );
     }
 
     #[test]
-    fn rejects_unknown_streams_and_positions() {
+    fn serializes_cache_answers_flat() {
+        let none = ServerMessage::CacheValue {
+            id: 5,
+            payload: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&none).unwrap(),
+            json!({"type": "cache_value", "id": 5, "payload": null})
+        );
+        let left = ServerMessage::CacheChange {
+            cache: "members".into(),
+            entry: CacheEntry {
+                key: "00ff".into(),
+                payload: None,
+                expires_in_ms: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&left).unwrap(),
+            json!({
+                "type": "cache_change", "cache": "members", "key": "00ff",
+                "payload": null, "expires_in_ms": null
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_known_types_with_bad_fields() {
         for bad in [
-            json!({"type": "subscribe", "stream": "chat", "from": "live"}),
             json!({"type": "subscribe", "stream": "ops", "from": "earliest"}),
             json!({"type": "subscribe", "stream": "ops", "from": -1}),
             json!({"type": "publish", "stream": "ops", "payload": "", "ack": true}),
-            json!({"type": "counter_add", "counter": "views", "key": "a", "delta": 1, "id": 1}),
+            json!({"type": "cache_get", "cache": "snap", "id": 1}),
+            json!({"stream": "ops"}),
         ] {
             assert!(
                 serde_json::from_value::<ClientMessage>(bad.clone()).is_err(),
@@ -337,7 +388,7 @@ mod tests {
     #[test]
     fn serializes_events_without_a_zero_skip_count() {
         let event = ServerMessage::Event {
-            stream: StreamName::Ops,
+            stream: "ops".into(),
             offset: Some(7),
             skipped_before: 0,
             payload: "AQI=".into(),

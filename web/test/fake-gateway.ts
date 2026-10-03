@@ -8,7 +8,7 @@ import {
   type Op,
 } from "@felix-canvas/model";
 
-import { GatewayError, type GatewayEvent, type StreamName } from "../src/gateway.js";
+import { GatewayError, type GatewayEvent } from "../src/gateway.js";
 import type { Gateway } from "../src/session.js";
 
 export const other = 0x0dd0n;
@@ -64,8 +64,8 @@ export class FakeGateway implements Gateway {
   onSubscribed: Gateway["onSubscribed"] = () => {};
   onError: Gateway["onError"] = () => {};
   onClose: Gateway["onClose"] = () => {};
-  onMembers: Gateway["onMembers"] = () => {};
-  onMember: Gateway["onMember"] = () => {};
+  onCacheEntries: Gateway["onCacheEntries"] = () => {};
+  onCacheChange: Gateway["onCacheChange"] = () => {};
   readonly requests: string[];
   /** While set, live records are lost on the way, as Felix drops them for a slow reader. */
   dropping = false;
@@ -83,7 +83,7 @@ export class FakeGateway implements Gateway {
     room.connections.add(this);
   }
 
-  subscribe(stream: StreamName, from: number | "live"): void {
+  subscribe(stream: string, from: number | "live"): void {
     if (stream === "presence") this.presenceSubscribes++;
     if (stream !== "ops") return;
     this.requests.push(`subscribe ${from}`);
@@ -110,27 +110,29 @@ export class FakeGateway implements Gateway {
     this.onEvent(event);
   }
 
-  async publish(stream: StreamName, payload: Uint8Array): Promise<number | null> {
+  async publish(stream: string, payload: Uint8Array): Promise<number | null> {
     if (stream !== "ops") return null;
     const offset = this.room.append(payload);
     if (this.losingAcks) throw new GatewayError("publish_failed", "connection lost");
     return offset;
   }
 
-  async counterAdd(_key: string, delta: number): Promise<number> {
+  async counterAdd(_counter: string, _key: string, delta: number): Promise<number> {
     return (this.#counter += delta);
   }
 
-  async snapshot(): Promise<Uint8Array | null> {
+  /** Only the snapshot is read: cache "snap", key "latest". */
+  async cacheGet(cache: string, key: string): Promise<Uint8Array | null> {
+    if (cache !== "snap" || key !== "latest") throw new GatewayError("bad_request", cache);
     this.requests.push("snapshot");
     await new Promise((resolve) => setTimeout(resolve));
     this.room.duringSnapshotRead();
     return this.room.snapshot();
   }
 
-  setMember(): void {}
-  removeMember(): void {}
-  watchMembers(): void {}
+  cachePut(): void {}
+  cacheDelete(): void {}
+  cacheWatch(): void {}
 
   throttle(bitsPerSecond: number | null): void {
     this.requests.push(`throttle ${bitsPerSecond}`);

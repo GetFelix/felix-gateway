@@ -1,44 +1,52 @@
 // The browser half of the gateway protocol. docs/protocol.md is the reference.
+// Streams, caches and counters are named by their alias in the gateway's
+// scope file. This file imports nothing, so it can stand on its own.
 
-import type { MemberEntry } from "./members.js";
-
-/** The room's two streams. */
-export type StreamName = "ops" | "presence";
+/** The protocol version this client speaks. */
+export const PROTOCOL = 1;
 
 /** Messages the gateway sends. */
 export type ServerMessage =
-  | { type: "hello"; namespace: string; room: string; member_ttl_ms: number }
+  | {
+      type: "hello";
+      protocol: number;
+      features: string[];
+      namespace: string;
+      cache_ttl_ms: Record<string, number>;
+      missing?: string[];
+    }
   | {
       type: "subscribed";
-      stream: StreamName;
+      stream: string;
       start_offset: number | null;
       live_offset: number | null;
     }
   | {
       type: "event";
-      stream: StreamName;
+      stream: string;
       offset: number | null;
       skipped_before?: number;
       payload: string;
     }
   | { type: "ack"; id: number; offset: number | null }
   | { type: "counter"; id: number; value: number }
-  | { type: "snapshot"; id: number; payload: string | null }
-  | { type: "members"; members: WireMember[] }
-  | ({ type: "member" } & WireMember)
+  | { type: "cache_value"; id: number; payload: string | null }
+  | { type: "cache_entries"; cache: string; entries: WireEntry[] }
+  | ({ type: "cache_change"; cache: string } & WireEntry)
   | {
       type: "error";
       id?: number;
-      stream?: StreamName;
+      stream?: string;
+      cache?: string;
       code:
         | "bad_request"
+        | "unsupported"
         | "publish_failed"
         | "subscribe_failed"
         | "subscription_ended"
         | "counter_failed"
-        | "snapshot_failed"
+        | "cache_failed"
         | "trimmed"
-        | "member_failed"
         | "watch_failed"
         | "signed_out"
         | "forbidden"
@@ -47,22 +55,45 @@ export type ServerMessage =
       message: string;
     };
 
-/** Which room to join, and the ID token that signs the browser in. */
+/**
+ * The sign-in, and the scope to open under the key the gateway's scope file
+ * names, such as `{ room: "lobby", token }`.
+ */
 export interface Join {
-  room: string;
   token: string;
+  [scopeField: string]: string;
 }
 
-interface WireMember {
+/** What the gateway answered a join with. */
+export interface Hello {
+  namespace: string;
+  /** The features asked for that the gateway accepted. */
+  features: string[];
+  /** How long an entry lasts without a write, for each cache with a TTL. */
+  cacheTtlMs: Record<string, number>;
+  /** Optional resources the sign-in does not reach. */
+  missing: string[];
+}
+
+interface WireEntry {
   key: string;
   payload: string | null;
   expires_in_ms: number | null;
 }
 
+/** One cache entry as the gateway reports it. */
+export interface CacheEntry {
+  key: string;
+  /** The entry's value, or `null` when it was deleted. */
+  payload: Uint8Array | null;
+  /** Milliseconds until the entry expires, or `null` if it never does. */
+  expiresInMs: number | null;
+}
+
 /** One record delivered on a stream. */
 export interface GatewayEvent {
-  stream: StreamName;
-  /** Log offset on `ops`; `null` on `presence`, which has no log. */
+  stream: string;
+  /** Log offset; `null` on a stream with no log. */
   offset: number | null;
   /** Offsets just before this one that hold no event. */
   skippedBefore: number;
@@ -90,25 +121,21 @@ interface Pending {
  * through the callbacks; publishes resolve with the record's log offset.
  */
 export class GatewayClient {
-  /**
-   * Called once, first, with the room this gateway serves and how long a
-   * member entry lasts without a refresh.
-   */
-  onHello: (namespace: string, room: string, memberTtlMs: number) => void = () => {};
-  /** Called with every member entry when a member watch starts. */
-  onMembers: (members: MemberEntry[]) => void = () => {};
-  /** Called for each member entry written or deleted after that. */
-  onMember: (member: MemberEntry) => void = () => {};
+  /** Called once, first, when the gateway has opened the session. */
+  onHello: (hello: Hello) => void = () => {};
+  /** Called with every entry of a cache when a watch of it starts. */
+  onCacheEntries: (cache: string, entries: CacheEntry[]) => void = () => {};
+  /** Called for each entry written or deleted after that. */
+  onCacheChange: (cache: string, entry: CacheEntry) => void = () => {};
   /** Called for every event, in the order the broker delivered them. */
   onEvent: (event: GatewayEvent) => void = () => {};
   /** Called once a subscription is registered with the broker. */
-  onSubscribed: (
-    stream: StreamName,
-    startOffset: number | null,
-    liveOffset: number | null,
-  ) => void = () => {};
-  /** Called for errors not tied to a publish, such as a subscription ending. */
-  onError: (error: GatewayError, stream?: StreamName) => void = () => {};
+  onSubscribed: (stream: string, start: number | null, live: number | null) => void = () => {};
+  /**
+   * Called for errors not tied to a request, such as a subscription ending,
+   * with the stream or cache they are about.
+   */
+  onError: (error: GatewayError, stream?: string, cache?: string) => void = () => {};
   /** Called when the connection closes. */
   onClose: () => void = () => {};
 
@@ -130,17 +157,17 @@ export class GatewayClient {
 
   /**
    * Open a connection to the gateway at `url`, a `ws:` or `wss:` URL, and
-   * join `join.room` with the ID token `join.token`. The gateway answers with
+   * join the scope in `join`, asking for `features`. The gateway answers with
    * `hello`, or refuses with an error and closes.
    */
-  static connect(url: string, join: Join): Promise<GatewayClient> {
+  static connect(url: string, join: Join, features: string[] = []): Promise<GatewayClient> {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(url);
       socket.addEventListener(
         "open",
         () => {
           const client = new GatewayClient(socket);
-          client.#send({ type: "join", ...join });
+          client.#send({ ...join, type: "join", protocol: PROTOCOL, features });
           resolve(client);
         },
         { once: true },
@@ -155,7 +182,7 @@ export class GatewayClient {
    * Relay `stream` from `from`: a log offset (the last one handled, plus one)
    * or `"live"`. Replaces an earlier subscription to the same stream.
    */
-  subscribe(stream: StreamName, from: number | "live"): void {
+  subscribe(stream: string, from: number | "live"): void {
     this.#send({ type: "subscribe", stream, from });
   }
 
@@ -164,7 +191,7 @@ export class GatewayClient {
    * log offset when the broker acknowledged after writing. Without, resolves
    * as soon as the request is sent.
    */
-  publish(stream: StreamName, payload: Uint8Array, ack = true): Promise<number | null> {
+  publish(stream: string, payload: Uint8Array, ack = true): Promise<number | null> {
     const message = { type: "publish", stream, payload: toBase64(payload), ack };
     if (!ack) {
       this.#send({ ...message, id: this.#nextId++ });
@@ -173,33 +200,30 @@ export class GatewayClient {
     return this.#request(message) as Promise<number | null>;
   }
 
-  /**
-   * Add `delta` to this session's sequence counter, `canvas.seq.<room>/<key>`,
-   * and resolve with the new sum.
-   */
-  counterAdd(key: string, delta: number): Promise<number> {
-    return this.#request({ type: "counter_add", counter: "seq", key, delta }) as Promise<number>;
+  /** Add `delta` to `key` of `counter` and resolve with the new sum. */
+  counterAdd(counter: string, key: string, delta: number): Promise<number> {
+    return this.#request({ type: "counter_add", counter, key, delta }) as Promise<number>;
   }
 
-  /** Read the room's snapshot: the bytes the snapshotter wrote, or `null` for none yet. */
-  async snapshot(): Promise<Uint8Array | null> {
-    const payload = (await this.#request({ type: "snapshot_get" })) as string | null;
+  /** Read `key` of `cache`: its value, or `null` when there is none. */
+  async cacheGet(cache: string, key: string): Promise<Uint8Array | null> {
+    const payload = (await this.#request({ type: "cache_get", cache, key })) as string | null;
     return payload === null ? null : fromBase64(payload);
   }
 
-  /** Write this session's member entry; it expires unless written again in time. */
-  setMember(key: string, payload: Uint8Array): void {
-    this.#send({ type: "set_member", key, payload: toBase64(payload) });
+  /** Write `key` of `cache`. It expires after the cache's TTL unless written again. */
+  cachePut(cache: string, key: string, payload: Uint8Array): void {
+    this.#send({ type: "cache_put", cache, key, payload: toBase64(payload) });
   }
 
-  /** Delete this session's member entry. */
-  removeMember(key: string): void {
-    this.#send({ type: "remove_member", key });
+  /** Delete `key` of `cache`. */
+  cacheDelete(cache: string, key: string): void {
+    this.#send({ type: "cache_delete", cache, key });
   }
 
-  /** Watch the room's member entries. Replaces an earlier watch. */
-  watchMembers(): void {
-    this.#send({ type: "watch_members" });
+  /** Watch the entries of `cache`. Replaces an earlier watch of it. */
+  cacheWatch(cache: string): void {
+    this.#send({ type: "cache_watch", cache });
   }
 
   /**
@@ -236,16 +260,21 @@ export class GatewayClient {
         });
         break;
       case "hello":
-        this.onHello(message.namespace, message.room, message.member_ttl_ms);
+        this.onHello({
+          namespace: message.namespace,
+          features: message.features,
+          cacheTtlMs: message.cache_ttl_ms,
+          missing: message.missing ?? [],
+        });
         break;
       case "subscribed":
         this.onSubscribed(message.stream, message.start_offset, message.live_offset);
         break;
-      case "members":
-        this.onMembers(message.members.map(memberEntry));
+      case "cache_entries":
+        this.onCacheEntries(message.cache, message.entries.map(cacheEntry));
         break;
-      case "member":
-        this.onMember(memberEntry(message));
+      case "cache_change":
+        this.onCacheChange(message.cache, cacheEntry(message));
         break;
       case "counter":
         this.#take(message.id)?.resolve(message.value);
@@ -253,7 +282,7 @@ export class GatewayClient {
       case "ack":
         this.#take(message.id)?.resolve(message.offset);
         break;
-      case "snapshot":
+      case "cache_value":
         this.#take(message.id)?.resolve(message.payload);
         break;
       case "error": {
@@ -262,7 +291,7 @@ export class GatewayClient {
         if (pending) {
           pending.reject(error);
         } else {
-          this.onError(error, message.stream);
+          this.onError(error, message.stream, message.cache);
         }
         break;
       }
@@ -277,11 +306,11 @@ export class GatewayClient {
   }
 }
 
-function memberEntry(member: WireMember): MemberEntry {
+function cacheEntry(entry: WireEntry): CacheEntry {
   return {
-    key: member.key,
-    payload: member.payload === null ? null : fromBase64(member.payload),
-    expiresInMs: member.expires_in_ms,
+    key: entry.key,
+    payload: entry.payload === null ? null : fromBase64(entry.payload),
+    expiresInMs: entry.expires_in_ms,
   };
 }
 

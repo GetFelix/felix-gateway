@@ -2,9 +2,11 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+
+use crate::scope::ScopeConfig;
 
 /// Gateway settings. Every field has an environment variable; the defaults
 /// match the development stack in `dev/`.
@@ -44,16 +46,16 @@ pub struct Config {
     /// `CANVAS_WEB_DIR`: a built web bundle to serve on every path the
     /// gateway does not route itself. Unset serves no page.
     pub web_dir: Option<PathBuf>,
-    /// `CANVAS_MEMBER_TTL_SECONDS`: how long a member entry outlives its last
-    /// refresh. Default 30.
-    pub member_ttl: Duration,
+    /// `CANVAS_SCOPE_FILE`: the scope file, which names the scope and its
+    /// streams, caches and counters. Required.
+    pub scope: Arc<ScopeConfig>,
 }
 
 impl Config {
     /// Read the settings from the environment.
     ///
     /// # Errors
-    /// When an address or number does not parse.
+    /// When an address does not parse, or the scope file is missing or invalid.
     pub fn from_env() -> Result<Self> {
         let var = |name: &str, default: &str| {
             std::env::var(name)
@@ -94,15 +96,9 @@ impl Config {
             oidc_client_id: var("CANVAS_OIDC_CLIENT_ID", "felix-canvas"),
             oidc_scopes: var("CANVAS_OIDC_SCOPES", "openid profile"),
             web_dir: path("CANVAS_WEB_DIR"),
-            member_ttl: Duration::from_secs(
-                var("CANVAS_MEMBER_TTL_SECONDS", "30")
-                    .parse()
-                    .ok()
-                    .filter(|&seconds| seconds > 0)
-                    .context(
-                        "CANVAS_MEMBER_TTL_SECONDS must be a whole number of seconds above 0",
-                    )?,
-            ),
+            scope: Arc::new(ScopeConfig::load(
+                &path("CANVAS_SCOPE_FILE").context("set CANVAS_SCOPE_FILE to the scope file")?,
+            )?),
         })
     }
 }

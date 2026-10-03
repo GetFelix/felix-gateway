@@ -1,14 +1,15 @@
-//! Viewers for the fanout measurement: `count` subscriptions to a room's op
-//! stream over one Felix client, each reading every change the way a browser's
+//! Viewers for the fanout measurement: `count` subscriptions to one scope's
+//! stream over one Felix client, each reading every record the way a browser's
 //! session does. Prints `ready` once every subscription is registered, and one
 //! line of JSON when standard input closes.
 //!
 //! ```text
-//! cargo run --release -p felix-canvas-gateway --example viewers -- <count> <token file>
+//! cargo run --release -p felix-canvas-gateway --example viewers -- <count> <token file> <stream> <scope>
 //! ```
 //!
-//! It reads the gateway's `CANVAS_*` variables, plus `CANVAS_ROOM` (default
-//! `lobby`). The token needs `stream.subscribe` on the room's op stream.
+//! `<stream>` is an alias from the scope file and `<scope>` the scope's value.
+//! It reads the gateway's `CANVAS_*` variables. The token needs
+//! `stream.subscribe` on that stream.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,14 +33,17 @@ struct Seen {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    const USAGE: &str = "usage: viewers <count> <token file>";
+    const USAGE: &str = "usage: viewers <count> <token file> <stream> <scope>";
     let mut args = std::env::args().skip(1);
     let count: usize = args.next().context(USAGE)?.parse().context(USAGE)?;
     let token = std::fs::read_to_string(args.next().context(USAGE)?)?;
-    let room = std::env::var("CANVAS_ROOM").unwrap_or_else(|_| "lobby".to_string());
-    let stream = format!("canvas.ops.{room}");
+    let (alias, scope) = (args.next().context(USAGE)?, args.next().context(USAGE)?);
 
     let config = Config::from_env()?;
+    let stream = config
+        .scope
+        .stream_name(&alias, &scope)
+        .with_context(|| format!("the scope file has no stream {alias:?}"))?;
     // Felix's default client, as any subscriber would have, not the gateway's
     // trimmed per-session one.
     let roots = match &config.ca_file {

@@ -1,7 +1,8 @@
 //! The gateway against a real Felix broker, control plane and the stand-in
 //! identity provider. Ignored by default because they need the development
 //! stack running; see the README, or run `cargo test -- --include-ignored`
-//! with the `CANVAS_*` variables set.
+//! with the `CANVAS_*` variables set. `CANVAS_SCOPE_FILE` must be the canvas's
+//! scope file, `deploy/scope.toml`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use felix_canvas_gateway::{Config, Gateway, Refused};
+use felix_canvas_gateway::{Config, Gateway, Refused, ScopeConfig};
 use felix_client::{CacheWatchFilter, TokenFuture, TokenProvider};
 use felix_wire::AckMode;
 use futures_util::{SinkExt, StreamExt};
@@ -79,7 +80,7 @@ impl Browser {
             .expect("open WebSocket");
         let mut browser = Self { socket, next_id: 0 };
         browser
-            .send(json!({"type": "join", "room": room, "token": token}))
+            .send(json!({"type": "join", "protocol": 1, "features": [], "room": room, "token": token}))
             .await;
         browser
     }
@@ -90,7 +91,14 @@ impl Browser {
         let hello = browser.recv().await;
         assert_eq!(hello["type"], "hello", "{hello}");
         assert_eq!(hello["room"], room);
-        assert!(hello["member_ttl_ms"].as_u64() > Some(0), "{hello}");
+        assert_eq!(
+            (hello["protocol"].as_u64(), &hello["features"]),
+            (Some(1), &json!([]))
+        );
+        assert!(
+            hello["cache_ttl_ms"]["members"].as_u64() > Some(0),
+            "{hello}"
+        );
         browser
     }
 
@@ -152,8 +160,8 @@ impl Browser {
     /// The next change to the member entry `key`.
     async fn member_change(&mut self, key: &str) -> Value {
         loop {
-            let change = self.recv_type("member").await;
-            if change["key"] == key {
+            let change = self.recv_type("cache_change").await;
+            if change["cache"] == "members" && change["key"] == key {
                 return change;
             }
         }
@@ -161,9 +169,11 @@ impl Browser {
 
     /// The keys in the next full member list.
     async fn member_keys(&mut self) -> Vec<String> {
-        self.send(json!({"type": "watch_members"})).await;
-        let list = self.recv_type("members").await;
-        list["members"]
+        self.send(json!({"type": "cache_watch", "cache": "members"}))
+            .await;
+        let list = self.recv_type("cache_entries").await;
+        assert_eq!(list["cache"], "members");
+        list["entries"]
             .as_array()
             .unwrap()
             .iter()
@@ -269,7 +279,7 @@ async fn two_browsers_see_each_others_ops_in_one_offset_order() {
     }
 
     let latency = gateway.metrics();
-    assert!(latency.felix_publish_ack_ops.count >= 10);
+    assert!(latency.felix_publish_ack["ops"].count >= 10);
     eprintln!("gateway latency: {latency:?}");
 }
 
@@ -317,9 +327,21 @@ async fn a_bad_message_is_answered_and_the_session_continues() {
     let (_gateway, addr) = start_gateway().await;
     let mut browser = Browser::open(addr).await;
     browser
-        .send(json!({"type": "subscribe", "stream": "chat"}))
+        .send(json!({"type": "subscribe", "stream": "ops"}))
         .await;
     assert_eq!(browser.recv().await["code"], "bad_request");
+    browser
+        .send(json!({"type": "subscribe", "stream": "chat", "from": "live"}))
+        .await;
+    let error = browser.recv().await;
+    assert_eq!(
+        (error["code"].as_str(), error["stream"].as_str()),
+        (Some("bad_request"), Some("chat"))
+    );
+    browser
+        .send(json!({"type": "x.teleport", "to": "studio"}))
+        .await;
+    assert_eq!(browser.recv().await["code"], "unsupported");
     browser
         .send(json!({"type": "publish", "stream": "ops", "payload": "not base64!", "ack": true, "id": 9}))
         .await;
@@ -347,7 +369,7 @@ async fn metrics_report_both_legs() {
     loop {
         let metrics = http_get(addr, "/metrics").await;
         if metrics["browser_rtt"]["count"].as_u64() > Some(0) {
-            assert!(metrics["felix_publish_ack_ops"]["count"].as_u64() > Some(0));
+            assert!(metrics["felix_publish_ack"]["ops"]["count"].as_u64() > Some(0));
             break;
         }
         assert!(
@@ -400,7 +422,9 @@ async fn an_op_published_while_the_snapshot_is_read_reaches_a_browser_that_subsc
         .as_u64()
         .expect("a live subscription names the tail");
     assert_eq!(subscribed["start_offset"].as_u64(), Some(live));
-    joiner.send(json!({"type": "snapshot_get", "id": 1})).await;
+    joiner
+        .send(json!({"type": "cache_get", "cache": "snap", "key": "latest", "id": 1}))
+        .await;
     writer.publish("ops", &format!("{tag}/during"), true).await;
     let written = writer.recv_type("ack").await["offset"].as_u64();
 
@@ -409,7 +433,7 @@ async fn an_op_published_while_the_snapshot_is_read_reaches_a_browser_that_subsc
     while snapshot.is_none() || event.is_none() {
         let message = joiner.recv().await;
         match message["type"].as_str() {
-            Some("snapshot") => {
+            Some("cache_value") => {
                 assert_eq!(message["id"], 1);
                 snapshot = Some(message);
             }
@@ -434,23 +458,34 @@ async fn a_room_without_a_snapshot_answers_null() {
     // Nothing writes a snapshot of the studio during the tests.
     let (_gateway, addr) = start_gateway().await;
     let mut browser = Browser::join(addr, "ana", "studio").await;
-    browser.send(json!({"type": "snapshot_get", "id": 3})).await;
-    let reply = browser.recv_type("snapshot").await;
-    assert_eq!(reply, json!({"type": "snapshot", "id": 3, "payload": null}));
+    browser
+        .send(json!({"type": "cache_get", "cache": "snap", "key": "latest", "id": 3}))
+        .await;
+    let reply = browser.recv_type("cache_value").await;
+    assert_eq!(
+        reply,
+        json!({"type": "cache_value", "id": 3, "payload": null})
+    );
+    browser
+        .send(json!({"type": "cache_get", "cache": "snap", "key": "a/b", "id": 4}))
+        .await;
+    assert_eq!(browser.recv().await["code"], "bad_request");
 }
 
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
 async fn members_are_listed_watched_and_expire() {
     let mut config = config();
-    config.member_ttl = Duration::from_secs(2);
+    let scope = std::fs::read_to_string(std::env::var("CANVAS_SCOPE_FILE").unwrap()).unwrap();
+    assert!(scope.contains("ttl_s = 30"), "the canvas's scope file");
+    config.scope = Arc::new(ScopeConfig::parse(&scope.replace("ttl_s = 30", "ttl_s = 2")).unwrap());
     let (_gateway, addr) = serve(config).await;
     let key = run_tag("member").replace(|c: char| !c.is_ascii_alphanumeric(), "-");
     let mut watcher = Browser::open(addr).await;
     assert!(!watcher.member_keys().await.contains(&key));
 
     let mut member = Browser::open(addr).await;
-    let set = json!({"type": "set_member", "key": key, "payload": BASE64.encode("ana")});
+    let set = json!({"type": "cache_put", "cache": "members", "key": key, "payload": BASE64.encode("ana")});
     member.send(set.clone()).await;
     let change = watcher.member_change(&key).await;
     assert_eq!(change["payload"], BASE64.encode("ana"));
@@ -460,15 +495,16 @@ async fn members_are_listed_watched_and_expire() {
     assert!((1..=2000).contains(&expires_in), "{change}");
 
     member
-        .send(json!({"type": "remove_member", "key": key}))
+        .send(json!({"type": "cache_delete", "cache": "members", "key": key}))
         .await;
     assert_eq!(watcher.member_change(&key).await["payload"], Value::Null);
 
     member.send(set.clone()).await;
     watcher.member_change(&key).await;
     let token = sign_in("ana").await;
-    let leave =
-        |room: &str, key: &str| json!({"room": room, "token": token, "key": key}).to_string();
+    let leave = |room: &str, key: &str| {
+        json!({"room": room, "token": token, "cache": "members", "key": key}).to_string()
+    };
     assert_eq!(
         http_post(addr, "/members/leave", &leave("lobby", &key)).await,
         204
@@ -478,7 +514,11 @@ async fn members_are_listed_watched_and_expire() {
         http_post(addr, "/members/leave", &leave("lobby", "a:b")).await,
         400
     );
-    let ben = json!({"room": "studio", "token": sign_in("ben").await, "key": key}).to_string();
+    let snap = json!({"room": "lobby", "token": token, "cache": "snap", "key": key}).to_string();
+    assert_eq!(http_post(addr, "/members/leave", &snap).await, 400);
+    let ben =
+        json!({"room": "studio", "token": sign_in("ben").await, "cache": "members", "key": key})
+            .to_string();
     assert_eq!(http_post(addr, "/members/leave", &ben).await, 403);
 
     member.send(set).await;
@@ -492,7 +532,7 @@ async fn members_are_listed_watched_and_expire() {
     );
 
     member
-        .send(json!({"type": "set_member", "key": "a:b", "payload": ""}))
+        .send(json!({"type": "cache_put", "cache": "members", "key": "a:b", "payload": ""}))
         .await;
     assert_eq!(member.recv().await["code"], "bad_request");
 }
@@ -518,7 +558,7 @@ async fn a_token_for_one_room_cannot_reach_another_at_the_broker() {
     // narrowing, not from membership. The connection goes straight to Felix;
     // no gateway code stands between it and the broker.
     let token = gateway
-        .room_token(&sign_in("ana").await, "lobby")
+        .scope_token(&sign_in("ana").await, "lobby")
         .await
         .expect("ana may open the lobby");
     let felix = Arc::new(
@@ -595,7 +635,7 @@ async fn a_member_of_one_room_is_refused_another() {
     let (gateway, addr) = start_gateway().await;
     let ben = sign_in("ben").await;
     assert!(matches!(
-        gateway.room_token(&ben, "studio").await,
+        gateway.scope_token(&ben, "studio").await,
         Err(Refused::Forbidden)
     ));
 
@@ -614,6 +654,15 @@ async fn a_join_without_a_valid_sign_in_or_room_is_refused() {
     let token = sign_in("ana").await;
     let mut bad_room = Browser::connect(addr, "lobby/../studio", &token).await;
     assert_eq!(bad_room.refusal().await["code"], "bad_request");
+
+    let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    let mut future = Browser { socket, next_id: 0 };
+    future
+        .send(json!({"type": "join", "protocol": 2, "room": "lobby", "token": token}))
+        .await;
+    assert_eq!(future.refusal().await["code"], "unsupported");
 
     let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
