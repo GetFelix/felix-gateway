@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,6 +28,8 @@ pub(crate) struct Brokers {
     tenant: String,
     namespace: String,
     member_ttl: Duration,
+    /// Which broker the next connection tries first.
+    next: AtomicUsize,
 }
 
 impl Brokers {
@@ -50,6 +53,7 @@ impl Brokers {
             tenant: config.tenant.clone(),
             namespace: config.namespace.clone(),
             member_ttl: config.member_ttl,
+            next: AtomicUsize::new(0),
         })
     }
 
@@ -68,7 +72,19 @@ impl Brokers {
         let mut config = ClientConfig::optimized_defaults(quic);
         config.auth_tenant_id = Some(self.tenant.clone());
         config.token_provider = Some(tokens);
-        ClusterClient::connect(&self.addrs, &self.server_name, config)
+        // Every session has its own client (felix#969), and the defaults open
+        // 20 connections each against a broker limit of 512 per address. One
+        // of each kind is plenty for one person's edits.
+        config.publish_conn_pool = 1;
+        config.event_conn_pool = 1;
+        config.cache_conn_pool = 1;
+        // Felix tries the addresses in order and waits out a handshake
+        // timeout on each that is down, so starting every connection at the
+        // same one would make every session pay for that broker's loss.
+        let mut addrs = self.addrs.clone();
+        let first = self.next.fetch_add(1, Ordering::Relaxed) % addrs.len();
+        addrs.rotate_left(first);
+        ClusterClient::connect(&addrs, &self.server_name, config)
             .await
             .context("connect to Felix")
     }

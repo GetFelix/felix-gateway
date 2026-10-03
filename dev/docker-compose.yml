@@ -65,6 +65,11 @@ services:
       FELIX_EVENT_BATCH_MAX_EVENTS: "8"
       FELIX_EVENT_BATCH_MAX_DELAY_US: "100"
       FELIX_FANOUT_BATCH: "8"
+      # The writer queue is per connection, not per subscription, and one
+      # change is one entry for each subscription on the connection. At the
+      # default of 64, a client holding 100 subscriptions on one connection
+      # loses changes at any rate.
+      FELIX_SUB_QUEUE_BOUND: "8192"
       RUST_LOG: info
     ports:
       - "127.0.0.1:5000:5000/udp"

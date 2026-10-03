@@ -18,6 +18,11 @@ const TENANT = process.env.CANVAS_TENANT ?? "canvas";
 const NAMESPACE = process.env.CANVAS_NAMESPACE ?? "default";
 const AUDIENCE = "felix-canvas";
 const RETENTION_SECONDS = 30 * 24 * 60 * 60;
+// 3 in the three-broker stack, so a room survives losing any one broker.
+const REPLICAS = Number(process.env.CANVAS_REPLICAS ?? 1);
+// Felix only promotes a replica it knows holds every acknowledged record when
+// the ack waited for a majority.
+const CONSISTENCY = REPLICAS > 1 ? "Quorum" : "Leader";
 
 // Who may open which room. Ana is in both, so the tests can show that a
 // session in one room cannot reach the other even for someone allowed in both.
@@ -96,6 +101,8 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
       { subject: "role:admin", object: streams, action: "stream.manage" },
       { subject: "role:admin", object: caches, action: "cache.manage" },
       { subject: "role:broker", object: "cluster:*", action: "node.view" },
+      // A broker in a cluster registers itself.
+      { subject: "role:broker", object: "cluster:*", action: "node.manage" },
       // Subscribing also grants polling the snapshotter's consumer group.
       { subject: "role:snapshotter", object: streams, action: "stream.subscribe" },
       { subject: "role:snapshotter", object: caches, action: "cache.read" },
@@ -123,9 +130,9 @@ const stream = (name, durable) => ({
   stream: name,
   kind: "Stream",
   shards: 1,
-  replication_factor: 1,
+  replication_factor: REPLICAS,
   retention: { max_age_seconds: durable ? RETENTION_SECONDS : null, max_size_bytes: null },
-  consistency: "Leader",
+  consistency: durable ? CONSISTENCY : "Leader",
   delivery: durable ? "AtLeastOnce" : "AtMostOnce",
   durable,
 });
@@ -150,7 +157,13 @@ for (const room of rooms) {
     console.log(`cache ${cache}`);
     await request("POST", `${CONTROL_PLANE}/v1/tenants/${TENANT}/namespaces/${NAMESPACE}/caches`, {
       token: admin,
-      body: { cache, display_name, shards: 1 },
+      body: {
+        cache,
+        display_name,
+        shards: 1,
+        replication_factor: REPLICAS,
+        consistency: CONSISTENCY,
+      },
     });
   }
 }

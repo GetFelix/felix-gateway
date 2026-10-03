@@ -69,6 +69,9 @@ export class FakeGateway implements Gateway {
   readonly requests: string[];
   /** While set, live records are lost on the way, as Felix drops them for a slow reader. */
   dropping = false;
+  /** While set, an op publish lands in the log but its answer is lost, as when the owner fails. */
+  losingAcks = false;
+  presenceSubscribes = 0;
   #from: number | null = null;
   #counter = 0;
 
@@ -81,6 +84,7 @@ export class FakeGateway implements Gateway {
   }
 
   subscribe(stream: StreamName, from: number | "live"): void {
+    if (stream === "presence") this.presenceSubscribes++;
     if (stream !== "ops") return;
     this.requests.push(`subscribe ${from}`);
     setTimeout(() => {
@@ -107,7 +111,10 @@ export class FakeGateway implements Gateway {
   }
 
   async publish(stream: StreamName, payload: Uint8Array): Promise<number | null> {
-    return stream === "ops" ? this.room.append(payload) : null;
+    if (stream !== "ops") return null;
+    const offset = this.room.append(payload);
+    if (this.losingAcks) throw new GatewayError("publish_failed", "connection lost");
+    return offset;
   }
 
   async counterAdd(_key: string, delta: number): Promise<number> {
