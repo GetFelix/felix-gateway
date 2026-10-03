@@ -386,8 +386,8 @@ Payloads are opaque to the gateway. The canvas encodes ops on `ops` with the
 | `sid` | uint | The authoring session, a u64 |
 | `seq` | uint | The session's op counter, a u32 |
 | `shape` | bin 16 | The target shape id, a u128, big-endian |
-| `kind` | uint | 0 create, 1 patch, 2 delete |
-| `fields` | map | Only the fields this op changes |
+| `kind` | uint | 0 create, 1 patch, 2 delete, 3 text |
+| `fields` | map | Only the fields this op changes; for `text`, the one field `y` |
 | `t` | uint, optional | When the author made the edit, in milliseconds since 1970 by its own clock. Only history shows it; the fold ignores it, and a value that is not a time is dropped |
 
 A move (a patch of `x` and `y`) encodes in about 90 bytes, 11 of them the time.
@@ -400,11 +400,45 @@ offset, and ignores a patch to a shape that does not exist, so a delete is final
 
 | Field | Shapes | Meaning |
 |---|---|---|
-| `type` | all | `rect`, `ellipse`, `line` or `stroke`. A create with any other type is ignored. Never changes |
+| `type` | all | `rect`, `ellipse`, `line`, `stroke` or `text`. A create with any other type is ignored. Never changes |
 | `x`, `y` | all | The top-left corner, or a line's start, in canvas units |
-| `w`, `h` | all | Size; for a line, the offset from start to end, which may be negative |
+| `w`, `h` | all | Size; for a line, the offset from start to end, which may be negative. |
 | `z` | all | A fractional-index key: shapes stack in key order, then by id. A value that is not a key is ignored |
 | `points` | `stroke` | Pairs of coordinates relative to `x, y`. Never changes once created |
+
+### Text
+
+A `text` op changes the rich text of a `text` shape, a rectangle or an
+ellipse. Its one field, `y`, is a [Yjs](https://docs.yjs.dev) update in Yjs's
+version 2 encoding, to a document with one root XML fragment named `body`.
+The fold applies it to that shape's document, so concurrent typing merges
+instead of one person's text replacing another's. A shape's first `text` op
+creates its body, and a delete removes it.
+
+The fold ignores a `text` op on a shape that does not exist, on a line or a
+stroke, or whose update does not decode or is over 64 KB. A session's Yjs
+client id is the low 32 bits of its `sid` XORed with the high 32.
+
+The fragment holds what the editor writes through `y-prosemirror`:
+
+| Element | Attributes | Holds |
+|---|---|---|
+| `p` | none | Text |
+| `h` | `level`: 1, 2 or 3 | Text |
+| `ul`, `ol` | none | `li` elements |
+| `li` | none | A `p`, then any blocks, including lists nested up to three deep |
+
+Text carries marks as Yjs formatting attributes, each a map:
+
+| Mark | Value | Meaning |
+|---|---|---|
+| `b`, `i`, `u` | `{}` | Bold, italic, underline |
+| `a` | `{ href }` | A link; only `http:`, `https:` and `mailto:` addresses count |
+| `size` | `{ step }` | `small`, `large` or `huge`: 12, 20 or 28 canvas units against Medium's 16 |
+| `color` | `{ name }` | `muted`, `coral`, `orange`, `amber`, `green`, `blue`, `violet`, `magenta` or `rose`; Ink when absent |
+
+Anything else in the document is kept but never shown, and the state hash
+leaves it out.
 
 ## Presence payload
 
@@ -454,7 +488,8 @@ The snapshotter writes key `latest` of `canvas.snap.<room>` with `encodeSnapshot
 
 | Key | MessagePack type | Meaning |
 |---|---|---|
-| `v` | uint | Format version, 1 |
+| `v` | uint | Format version, 2. Version 1 had no `texts` and still decodes |
 | `offset` | uint | The last log offset folded in. Continue from `offset + 1` |
 | `shapes` | array | One `[id, fields, written]` per shape: the id as bin 16, the fields as in ops, and a map from field name to the offset that last wrote it |
 | `seqs` | array | One `[sid, seq]` per session: the highest `seq` folded in, so a retried op that lands later is still recognised as a repeat |
+| `texts` | array | One `[id, state]` per body: the shape id as bin 16 and `Y.encodeStateAsUpdateV2` of its document |
