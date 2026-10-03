@@ -402,7 +402,7 @@ offset, and ignores a patch to a shape that does not exist, so a delete is final
 |---|---|---|
 | `type` | all | `rect`, `ellipse`, `line`, `stroke` or `text`. A create with any other type is ignored. Never changes |
 | `x`, `y` | all | The top-left corner, or a line's start, in canvas units |
-| `w`, `h` | all | Size; for a line, the offset from start to end, which may be negative. |
+| `w`, `h` | all | Size; for a line, the offset from start to end, which may be negative. A `text` shape's height follows its text, so its `h` is unused, and a `w` of 0 makes it grow with its longest line |
 | `z` | all | A fractional-index key: shapes stack in key order, then by id. A value that is not a key is ignored |
 | `points` | `stroke` | Pairs of coordinates relative to `x, y`. Never changes once created |
 
@@ -456,6 +456,7 @@ otherwise. A session not heard from for 10 seconds is treated as gone.
 | `sel` | array of bin 16 | Ids of the selected shapes |
 | `gone` | bool | Present and true on a session's last message |
 | `at` | uint | How many changes the session has applied: the next offset it needs. Optional |
+| `txt` | array, optional | While the session edits text: `[shape, anchor, head]`, the shape id as bin 16 and the selection's two ends as encoded Yjs relative positions (`Y.encodeRelativePosition`), so a caret stays on its character while others type before it |
 
 The canvas samples the pointer once per animation frame and sends at most one
 message per 16 ms, so a 120 Hz screen still sends 60 a second. Cursors on other
