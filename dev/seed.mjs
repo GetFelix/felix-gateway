@@ -33,7 +33,7 @@ const CONSISTENCY = REPLICAS > 1 ? "Quorum" : "Leader";
 // Ana is in both rooms, so the tests can show that a session in one room
 // cannot reach the other even for someone allowed in both.
 const MEMBERS = Object.fromEntries(
-  env("CANVAS_ROOMS", "lobby=ana,ben studio=ana")
+  env("CANVAS_ROOMS", "lobby=ana,ben,cleo studio=ana")
     .split(/\s+/)
     .filter(Boolean)
     .map((entry) => {

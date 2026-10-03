@@ -33,7 +33,10 @@ GET /oidc
 
 It signs in with that OpenID Connect provider using the authorization code
 flow with PKCE (S256), as a public client with the redirect URI
-`<page origin>/`, asking for `scopes`, and keeps the ID token it gets. [design.md](design.md#authorization)
+`<page origin>/`, asking for `scopes`, and keeps the ID token it gets for that
+tab only, so two windows of one browser can be signed in to different
+accounts. A new tab signs in again; with a provider session that is usually a
+redirect with nothing to type. [design.md](design.md#authorization)
 describes what the gateway does with it.
 
 ## Browser to gateway
@@ -432,10 +435,12 @@ A member entry is a MessagePack map, encoded by `encodeMember` in `model/`.
 |---|---|---|
 | `name` | str | Display name, at most 24 characters |
 | `color` | uint | Index into the presence palette |
-| `person` | uint | A u64 the browser keeps in local storage across visits |
+| `person` | uint | A u64 hash of the signed-in account: the 64-bit FNV-1a of the JSON array `[iss, sub]` from the ID token |
 
 The key is the session, which is new on every page load; `person` stays the
-same, so the canvas uses it for anything that should outlast a reload. A
+same for every tab and every visit signed in to one account, so the canvas
+uses it for anything that should outlast a reload. Two windows signed in to
+different accounts are two people, even in one browser. A
 person's colour is their `person` modulo eight, moved on to the next free
 colour while someone with a smaller `person` holds it. Everyone sees the same
 member list, so everyone settles on the same colours, and a reload keeps them.

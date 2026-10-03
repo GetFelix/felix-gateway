@@ -31,7 +31,7 @@ function mint(subject, audience, nonce) {
       iss: ISSUER,
       sub: subject,
       aud: audience,
-      name: subject,
+      name: subject.charAt(0).toUpperCase() + subject.slice(1),
       iat: now,
       exp: now + TOKEN_TTL_SECONDS,
       ...(nonce ? { nonce } : {}),
