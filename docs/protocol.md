@@ -10,7 +10,7 @@ Each room has two streams and one member list:
 
 | Name | Felix stream | Kind | Offsets |
 |---|---|---|---|
-| `ops` | `canvas.ops.<room>` | Durable, retained 30 days | Every event has one |
+| `ops` | `canvas.ops.<room>` | Durable, kept until the broker's retention trims it | Every event has one |
 | `presence` | `canvas.presence.<room>` | In memory, at most once | Always `null` |
 
 The member list is the Felix cache `canvas.members.<room>`, one key per
@@ -144,6 +144,26 @@ A browser joins a room in this order:
 
 Reading the snapshot before subscribing would lose the ops published between
 the two. [design.md](design.md#join-and-snapshot) explains the rule.
+
+### Reading history
+
+A page may open more than one connection to the same room; each joins and is
+narrowed on its own. The canvas reads a room's history over a second one, so
+its live subscription is never replaced:
+
+1. `join` the room with the same ID token, then `subscribe` to `ops` from 0.
+   `subscribed` names the tail `L`; history is loaded once every offset below
+   `L` has arrived, and later events extend it.
+2. A jump in offsets is a drop, as on any subscription: `subscribe` again from
+   the first offset missing.
+3. A `trimmed` answer means retention has discarded the start of the log. Read
+   the snapshot with `snapshot_get` and `subscribe` from its offset plus one;
+   history starts there.
+
+Closing the connection ends the read. The gateway keeps nothing about it, and
+reading again later subscribes from the first offset the page does not hold.
+[design.md](design.md#history-and-the-time-scrubber) describes what the page
+does with it.
 ### `set_member`
 
 ```json
@@ -365,8 +385,9 @@ Payloads are opaque to the gateway. The canvas encodes ops on `ops` with the
 | `shape` | bin 16 | The target shape id, a u128, big-endian |
 | `kind` | uint | 0 create, 1 patch, 2 delete |
 | `fields` | map | Only the fields this op changes |
+| `t` | uint, optional | When the author made the edit, in milliseconds since 1970 by its own clock. Only history shows it; the fold ignores it, and a value that is not a time is dropped |
 
-A move (a patch of `x` and `y`) encodes in about 80 bytes.
+A move (a patch of `x` and `y`) encodes in about 90 bytes, 11 of them the time.
 
 ### Shape fields
 
