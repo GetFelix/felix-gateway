@@ -12,14 +12,19 @@ use felix_client::{CacheChange, CacheWatchItem, CursorErrorReason, SubscribeCurs
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::felix::Felix;
+use crate::access::{ControlPlane, Refused};
+use crate::felix::{Brokers, Felix};
 use crate::metrics::Metrics;
 use crate::protocol::{
     ClientMessage, CounterName, ErrorCode, MemberEntry, ServerMessage, StartAt, StreamName,
 };
+use crate::room::{BAD_NAME, Room, valid_name};
 use crate::transport::{BrowserConnection, Incoming};
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a new connection may take to send its `join`.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Events waiting for a slow browser. When this fills, the subscription stops
 /// reading and Felix's own per-subscriber queue decides what to drop, so a
@@ -47,9 +52,14 @@ enum Write {
 /// Relay one browser connection until it closes.
 pub(crate) async fn run<C: BrowserConnection>(
     mut conn: C,
-    felix: Arc<Felix>,
+    brokers: Arc<Brokers>,
+    control_plane: ControlPlane,
     metrics: Arc<Metrics>,
 ) {
+    let Some(felix) = join(&mut conn, &brokers, &control_plane).await else {
+        return;
+    };
+    let felix = Arc::new(felix);
     let (events_tx, mut events_rx) = mpsc::channel(EVENT_QUEUE);
     // Unbounded so the publish task never waits on the browser, which is what
     // lets the loop below block on a full publish queue without deadlocking.
@@ -67,12 +77,11 @@ pub(crate) async fn run<C: BrowserConnection>(
     let mut ping = tokio::time::interval(PING_INTERVAL);
 
     let hello = ServerMessage::Hello {
-        namespace: felix.namespace().to_string(),
+        namespace: brokers.namespace().to_string(),
         room: felix.room().to_string(),
-        member_ttl_ms: u64::try_from(felix.member_ttl().as_millis()).unwrap_or(u64::MAX),
+        member_ttl_ms: u64::try_from(brokers.member_ttl().as_millis()).unwrap_or(u64::MAX),
     };
-    let hello = serde_json::to_string(&hello).expect("server messages serialize");
-    if conn.send(hello).await.is_err() {
+    if send(&mut conn, &hello).await.is_err() {
         return;
     }
 
@@ -111,8 +120,8 @@ pub(crate) async fn run<C: BrowserConnection>(
                     }
                     Ok(ClientMessage::SetMember { key, payload }) => {
                         match BASE64.decode(payload) {
-                            Ok(_) if !valid_key(&key) => {
-                                error(None, None, ErrorCode::BadRequest, BAD_KEY)
+                            Ok(_) if !valid_name(&key) => {
+                                error(None, None, ErrorCode::BadRequest, BAD_NAME)
                             }
                             Ok(payload) => {
                                 let write = Write::Member { key, payload: Some(payload) };
@@ -125,13 +134,13 @@ pub(crate) async fn run<C: BrowserConnection>(
                         }
                     }
                     Ok(ClientMessage::RemoveMember { key }) => {
-                        if valid_key(&key) {
+                        if valid_name(&key) {
                             if write_tx.send(Write::Member { key, payload: None }).await.is_err() {
                                 break;
                             }
                             continue;
                         }
-                        error(None, None, ErrorCode::BadRequest, BAD_KEY)
+                        error(None, None, ErrorCode::BadRequest, BAD_NAME)
                     }
                     Ok(ClientMessage::WatchMembers) => {
                         let task = tokio::spawn(relay_members(Arc::clone(&felix), events_tx.clone()));
@@ -140,9 +149,12 @@ pub(crate) async fn run<C: BrowserConnection>(
                         }
                         continue;
                     }
+                    Ok(ClientMessage::Join { .. }) => {
+                        error(None, None, ErrorCode::BadRequest, "already joined")
+                    }
                     Ok(ClientMessage::CounterAdd { counter, key, delta, id }) => {
-                        if !valid_key(&key) {
-                            error(Some(id), None, ErrorCode::BadRequest, BAD_KEY)
+                        if !valid_name(&key) {
+                            error(Some(id), None, ErrorCode::BadRequest, BAD_NAME)
                         } else {
                             tokio::spawn(add_to_counter(
                                 counter,
@@ -171,8 +183,7 @@ pub(crate) async fn run<C: BrowserConnection>(
                 continue;
             }
         };
-        let text = serde_json::to_string(&outbound).expect("server messages serialize");
-        if conn.send(text).await.is_err() {
+        if send(&mut conn, &outbound).await.is_err() {
             break;
         }
     }
@@ -228,15 +239,70 @@ async fn write_in_order(
     }
 }
 
-pub(crate) const BAD_KEY: &str = "a key is 1 to 64 ASCII letters, digits, '-' or '_'";
+/// Wait for the browser's `join`, exchange its sign-in for a token that
+/// reaches only that room, and connect to Felix with it. Anything else first,
+/// or a refusal, is answered with an error and ends the session.
+async fn join<C: BrowserConnection>(
+    conn: &mut C,
+    brokers: &Brokers,
+    control_plane: &ControlPlane,
+) -> Option<Felix> {
+    let first = tokio::time::timeout(JOIN_TIMEOUT, async {
+        loop {
+            match conn.recv().await? {
+                Incoming::Message(text) => return Some(text),
+                Incoming::RoundTrip(_) => {}
+            }
+        }
+    })
+    .await
+    .ok()??;
+    let refusal = match serde_json::from_str(&first) {
+        Ok(ClientMessage::Join { room, token }) => match Room::parse(&room) {
+            Some(room) => match open(room, &token, brokers, control_plane).await {
+                Ok(felix) => return Some(felix),
+                Err(refusal) => refusal,
+            },
+            None => error(None, None, ErrorCode::BadRequest, BAD_NAME),
+        },
+        Ok(_) => error(None, None, ErrorCode::BadRequest, "join a room first"),
+        Err(err) => error(None, None, ErrorCode::BadRequest, err),
+    };
+    let _ = send(conn, &refusal).await;
+    None
+}
 
-// Keys become part of a Felix cache key shared by every connection, so they
-// are kept to a plain alphabet rather than passed through.
-pub(crate) fn valid_key(key: &str) -> bool {
-    (1..=64).contains(&key.len())
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+/// Exchange `token` for `room` and connect with the result. The error is the
+/// message to answer the browser with.
+pub(crate) async fn open(
+    room: Room,
+    token: &str,
+    brokers: &Brokers,
+    control_plane: &ControlPlane,
+) -> Result<Felix, ServerMessage> {
+    let grant = control_plane
+        .exchange(token, &room)
+        .await
+        .map_err(|refusal| match refusal {
+            Refused::SignedOut => error(None, None, ErrorCode::SignedOut, "sign in again"),
+            Refused::Forbidden => error(
+                None,
+                None,
+                ErrorCode::Forbidden,
+                "not a member of this room",
+            ),
+            Refused::Unavailable(err) => error(None, None, ErrorCode::Unavailable, err),
+        })?;
+    let client = brokers
+        .connect(control_plane.tokens(grant))
+        .await
+        .map_err(|err| error(None, None, ErrorCode::Unavailable, err))?;
+    Ok(Felix::new(client, brokers, room))
+}
+
+async fn send<C: BrowserConnection>(conn: &mut C, message: &ServerMessage) -> anyhow::Result<()> {
+    conn.send(serde_json::to_string(message).expect("server messages serialize"))
+        .await
 }
 
 async fn add_to_counter(
@@ -345,7 +411,6 @@ async fn relay_members(felix: Arc<Felix>, events: mpsc::Sender<ServerMessage>) {
             return;
         }
     };
-    let prefix = felix.member_prefix();
     let mut retained = watch.retained_count().unwrap_or(0);
     let mut initial = Some(Vec::new());
     let ended = loop {
@@ -360,7 +425,7 @@ async fn relay_members(felix: Arc<Felix>, events: mpsc::Sender<ServerMessage>) {
         }
         match watch.recv().await {
             Some(CacheWatchItem::Change(change)) => {
-                let entry = member_entry(&prefix, change);
+                let entry = member_entry(change);
                 match initial.as_mut() {
                     Some(members) => {
                         retained -= 1;
@@ -386,18 +451,14 @@ async fn relay_members(felix: Arc<Felix>, events: mpsc::Sender<ServerMessage>) {
         .await;
 }
 
-fn member_entry(prefix: &str, change: CacheChange) -> MemberEntry {
+fn member_entry(change: CacheChange) -> MemberEntry {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
     MemberEntry {
-        key: change
-            .key
-            .strip_prefix(prefix)
-            .unwrap_or(&change.key)
-            .to_string(),
+        key: change.key,
         payload: change.value.map(|value| BASE64.encode(value)),
         expires_in_ms: (change.expires_at_millis != 0)
             .then(|| change.expires_at_millis.saturating_sub(now)),

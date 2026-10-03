@@ -13,12 +13,12 @@ pub enum StreamName {
     Presence,
 }
 
-/// A counter the browser may add to. Each maps to one Felix counter scope,
-/// with keys confined to the gateway's room.
+/// A counter the browser may add to. Each maps to one of the room's Felix
+/// counter caches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CounterName {
-    /// Per-session op sequence numbers, `canvas.seq/<room>:<key>`.
+    /// Per-session op sequence numbers, `canvas.seq.<room>/<key>`.
     Seq,
 }
 
@@ -43,6 +43,10 @@ pub enum Live {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    /// The first message on every connection: which room to open, and the
+    /// browser's OpenID Connect ID token. Answered with
+    /// [`ServerMessage::Hello`], or with an error before the gateway closes.
+    Join { room: String, token: String },
     /// Start relaying a stream's events. Replaces any earlier subscription to
     /// the same stream on this connection.
     Subscribe { stream: StreamName, from: StartAt },
@@ -65,7 +69,7 @@ pub enum ClientMessage {
     /// Read the room's snapshot. The gateway answers with a
     /// [`ServerMessage::Snapshot`] carrying the same `id`.
     SnapshotGet { id: u64 },
-    /// Write this session's member entry, `canvas.presence/<room>:<key>`,
+    /// Write this session's member entry, `canvas.members.<room>/<key>`,
     /// expiring after the gateway's member TTL unless written again.
     SetMember { key: String, payload: String },
     /// Delete a member entry, for a session that is closing.
@@ -79,7 +83,7 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// The first message on every connection: which room this gateway serves.
+    /// The answer to [`ClientMessage::Join`]: the session is open on this room.
     Hello {
         namespace: String,
         room: String,
@@ -155,6 +159,12 @@ pub enum ErrorCode {
     /// The subscription asked for an offset the log no longer holds. Start
     /// again from the snapshot.
     Trimmed,
+    /// The join carried no usable sign-in. Sign in again.
+    SignedOut,
+    /// The signed-in user may not open this room.
+    Forbidden,
+    /// The join could not be completed for now. Try again.
+    Unavailable,
     /// Felix refused or lost a member write or delete.
     MemberFailed,
     /// The member watch was refused or stopped. Watch again.
@@ -203,6 +213,20 @@ mod tests {
             ClientMessage::Subscribe {
                 stream: StreamName::Presence,
                 from: StartAt::Live(Live::Live)
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_join() {
+        let join: ClientMessage =
+            serde_json::from_value(json!({"type": "join", "room": "lobby", "token": "eyJ"}))
+                .unwrap();
+        assert_eq!(
+            join,
+            ClientMessage::Join {
+                room: "lobby".into(),
+                token: "eyJ".into()
             }
         );
     }

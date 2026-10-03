@@ -1,12 +1,14 @@
-//! The gateway's one Felix connection, shared by every browser session.
+//! Felix connections: one per browser session, each with that session's own
+//! room token.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use felix_client::{
     CacheWatchFilter, ClientConfig, ClusterCacheWatch, ClusterClient, ClusterSubscription,
-    StartPosition,
+    StartPosition, TokenProvider,
 };
 use felix_wire::AckMode;
 use rustls::RootCertStore;
@@ -15,23 +17,20 @@ use rustls::pki_types::pem::PemObject;
 
 use crate::config::Config;
 use crate::protocol::{CounterName, StartAt, StreamName};
+use crate::room::{Room, SNAPSHOT_KEY};
 
-/// The cache holding member entries, keyed `<room>:<session>`.
-const MEMBERS: &str = "canvas.presence";
-
-/// A Felix connection scoped to one room's streams.
-pub(crate) struct Felix {
-    client: Arc<ClusterClient>,
+/// Where the brokers are and how to trust them, read once at startup.
+pub(crate) struct Brokers {
+    addrs: Vec<SocketAddr>,
+    server_name: String,
+    roots: Option<Arc<RootCertStore>>,
     tenant: String,
     namespace: String,
-    room: String,
-    ops: String,
-    presence: String,
     member_ttl: Duration,
 }
 
-impl Felix {
-    pub(crate) async fn connect(config: &Config) -> Result<Self> {
+impl Brokers {
+    pub(crate) fn new(config: &Config) -> Result<Self> {
         let roots = match &config.ca_file {
             Some(path) => {
                 let mut roots = RootCertStore::empty();
@@ -44,20 +43,12 @@ impl Felix {
             }
             None => None,
         };
-        let quinn = felix_client::quic_client_config(roots, true)?;
-        let mut client_config = ClientConfig::optimized_defaults(quinn);
-        client_config.auth_tenant_id = Some(config.tenant.clone());
-        client_config.auth_token = Some(config.token.clone());
-        let client = ClusterClient::connect(&config.brokers, &config.server_name, client_config)
-            .await
-            .context("connect to Felix")?;
         Ok(Self {
-            client: Arc::new(client),
+            addrs: config.brokers.clone(),
+            server_name: config.server_name.clone(),
+            roots,
             tenant: config.tenant.clone(),
             namespace: config.namespace.clone(),
-            room: config.room.clone(),
-            ops: format!("canvas.ops.{}", config.room),
-            presence: format!("canvas.presence.{}", config.room),
             member_ttl: config.member_ttl,
         })
     }
@@ -66,18 +57,51 @@ impl Felix {
         &self.namespace
     }
 
-    pub(crate) fn room(&self) -> &str {
-        &self.room
-    }
-
     pub(crate) fn member_ttl(&self) -> Duration {
         self.member_ttl
     }
 
-    /// The prefix of every member key in this room. Keys are checked to hold
-    /// no `:`, so one room's prefix never matches another room's keys.
-    pub(crate) fn member_prefix(&self) -> String {
-        format!("{}:", self.room)
+    /// Connect with tokens from `tokens`, which decide what this connection
+    /// may touch.
+    pub(crate) async fn connect(&self, tokens: Arc<dyn TokenProvider>) -> Result<ClusterClient> {
+        let quic = felix_client::quic_client_config(self.roots.clone(), true)?;
+        let mut config = ClientConfig::optimized_defaults(quic);
+        config.auth_tenant_id = Some(self.tenant.clone());
+        config.token_provider = Some(tokens);
+        ClusterClient::connect(&self.addrs, &self.server_name, config)
+            .await
+            .context("connect to Felix")
+    }
+}
+
+/// One session's Felix connection, scoped to its room's streams and caches.
+pub(crate) struct Felix {
+    client: Arc<ClusterClient>,
+    tenant: String,
+    namespace: String,
+    room: Room,
+    ops: String,
+    presence: String,
+    members: String,
+    member_ttl: Duration,
+}
+
+impl Felix {
+    pub(crate) fn new(client: ClusterClient, brokers: &Brokers, room: Room) -> Self {
+        Self {
+            client: Arc::new(client),
+            tenant: brokers.tenant.clone(),
+            namespace: brokers.namespace.clone(),
+            ops: room.ops(),
+            presence: room.presence(),
+            members: room.members(),
+            member_ttl: brokers.member_ttl,
+            room,
+        }
+    }
+
+    pub(crate) fn room(&self) -> &str {
+        self.room.name()
     }
 
     fn stream(&self, stream: StreamName) -> &str {
@@ -133,8 +157,8 @@ impl Felix {
             .await
     }
 
-    /// Add to a counter under this room, `<cache>/<room>:<key>`. Like a
-    /// publish it is sent once; Felix counts a retried add twice.
+    /// Add to one of the room's counters. Like a publish it is sent once;
+    /// Felix counts a retried add twice.
     pub(crate) async fn counter_add(
         &self,
         counter: CounterName,
@@ -142,29 +166,32 @@ impl Felix {
         delta: i64,
     ) -> Result<i64> {
         let cache = match counter {
-            CounterName::Seq => "canvas.seq",
+            CounterName::Seq => self.room.seq(),
         };
-        let key = format!("{}:{key}", self.room);
         self.client
             .client()
             .await
-            .counter_add(&self.tenant, &self.namespace, cache, &key, delta)
+            .counter_add(&self.tenant, &self.namespace, &cache, key, delta)
             .await
     }
 
-    /// The room's snapshot, `canvas.snap/<room>`, as the snapshotter wrote it.
+    /// The room's snapshot, as the snapshotter wrote it.
     pub(crate) async fn snapshot(&self) -> Result<Option<Vec<u8>>> {
         let value = self
             .client
             .client()
             .await
-            .cache_get(&self.tenant, &self.namespace, "canvas.snap", &self.room)
+            .cache_get(
+                &self.tenant,
+                &self.namespace,
+                &self.room.snapshots(),
+                SNAPSHOT_KEY,
+            )
             .await?;
         Ok(value.map(|bytes| bytes.to_vec()))
     }
 
     pub(crate) async fn set_member(&self, key: &str, payload: Vec<u8>) -> Result<()> {
-        let key = format!("{}{key}", self.member_prefix());
         let ttl = u64::try_from(self.member_ttl.as_millis()).unwrap_or(u64::MAX);
         self.client
             .client()
@@ -172,8 +199,8 @@ impl Felix {
             .cache_put(
                 &self.tenant,
                 &self.namespace,
-                MEMBERS,
-                &key,
+                &self.members,
+                key,
                 payload.into(),
                 Some(ttl),
             )
@@ -181,23 +208,23 @@ impl Felix {
     }
 
     pub(crate) async fn remove_member(&self, key: &str) -> Result<()> {
-        let key = format!("{}{key}", self.member_prefix());
         self.client
             .client()
             .await
-            .cache_delete(&self.tenant, &self.namespace, MEMBERS, &key)
+            .cache_delete(&self.tenant, &self.namespace, &self.members, key)
             .await
             .map(drop)
     }
 
-    /// Every member entry in the room, then each change to one.
+    /// Every member entry in the room, then each change to one. The member
+    /// cache has one shard, so an empty prefix covers the whole room.
     pub(crate) async fn watch_members(&self) -> Result<ClusterCacheWatch> {
         self.client
             .watch_cache_retained(
                 &self.tenant,
                 &self.namespace,
-                MEMBERS,
-                CacheWatchFilter::Prefix(self.member_prefix()),
+                &self.members,
+                CacheWatchFilter::Prefix(String::new()),
             )
             .await
     }

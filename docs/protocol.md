@@ -2,20 +2,68 @@
 
 A browser opens one WebSocket to the gateway at `/ws` and exchanges JSON text
 frames over it. The gateway relays each request to Felix and each Felix event
-back, without decoding payloads. One gateway serves one room, named by
-`CANVAS_ROOM`.
+back, without decoding payloads. One gateway serves every room: a connection
+names its room and signs in with its first message, `join`, and from then on
+reaches that room and nothing else.
 
-The protocol has two streams and one member list:
+Each room has two streams and one member list:
 
 | Name | Felix stream | Kind | Offsets |
 |---|---|---|---|
 | `ops` | `canvas.ops.<room>` | Durable, retained 30 days | Every event has one |
 | `presence` | `canvas.presence.<room>` | In memory, at most once | Always `null` |
 
-The member list is the Felix cache keys `canvas.presence/<room>:<session>`, one
-per session, each expiring unless its session writes it again.
+The member list is the Felix cache `canvas.members.<room>`, one key per
+session, each expiring unless its session writes it again. The room's other
+caches are `canvas.seq.<room>` for sequence numbers and `canvas.snap.<room>`
+for the snapshot. Every room has its own streams and caches because Felix
+authorizes a cache as a whole, never one key of it.
+
+## Signing in
+
+Before it connects, the page asks the gateway how to sign in:
+
+```http
+GET /oidc
+```
+
+```json
+{"issuer": "https://login.example.com", "client_id": "felix-canvas"}
+```
+
+It signs in with that OpenID Connect provider using the authorization code
+flow with PKCE (S256), as a public client with the redirect URI
+`<page origin>/`, and keeps the ID token it gets. [design.md](design.md#authorization)
+describes what the gateway does with it.
 
 ## Browser to gateway
+
+### `join`
+
+```json
+{"type": "join", "room": "lobby", "token": "eyJhbGciOiJFUzI1NiIs..."}
+```
+
+| Field | Meaning |
+|---|---|
+| `room` | The room to open: 1 to 64 ASCII letters, digits, `-` or `_` |
+| `token` | The ID token from signing in |
+
+The first message on every connection, and the only one allowed before
+`hello`. The gateway exchanges the ID token at the Felix control plane for a
+Felix token narrowed to this room and opens its Felix connection with it. It
+answers `hello`, or one `error` and then closes the connection:
+
+| Code | Meaning | What the canvas does |
+|---|---|---|
+| `forbidden` | The signed-in person is not a member of the room, or the room does not exist | Shows "You don't have access to this canvas" and stops |
+| `signed_out` | The ID token is missing, expired or from a provider the deployment does not trust | Offers to sign in again |
+| `unavailable` | The control plane or the brokers could not be reached | Reconnects as after any drop |
+| `bad_request` | The first message was not a `join`, or the room name is not allowed | |
+
+Messages sent after `join` and before `hello` wait for the answer, so a page
+can send its first `subscribe` right after `join`. A connection that sends
+nothing for 10 seconds is closed.
 
 ### `subscribe`
 
@@ -62,8 +110,8 @@ retry, because only the op's `(sid, seq)` makes a retry safe to deduplicate.
 
 | Field | Meaning |
 |---|---|
-| `counter` | `"seq"`, the only counter: per-session op sequence numbers, the Felix counter `canvas.seq/<room>:<key>` |
-| `key` | 1 to 64 ASCII letters, digits, `-` or `_`. The gateway prefixes the room, so a key never reaches another room's counter |
+| `counter` | `"seq"`, the only counter: per-session op sequence numbers, key `key` in the Felix counter cache `canvas.seq.<room>` |
+| `key` | 1 to 64 ASCII letters, digits, `-` or `_` |
 | `delta` | A signed 64-bit amount to add |
 | `id` | As for `publish`; it comes back on the `counter` or `error` |
 
@@ -79,7 +127,7 @@ only wastes numbers.
 {"type": "snapshot_get", "id": 9}
 ```
 
-Read the room's snapshot, the Felix cache key `canvas.snap/<room>`. The gateway
+Read the room's snapshot, key `latest` in the Felix cache `canvas.snap.<room>`. The gateway
 answers with a `snapshot` message carrying the same `id`.
 
 ### Joining
@@ -102,7 +150,7 @@ the two. [design.md](design.md#join-and-snapshot) explains the rule.
 {"type": "set_member", "key": "3f9a0c12d4e5b6a7", "payload": "gqRuYW1lo0FuYaVjb2xvcgI="}
 ```
 
-Writes this session's member entry, `canvas.presence/<room>:<key>`, with the
+Writes this session's member entry, key `key` in `canvas.members.<room>`, with the
 TTL the gateway announced in `hello`. `key` follows the rule for `counter_add`.
 The canvas writes its entry on connecting and again every third of the TTL, so
 a session that stops writing drops out of everyone's list within one TTL. There
@@ -119,9 +167,12 @@ writes and publishes reach Felix one at a time in the order sent, so a delete is
 never overtaken by the refresh before it.
 
 A message sent while a page unloads may never leave it, so a closing tab also
-sends the key as the body of `POST /members/leave` with `navigator.sendBeacon`,
-which the browser delivers after the page is gone. The gateway answers 204, or
-400 for a bad key.
+sends `POST /members/leave` with `navigator.sendBeacon`, which the browser
+delivers after the page is gone. The body is
+`{"room": "lobby", "token": "<ID token>", "key": "3f9a0c12d4e5b6a7"}`, and the
+gateway exchanges the token exactly as for `join` before it deletes anything.
+It answers 204, 400 for a bad room or key, or 403 with the refusal as an
+`error` message.
 
 ### `watch_members`
 
@@ -141,8 +192,8 @@ earlier watch and starts with a fresh `members`.
 {"type": "hello", "namespace": "default", "room": "lobby", "member_ttl_ms": 30000}
 ```
 
-The first message on every connection: the room this gateway serves, and how
-long a member entry lasts without a write. `CANVAS_MEMBER_TTL_SECONDS` sets
+The answer to `join`: the session is open on this room, and this is how long
+a member entry lasts without a write. `CANVAS_MEMBER_TTL_SECONDS` sets
 the TTL; it defaults to 30 seconds.
 
 ### `subscribed`
@@ -232,7 +283,7 @@ A relative time keeps the browser's own clock out of it.
 
 `id` and `stream` are present when the error is about one request or one
 stream. `oldest` is present only on `trimmed`. The connection stays open after
-any error.
+any error except an answer to `join`.
 
 | Code | Meaning |
 |---|---|
@@ -245,6 +296,7 @@ any error.
 | `trimmed` | The subscription asked for an offset retention has discarded. `oldest` is the oldest offset left. Join again from the snapshot |
 | `member_failed` | Felix refused or lost a member write or delete. The next refresh writes it again |
 | `watch_failed` | The member watch was refused or stopped. Send `watch_members` again |
+| `forbidden`, `signed_out`, `unavailable` | Only in answer to `join`; see [`join`](#join) |
 
 ## Slow browsers
 
@@ -340,7 +392,7 @@ however many entries an unclean reload left behind.
 
 ## Snapshot payload
 
-The snapshotter writes `canvas.snap/<room>` with `encodeSnapshot` from
+The snapshotter writes key `latest` of `canvas.snap.<room>` with `encodeSnapshot` from
 `model/`: a MessagePack map with these keys.
 
 | Key | MessagePack type | Meaning |

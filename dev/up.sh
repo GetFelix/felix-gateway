@@ -15,9 +15,9 @@ fi
 for _ in $(seq 1 90); do
   if curl -fsS http://127.0.0.1:8080/ready >/dev/null 2>&1; then
     echo "Felix is ready. For the gateway:"
-    echo "  export CANVAS_FELIX_TOKEN=\"\$(cat dev/state/gateway.token)\""
     echo "  export CANVAS_FELIX_CA_FILE=dev/state/broker-cert.pem"
-    echo "The snapshotter takes the same variables with dev/state/snapshotter.token."
+    echo "The snapshotter also takes"
+    echo "  export CANVAS_FELIX_TOKEN=\"\$(cat dev/state/snapshotter.token)\""
     exit 0
   fi
   sleep 2

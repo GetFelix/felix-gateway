@@ -1,5 +1,6 @@
 # Felix for local development and CI: a control plane, one broker, a stand-in
-# IdP, and a one-shot seed that creates the room's streams and tokens.
+# IdP, and a one-shot seed that creates the rooms, their members and the
+# service tokens.
 # `dev/up.sh` starts it and waits until the broker is ready.
 name: felix-canvas
 
@@ -7,6 +8,11 @@ services:
   idp:
     image: node:24-alpine
     command: ["node", "/app/idp.mjs"]
+    environment:
+      # Browsers sign in on the host, so the issuer is the host's address.
+      IDP_ISSUER: http://127.0.0.1:9400
+    ports:
+      - "127.0.0.1:9400:9400"
     volumes:
       - ./idp.mjs:/app/idp.mjs:ro
     healthcheck:
@@ -24,9 +30,8 @@ services:
       FELIX_BOOTSTRAP_TOKEN: dev-bootstrap
       # The dev IdP is plain HTTP on the compose network.
       FELIX_CONTROLPLANE_OIDC_ALLOW_INSECURE_HTTP: "true"
-      # The gateway reads its token once from the environment, and the broker
-      # reads its credential once at startup, so the default 15 minutes would
-      # end a dev session early.
+      # The broker reads its credential once at startup, so the default 15
+      # minutes would end a dev session early. Session tokens refresh.
       FELIX_EXCHANGE_TOKEN_TTL_SECONDS: "86400"
       RUST_LOG: info
     ports:

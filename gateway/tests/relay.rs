@@ -1,13 +1,17 @@
-//! The gateway against a real Felix broker. Ignored by default because they
-//! need the development stack running; see the README, or run
-//! `cargo test -- --include-ignored` with the `CANVAS_*` variables set.
+//! The gateway against a real Felix broker, control plane and the stand-in
+//! identity provider. Ignored by default because they need the development
+//! stack running; see the README, or run `cargo test -- --include-ignored`
+//! with the `CANVAS_*` variables set.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use felix_canvas_gateway::{Config, Gateway};
+use felix_canvas_gateway::{Config, Gateway, Refused};
+use felix_client::{CacheWatchFilter, TokenFuture, TokenProvider};
+use felix_wire::AckMode;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,7 +30,7 @@ async fn start_gateway() -> (Gateway, SocketAddr) {
 }
 
 async fn serve(config: Config) -> (Gateway, SocketAddr) {
-    let gateway = Gateway::connect(&config).await.expect("connect to Felix");
+    let gateway = Gateway::new(&config).expect("read the broker CA");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = gateway.router();
@@ -44,22 +48,68 @@ fn run_tag(test: &str) -> String {
     format!("{test}-{nanos}")
 }
 
+/// An ID token for `user` from the development IdP, as a browser would hold
+/// after signing in.
+async fn sign_in(user: &str) -> String {
+    let config = config();
+    let url = format!(
+        "{}/token?sub={user}&aud={}",
+        config.oidc_issuer, config.oidc_client_id
+    );
+    let answer: Value = reqwest::get(url)
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("the development IdP answers")
+        .json()
+        .await
+        .unwrap();
+    answer["id_token"].as_str().unwrap().to_string()
+}
+
 struct Browser {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
 }
 
 impl Browser {
-    async fn open(gateway: SocketAddr) -> Self {
+    /// Open a connection and send `join`, without waiting for the answer.
+    async fn connect(gateway: SocketAddr, room: &str, token: &str) -> Self {
         let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{gateway}/ws"))
             .await
             .expect("open WebSocket");
         let mut browser = Self { socket, next_id: 0 };
+        browser
+            .send(json!({"type": "join", "room": room, "token": token}))
+            .await;
+        browser
+    }
+
+    /// Join `room` signed in as `user`, and wait until the gateway confirms.
+    async fn join(gateway: SocketAddr, user: &str, room: &str) -> Self {
+        let mut browser = Self::connect(gateway, room, &sign_in(user).await).await;
         let hello = browser.recv().await;
-        assert_eq!(hello["type"], "hello", "the first message names the room");
-        assert!(hello["room"].is_string(), "{hello}");
+        assert_eq!(hello["type"], "hello", "{hello}");
+        assert_eq!(hello["room"], room);
         assert!(hello["member_ttl_ms"].as_u64() > Some(0), "{hello}");
         browser
+    }
+
+    async fn open(gateway: SocketAddr) -> Self {
+        Self::join(gateway, "ana", "lobby").await
+    }
+
+    /// The error a refused join is answered with. The gateway closes after it.
+    async fn refusal(&mut self) -> Value {
+        let error = self.recv().await;
+        assert_eq!(error["type"], "error", "{error}");
+        let closed = tokio::time::timeout(WAIT, self.socket.next())
+            .await
+            .unwrap();
+        assert!(
+            !matches!(closed, Some(Ok(Message::Text(_)))),
+            "nothing follows a refusal: {closed:?}"
+        );
+        error
     }
 
     async fn send(&mut self, message: Value) {
@@ -381,10 +431,9 @@ async fn an_op_published_while_the_snapshot_is_read_reaches_a_browser_that_subsc
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
 async fn a_room_without_a_snapshot_answers_null() {
-    let mut config = config();
-    config.room = run_tag("empty");
-    let (_gateway, addr) = serve(config).await;
-    let mut browser = Browser::open(addr).await;
+    // Nothing writes a snapshot of the studio during the tests.
+    let (_gateway, addr) = start_gateway().await;
+    let mut browser = Browser::join(addr, "ana", "studio").await;
     browser.send(json!({"type": "snapshot_get", "id": 3})).await;
     let reply = browser.recv_type("snapshot").await;
     assert_eq!(reply, json!({"type": "snapshot", "id": 3, "payload": null}));
@@ -417,9 +466,20 @@ async fn members_are_listed_watched_and_expire() {
 
     member.send(set.clone()).await;
     watcher.member_change(&key).await;
-    assert_eq!(http_post(addr, "/members/leave", &key).await, 204);
+    let token = sign_in("ana").await;
+    let leave =
+        |room: &str, key: &str| json!({"room": room, "token": token, "key": key}).to_string();
+    assert_eq!(
+        http_post(addr, "/members/leave", &leave("lobby", &key)).await,
+        204
+    );
     assert_eq!(watcher.member_change(&key).await["payload"], Value::Null);
-    assert_eq!(http_post(addr, "/members/leave", "a:b").await, 400);
+    assert_eq!(
+        http_post(addr, "/members/leave", &leave("lobby", "a:b")).await,
+        400
+    );
+    let ben = json!({"room": "studio", "token": sign_in("ben").await, "key": key}).to_string();
+    assert_eq!(http_post(addr, "/members/leave", &ben).await, 403);
 
     member.send(set).await;
     watcher.member_change(&key).await;
@@ -435,6 +495,134 @@ async fn members_are_listed_watched_and_expire() {
         .send(json!({"type": "set_member", "key": "a:b", "payload": ""}))
         .await;
     assert_eq!(member.recv().await["code"], "bad_request");
+}
+
+/// A fixed token, so a test can hold a connection to exactly what one room
+/// token allows.
+struct Fixed(String);
+
+impl TokenProvider for Fixed {
+    fn token(&self) -> TokenFuture<'_> {
+        let token = self.0.clone();
+        Box::pin(async move { Ok(token) })
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_token_for_one_room_cannot_reach_another_at_the_broker() {
+    let (gateway, _addr) = start_gateway().await;
+    let config = config();
+    let (tenant, namespace) = (config.tenant.as_str(), config.namespace.as_str());
+    // Ana is a member of both rooms, so a refusal below comes from the
+    // narrowing, not from membership. The connection goes straight to Felix;
+    // no gateway code stands between it and the broker.
+    let token = gateway
+        .room_token(&sign_in("ana").await, "lobby")
+        .await
+        .expect("ana may open the lobby");
+    let felix = Arc::new(
+        gateway
+            .connect_felix(Arc::new(Fixed(token)))
+            .await
+            .expect("connect to Felix"),
+    );
+    let tag = run_tag("narrowed");
+
+    felix
+        .publish(
+            tenant,
+            namespace,
+            "canvas.ops.lobby",
+            tag.clone().into_bytes(),
+            AckMode::PerMessage,
+        )
+        .await
+        .expect("the lobby token publishes to the lobby");
+    felix
+        .subscribe_from(tenant, namespace, "canvas.ops.lobby", None)
+        .await
+        .expect("and subscribes to it");
+
+    for stream in ["canvas.ops.studio", "canvas.presence.studio"] {
+        let publish = felix
+            .publish(
+                tenant,
+                namespace,
+                stream,
+                tag.clone().into_bytes(),
+                AckMode::PerMessage,
+            )
+            .await;
+        assert!(publish.is_err(), "published to {stream}: {publish:?}");
+        let subscribe = felix.subscribe_from(tenant, namespace, stream, None).await;
+        assert!(subscribe.is_err(), "subscribed to {stream}");
+    }
+    let client = felix.client().await;
+    let read = client
+        .cache_get(tenant, namespace, "canvas.snap.studio", "latest")
+        .await;
+    assert!(read.is_err(), "read the studio snapshot: {read:?}");
+    let add = client
+        .counter_add(tenant, namespace, "canvas.seq.studio", "narrowed", 1)
+        .await;
+    assert!(add.is_err(), "added to a studio counter: {add:?}");
+    let put = client
+        .cache_put(
+            tenant,
+            namespace,
+            "canvas.members.studio",
+            "narrowed",
+            b"ana".to_vec().into(),
+            Some(1000),
+        )
+        .await;
+    assert!(put.is_err(), "joined the studio's member list: {put:?}");
+    let watch = felix
+        .watch_cache_retained(
+            tenant,
+            namespace,
+            "canvas.members.studio",
+            CacheWatchFilter::Prefix(String::new()),
+        )
+        .await;
+    assert!(watch.is_err(), "watched the studio's member list");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_member_of_one_room_is_refused_another() {
+    let (gateway, addr) = start_gateway().await;
+    let ben = sign_in("ben").await;
+    assert!(matches!(
+        gateway.room_token(&ben, "studio").await,
+        Err(Refused::Forbidden)
+    ));
+
+    let mut browser = Browser::connect(addr, "studio", &ben).await;
+    assert_eq!(browser.refusal().await["code"], "forbidden");
+    Browser::join(addr, "ben", "lobby").await;
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_join_without_a_valid_sign_in_or_room_is_refused() {
+    let (_gateway, addr) = start_gateway().await;
+    let mut forged = Browser::connect(addr, "lobby", "not.a.token").await;
+    assert_eq!(forged.refusal().await["code"], "signed_out");
+
+    let token = sign_in("ana").await;
+    let mut bad_room = Browser::connect(addr, "lobby/../studio", &token).await;
+    assert_eq!(bad_room.refusal().await["code"], "bad_request");
+
+    let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    let mut early = Browser { socket, next_id: 0 };
+    early
+        .send(json!({"type": "subscribe", "stream": "ops", "from": "live"}))
+        .await;
+    assert_eq!(early.refusal().await["code"], "bad_request");
 }
 
 async fn http_post(addr: SocketAddr, path: &str, body: &str) -> u16 {

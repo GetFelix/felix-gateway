@@ -39,10 +39,19 @@ export type ServerMessage =
         | "snapshot_failed"
         | "trimmed"
         | "member_failed"
-        | "watch_failed";
+        | "watch_failed"
+        | "signed_out"
+        | "forbidden"
+        | "unavailable";
       oldest?: number;
       message: string;
     };
+
+/** Which room to join, and the ID token that signs the browser in. */
+export interface Join {
+  room: string;
+  token: string;
+}
 
 interface WireMember {
   key: string;
@@ -119,11 +128,23 @@ export class GatewayClient {
     });
   }
 
-  /** Open a connection to the gateway at `url`, a `ws:` or `wss:` URL. */
-  static connect(url: string): Promise<GatewayClient> {
+  /**
+   * Open a connection to the gateway at `url`, a `ws:` or `wss:` URL, and
+   * join `join.room` with the ID token `join.token`. The gateway answers with
+   * `hello`, or refuses with an error and closes.
+   */
+  static connect(url: string, join: Join): Promise<GatewayClient> {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(url);
-      socket.addEventListener("open", () => resolve(new GatewayClient(socket)), { once: true });
+      socket.addEventListener(
+        "open",
+        () => {
+          const client = new GatewayClient(socket);
+          client.#send({ type: "join", ...join });
+          resolve(client);
+        },
+        { once: true },
+      );
       socket.addEventListener("error", () => reject(new Error(`cannot reach ${url}`)), {
         once: true,
       });
@@ -153,7 +174,7 @@ export class GatewayClient {
   }
 
   /**
-   * Add `delta` to this session's sequence counter, `canvas.seq/<room>:<key>`,
+   * Add `delta` to this session's sequence counter, `canvas.seq.<room>/<key>`,
    * and resolve with the new sum.
    */
   counterAdd(key: string, delta: number): Promise<number> {

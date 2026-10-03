@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let gateway = Gateway::connect(&config).await?;
+    let gateway = Gateway::new(&config)?;
     // Small frames both ways: without TCP_NODELAY, Nagle and delayed ACKs add
     // up to 40 ms to a cursor or an ack.
     let listener = tokio::net::TcpListener::bind(config.listen)
@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         });
     tracing::info!(
         listen = %listener.local_addr()?,
-        room = %config.room,
+        tenant = %config.tenant,
         "gateway ready"
     );
     axum::serve(listener, gateway.router()).await?;
