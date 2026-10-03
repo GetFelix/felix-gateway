@@ -47,7 +47,11 @@ impl Browser {
         let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{gateway}/ws"))
             .await
             .expect("open WebSocket");
-        Self { socket, next_id: 0 }
+        let mut browser = Self { socket, next_id: 0 };
+        let hello = browser.recv().await;
+        assert_eq!(hello["type"], "hello", "the first message names the room");
+        assert!(hello["room"].is_string(), "{hello}");
+        browser
     }
 
     async fn send(&mut self, message: Value) {
@@ -273,6 +277,33 @@ async fn metrics_report_both_legs() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drop(browser);
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn counter_adds_answer_with_the_running_sum() {
+    let (_gateway, addr) = start_gateway().await;
+    let key = run_tag("seq").replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let mut browser = Browser::open(addr).await;
+    let mut sums = Vec::new();
+    for (id, delta) in [(1, 256), (2, 256), (3, 1)] {
+        browser
+            .send(json!({"type": "counter_add", "counter": "seq", "key": key, "delta": delta, "id": id}))
+            .await;
+        let reply = browser.recv_type("counter").await;
+        assert_eq!(reply["id"], id);
+        sums.push(reply["value"].as_i64().unwrap());
+    }
+    assert_eq!(sums, [256, 512, 513]);
+
+    browser
+        .send(json!({"type": "counter_add", "counter": "seq", "key": "no/slashes", "delta": 1, "id": 9}))
+        .await;
+    let error = browser.recv().await;
+    assert_eq!(
+        (error["code"].as_str(), error["id"].as_u64()),
+        (Some("bad_request"), Some(9))
+    );
 }
 
 async fn http_get(addr: SocketAddr, path: &str) -> Value {

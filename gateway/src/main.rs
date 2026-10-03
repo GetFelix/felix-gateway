@@ -1,4 +1,5 @@
 use anyhow::Result;
+use axum::serve::{Listener, ListenerExt};
 use felix_canvas_gateway::{Config, Gateway};
 use tracing_subscriber::EnvFilter;
 
@@ -10,7 +11,13 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let gateway = Gateway::connect(&config).await?;
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    // Small frames both ways: without TCP_NODELAY, Nagle and delayed ACKs add
+    // up to 40 ms to a cursor or an ack.
+    let listener = tokio::net::TcpListener::bind(config.listen)
+        .await?
+        .tap_io(|tcp| {
+            let _ = tcp.set_nodelay(true);
+        });
     tracing::info!(
         listen = %listener.local_addr()?,
         room = %config.room,

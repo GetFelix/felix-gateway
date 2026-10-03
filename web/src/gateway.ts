@@ -5,6 +5,7 @@ export type StreamName = "ops" | "presence";
 
 /** Messages the gateway sends. */
 export type ServerMessage =
+  | { type: "hello"; namespace: string; room: string }
   | {
       type: "subscribed";
       stream: StreamName;
@@ -19,11 +20,17 @@ export type ServerMessage =
       payload: string;
     }
   | { type: "ack"; id: number; offset: number | null }
+  | { type: "counter"; id: number; value: number }
   | {
       type: "error";
       id?: number;
       stream?: StreamName;
-      code: "bad_request" | "publish_failed" | "subscribe_failed" | "subscription_ended";
+      code:
+        | "bad_request"
+        | "publish_failed"
+        | "subscribe_failed"
+        | "subscription_ended"
+        | "counter_failed";
       message: string;
     };
 
@@ -49,7 +56,7 @@ export class GatewayError extends Error {
 }
 
 interface Pending {
-  resolve: (offset: number | null) => void;
+  resolve: (value: number | null) => void;
   reject: (error: GatewayError) => void;
 }
 
@@ -58,10 +65,16 @@ interface Pending {
  * through the callbacks; publishes resolve with the record's log offset.
  */
 export class GatewayClient {
+  /** Called once, first, with the room this gateway serves. */
+  onHello: (namespace: string, room: string) => void = () => {};
   /** Called for every event, in the order the broker delivered them. */
   onEvent: (event: GatewayEvent) => void = () => {};
   /** Called once a subscription is registered with the broker. */
-  onSubscribed: (stream: StreamName, startOffset: number | null) => void = () => {};
+  onSubscribed: (
+    stream: StreamName,
+    startOffset: number | null,
+    liveOffset: number | null,
+  ) => void = () => {};
   /** Called for errors not tied to a publish, such as a subscription ending. */
   onError: (error: GatewayError, stream?: StreamName) => void = () => {};
   /** Called when the connection closes. */
@@ -116,6 +129,18 @@ export class GatewayClient {
     return new Promise((resolve, reject) => this.#pending.set(id, { resolve, reject }));
   }
 
+  /**
+   * Add `delta` to this session's sequence counter, `canvas.seq/<room>:<key>`,
+   * and resolve with the new sum.
+   */
+  counterAdd(key: string, delta: number): Promise<number> {
+    const id = this.#nextId++;
+    this.#send({ type: "counter_add", counter: "seq", key, delta, id });
+    return new Promise((resolve, reject) =>
+      this.#pending.set(id, { resolve: (value) => resolve(value as number), reject }),
+    );
+  }
+
   close(): void {
     this.#socket.close();
   }
@@ -135,8 +160,14 @@ export class GatewayClient {
           payload: fromBase64(message.payload),
         });
         break;
+      case "hello":
+        this.onHello(message.namespace, message.room);
+        break;
       case "subscribed":
-        this.onSubscribed(message.stream, message.start_offset);
+        this.onSubscribed(message.stream, message.start_offset, message.live_offset);
+        break;
+      case "counter":
+        this.#take(message.id)?.resolve(message.value);
         break;
       case "ack":
         this.#take(message.id)?.resolve(message.offset);

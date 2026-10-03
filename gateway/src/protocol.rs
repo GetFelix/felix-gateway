@@ -13,6 +13,15 @@ pub enum StreamName {
     Presence,
 }
 
+/// A counter the browser may add to. Each maps to one Felix counter scope,
+/// with keys confined to the gateway's room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterName {
+    /// Per-session op sequence numbers, `canvas.seq/<room>:<key>`.
+    Seq,
+}
+
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
@@ -45,12 +54,22 @@ pub enum ClientMessage {
         ack: bool,
         id: u64,
     },
+    /// Add `delta` to a counter. The gateway answers with a
+    /// [`ServerMessage::Counter`] carrying the same `id` and the new sum.
+    CounterAdd {
+        counter: CounterName,
+        key: String,
+        delta: i64,
+        id: u64,
+    },
 }
 
 /// A message to the browser.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// The first message on every connection: which room this gateway serves.
+    Hello { namespace: String, room: String },
     /// The subscription is registered with the broker: anything published
     /// from here on will be delivered.
     Subscribed {
@@ -77,6 +96,8 @@ pub enum ServerMessage {
         /// The record's log offset, when the broker acknowledged after writing it.
         offset: Option<u64>,
     },
+    /// The sum after the counter add with this `id`.
+    Counter { id: u64, value: i64 },
     /// Something the browser asked for failed.
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +122,8 @@ pub enum ErrorCode {
     /// A subscription stopped delivering. Subscribe again from the last
     /// offset handled plus one.
     SubscriptionEnded,
+    /// Felix refused or lost a counter add. It may have been counted.
+    CounterFailed,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -138,12 +161,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_counter_add() {
+        let add: ClientMessage = serde_json::from_value(json!({
+            "type": "counter_add", "counter": "seq", "key": "00ff", "delta": 256, "id": 4
+        }))
+        .unwrap();
+        assert_eq!(
+            add,
+            ClientMessage::CounterAdd {
+                counter: CounterName::Seq,
+                key: "00ff".into(),
+                delta: 256,
+                id: 4
+            }
+        );
+    }
+
+    #[test]
     fn rejects_unknown_streams_and_positions() {
         for bad in [
             json!({"type": "subscribe", "stream": "chat", "from": "live"}),
             json!({"type": "subscribe", "stream": "ops", "from": "earliest"}),
             json!({"type": "subscribe", "stream": "ops", "from": -1}),
             json!({"type": "publish", "stream": "ops", "payload": "", "ack": true}),
+            json!({"type": "counter_add", "counter": "views", "key": "a", "delta": 1, "id": 1}),
         ] {
             assert!(
                 serde_json::from_value::<ClientMessage>(bad.clone()).is_err(),

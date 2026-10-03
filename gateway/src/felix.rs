@@ -10,13 +10,14 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 
 use crate::config::Config;
-use crate::protocol::{StartAt, StreamName};
+use crate::protocol::{CounterName, StartAt, StreamName};
 
 /// A Felix connection scoped to one room's streams.
 pub(crate) struct Felix {
     client: Arc<ClusterClient>,
     tenant: String,
     namespace: String,
+    room: String,
     ops: String,
     presence: String,
 }
@@ -46,9 +47,18 @@ impl Felix {
             client: Arc::new(client),
             tenant: config.tenant.clone(),
             namespace: config.namespace.clone(),
+            room: config.room.clone(),
             ops: format!("canvas.ops.{}", config.room),
             presence: format!("canvas.presence.{}", config.room),
         })
+    }
+
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub(crate) fn room(&self) -> &str {
+        &self.room
     }
 
     fn stream(&self, stream: StreamName) -> &str {
@@ -93,6 +103,25 @@ impl Felix {
         };
         self.client
             .subscribe_from(&self.tenant, &self.namespace, self.stream(stream), start)
+            .await
+    }
+
+    /// Add to a counter under this room, `<cache>/<room>:<key>`. Like a
+    /// publish it is sent once; Felix counts a retried add twice.
+    pub(crate) async fn counter_add(
+        &self,
+        counter: CounterName,
+        key: &str,
+        delta: i64,
+    ) -> Result<i64> {
+        let cache = match counter {
+            CounterName::Seq => "canvas.seq",
+        };
+        let key = format!("{}:{key}", self.room);
+        self.client
+            .client()
+            .await
+            .counter_add(&self.tenant, &self.namespace, cache, &key, delta)
             .await
     }
 }

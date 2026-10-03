@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::felix::Felix;
 use crate::metrics::Metrics;
-use crate::protocol::{ClientMessage, ErrorCode, ServerMessage, StartAt, StreamName};
+use crate::protocol::{ClientMessage, CounterName, ErrorCode, ServerMessage, StartAt, StreamName};
 use crate::transport::{BrowserConnection, Incoming};
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -54,6 +54,15 @@ pub(crate) async fn run<C: BrowserConnection>(
     let mut subscriptions: HashMap<StreamName, JoinHandle<()>> = HashMap::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
 
+    let hello = ServerMessage::Hello {
+        namespace: felix.namespace().to_string(),
+        room: felix.room().to_string(),
+    };
+    let hello = serde_json::to_string(&hello).expect("server messages serialize");
+    if conn.send(hello).await.is_err() {
+        return;
+    }
+
     loop {
         let outbound = tokio::select! {
             incoming = conn.recv() => match incoming {
@@ -85,6 +94,21 @@ pub(crate) async fn run<C: BrowserConnection>(
                                 continue;
                             }
                             Err(err) => error(Some(id), Some(stream), ErrorCode::BadRequest, err),
+                        }
+                    }
+                    Ok(ClientMessage::CounterAdd { counter, key, delta, id }) => {
+                        if !valid_counter_key(&key) {
+                            error(Some(id), None, ErrorCode::BadRequest, BAD_COUNTER_KEY)
+                        } else {
+                            tokio::spawn(add_to_counter(
+                                counter,
+                                key,
+                                delta,
+                                id,
+                                Arc::clone(&felix),
+                                replies_tx.clone(),
+                            ));
+                            continue;
                         }
                     }
                     Err(err) => error(None, None, ErrorCode::BadRequest, err),
@@ -139,6 +163,32 @@ async fn publish_in_order(
         };
         let _ = replies.send(reply);
     }
+}
+
+const BAD_COUNTER_KEY: &str = "a counter key is 1 to 64 ASCII letters, digits, '-' or '_'";
+
+// Keys become part of a Felix cache key shared by every connection, so they
+// are kept to a plain alphabet rather than passed through.
+fn valid_counter_key(key: &str) -> bool {
+    (1..=64).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+async fn add_to_counter(
+    counter: CounterName,
+    key: String,
+    delta: i64,
+    id: u64,
+    felix: Arc<Felix>,
+    replies: mpsc::UnboundedSender<ServerMessage>,
+) {
+    let reply = match felix.counter_add(counter, &key, delta).await {
+        Ok(value) => ServerMessage::Counter { id, value },
+        Err(err) => error(Some(id), None, ErrorCode::CounterFailed, err),
+    };
+    let _ = replies.send(reply);
 }
 
 async fn relay_subscription(

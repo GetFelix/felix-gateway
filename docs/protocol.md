@@ -48,7 +48,34 @@ sent them, so one session's ops land in the log in its own `seq` order. The
 gateway never resends a publish. When one fails the browser decides whether to
 retry, because only the op's `(sid, seq)` makes a retry safe to deduplicate.
 
+### `counter_add`
+
+```json
+{"type": "counter_add", "counter": "seq", "key": "3f9a0c12d4e5b6a7", "delta": 1024, "id": 8}
+```
+
+| Field | Meaning |
+|---|---|
+| `counter` | `"seq"`, the only counter: per-session op sequence numbers, the Felix counter `canvas.seq/<room>:<key>` |
+| `key` | 1 to 64 ASCII letters, digits, `-` or `_`. The gateway prefixes the room, so a key never reaches another room's counter |
+| `delta` | A signed 64-bit amount to add |
+| `id` | As for `publish`; it comes back on the `counter` or `error` |
+
+The gateway answers with a `counter` message carrying the sum after the add.
+The canvas reserves its sequence numbers this way: it adds 1,024 to its session's
+counter and uses the 1,024 numbers below the sum, fetching another block when
+half are gone. Felix counts an add retried after a lost answer twice, which
+only wastes numbers.
+
 ## Gateway to browser
+
+### `hello`
+
+```json
+{"type": "hello", "namespace": "default", "room": "lobby"}
+```
+
+The first message on every connection: the room this gateway serves.
 
 ### `subscribed`
 
@@ -94,6 +121,14 @@ had one to give, and `null` when:
 
 A publish with `"ack": false` gets no `ack`, only an `error` if it fails.
 
+### `counter`
+
+```json
+{"type": "counter", "id": 8, "value": 2048}
+```
+
+The counter's sum after the `counter_add` with this `id`.
+
 ### `error`
 
 ```json
@@ -109,6 +144,7 @@ stream. The connection stays open after any error.
 | `publish_failed` | Felix refused or lost the publish. It may have landed: retry with the same `(sid, seq)` |
 | `subscribe_failed` | Felix refused the subscription, for example an offset already trimmed |
 | `subscription_ended` | A subscription stopped delivering. Subscribe again from the last offset handled plus one |
+| `counter_failed` | Felix refused or lost a counter add. It may have been counted |
 
 ## Slow browsers
 
@@ -149,3 +185,33 @@ Payloads are opaque to the gateway. The canvas encodes ops on `ops` with the
 | `fields` | map | Only the fields this op changes |
 
 A move (a patch of `x` and `y`) encodes in about 80 bytes.
+
+### Shape fields
+
+A `create` carries every field of the new shape; a `patch` carries only those it
+changes. The fold in `model/` applies them last-writer-wins per field on log
+offset, and ignores a patch to a shape that does not exist, so a delete is final.
+
+| Field | Shapes | Meaning |
+|---|---|---|
+| `type` | all | `rect`, `ellipse`, `line` or `stroke`. A create with any other type is ignored. Never changes |
+| `x`, `y` | all | The top-left corner, or a line's start, in canvas units |
+| `w`, `h` | all | Size; for a line, the offset from start to end, which may be negative |
+| `z` | all | A fractional-index key: shapes stack in key order, then by id. A value that is not a key is ignored |
+| `points` | `stroke` | Pairs of coordinates relative to `x, y`. Never changes once created |
+
+## Presence payload
+
+Records on `presence` are MessagePack maps, published fire-and-forget at most
+once a frame while the pointer or selection moves, and every 3 seconds
+otherwise. A session not heard from for 10 seconds is treated as gone.
+
+| Key | MessagePack type | Meaning |
+|---|---|---|
+| `sid` | uint | The session, as in ops |
+| `n` | uint | Increases with every message, so a session can time its own echo |
+| `name` | str | Display name |
+| `color` | uint | Index into the eight-colour presence palette |
+| `x`, `y` | float or nil | The pointer in canvas units, nil when it left the canvas |
+| `sel` | array of bin 16 | Ids of the selected shapes |
+| `gone` | bool | Present and true on a session's last message |

@@ -52,6 +52,7 @@ async function exchange(subject, body) {
 }
 
 const streams = `stream:${TENANT}/${NAMESPACE}/*`;
+const caches = `cache:${TENANT}/${NAMESPACE}/*`;
 console.log(`bootstrap tenant ${TENANT}`);
 await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initialize`, {
   headers: { "x-felix-bootstrap-token": BOOTSTRAP_TOKEN },
@@ -68,9 +69,12 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
     initial_admin_principals: [principal("canvas-admin")],
     policies: [
       { subject: "role:admin", object: streams, action: "stream.manage" },
+      { subject: "role:admin", object: caches, action: "cache.manage" },
       { subject: "role:broker", object: "cluster:*", action: "node.view" },
       { subject: "role:gateway", object: streams, action: "stream.publish" },
       { subject: "role:gateway", object: streams, action: "stream.subscribe" },
+      // Counters authorize as cache writes.
+      { subject: "role:gateway", object: caches, action: "cache.write" },
     ],
     groupings: [
       { user: principal("canvas-admin"), role: "role:admin" },
@@ -107,13 +111,19 @@ for (const [name, durable] of [
   });
 }
 
+console.log("cache canvas.seq");
+await request("POST", `${CONTROL_PLANE}/v1/tenants/${TENANT}/namespaces/${NAMESPACE}/caches`, {
+  token: admin,
+  body: { cache: "canvas.seq", display_name: "Op sequence per session" },
+});
+
 // The broker runs as uid 65532 and writes its certificate here too.
 await mkdir(STATE, { recursive: true });
 await chmod(STATE, 0o777);
 const broker = await exchange("canvas-broker", { audience: "felix-controlplane" });
 await writeFile(`${STATE}/node.token`, broker, { mode: 0o644 });
 const gateway = await exchange("canvas-gateway", {
-  requested: ["stream.publish", "stream.subscribe"],
+  requested: ["stream.publish", "stream.subscribe", "cache.write"],
 });
 await writeFile(`${STATE}/gateway.token`, gateway, { mode: 0o644 });
 console.log(`wrote ${STATE}/node.token and ${STATE}/gateway.token`);
