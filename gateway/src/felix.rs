@@ -1,7 +1,6 @@
 //! Felix connections: one per browser session, each with that session's own
 //! room token.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,7 +21,7 @@ use crate::room::{Room, SNAPSHOT_KEY};
 
 /// Where the brokers are and how to trust them, read once at startup.
 pub(crate) struct Brokers {
-    addrs: Vec<SocketAddr>,
+    addrs: Vec<String>,
     server_name: String,
     roots: Option<Arc<RootCertStore>>,
     tenant: String,
@@ -78,13 +77,13 @@ impl Brokers {
         config.publish_conn_pool = 1;
         config.event_conn_pool = 1;
         config.cache_conn_pool = 1;
+        let mut seeds = crate::resolve_brokers(&self.addrs).await?;
         // Felix tries the addresses in order and waits out a handshake
         // timeout on each that is down, so starting every connection at the
         // same one would make every session pay for that broker's loss.
-        let mut addrs = self.addrs.clone();
-        let first = self.next.fetch_add(1, Ordering::Relaxed) % addrs.len();
-        addrs.rotate_left(first);
-        ClusterClient::connect(&addrs, &self.server_name, config)
+        let first = self.next.fetch_add(1, Ordering::Relaxed) % seeds.len();
+        seeds.rotate_left(first);
+        ClusterClient::connect(&seeds, &self.server_name, config)
             .await
             .context("connect to Felix")
     }

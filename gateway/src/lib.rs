@@ -23,6 +23,7 @@ mod room;
 mod throttle;
 pub mod transport;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -34,9 +35,10 @@ use axum::routing::{get, post};
 use felix_client::{ClusterClient, TokenProvider};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tower_http::services::ServeDir;
 
 pub use access::Refused;
-pub use config::Config;
+pub use config::{Config, resolve_brokers};
 pub use metrics::{Metrics, Snapshot, Summary};
 
 use access::ControlPlane;
@@ -52,6 +54,7 @@ pub struct Gateway {
     control_plane: ControlPlane,
     metrics: Arc<Metrics>,
     oidc: Arc<Value>,
+    web_dir: Option<PathBuf>,
 }
 
 impl Gateway {
@@ -71,20 +74,26 @@ impl Gateway {
             oidc: Arc::new(json!({
                 "issuer": config.oidc_issuer,
                 "client_id": config.oidc_client_id,
+                "scopes": config.oidc_scopes,
             })),
+            web_dir: config.web_dir.clone(),
         })
     }
 
     /// The HTTP routes: `/ws` for browsers, `/oidc` for how a browser signs
     /// in, `/members/leave` for a closing tab's goodbye, and `/metrics` for
-    /// latency.
+    /// latency. Every other path is a file of the web bundle, when there is one.
     pub fn router(&self) -> Router {
-        Router::new()
+        let router = Router::new()
             .route("/ws", get(websocket))
             .route("/oidc", get(oidc))
             .route("/members/leave", post(leave))
             .route("/metrics", get(metrics))
-            .with_state(self.clone())
+            .with_state(self.clone());
+        match &self.web_dir {
+            Some(dir) => router.fallback_service(ServeDir::new(dir)),
+            None => router,
+        }
     }
 
     /// Latency recorded since the gateway started.

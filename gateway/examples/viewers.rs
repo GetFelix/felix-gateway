@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use felix_canvas_gateway::Config;
+use felix_canvas_gateway::{Config, resolve_brokers};
 use felix_client::{ClientConfig, ClusterClient, StartPosition};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
@@ -60,9 +60,13 @@ async fn main() -> Result<()> {
         client_config.client_sub_queue_policy = felix_client::ClientSubQueuePolicy::Block;
     }
     let client = Arc::new(
-        ClusterClient::connect(&config.brokers, &config.server_name, client_config)
-            .await
-            .context("connect to Felix")?,
+        ClusterClient::connect(
+            &resolve_brokers(&config.brokers).await?,
+            &config.server_name,
+            client_config,
+        )
+        .await
+        .context("connect to Felix")?,
     );
 
     let seen: Vec<Arc<Seen>> = (0..count).map(|_| Arc::default()).collect();

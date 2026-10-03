@@ -28,12 +28,12 @@ GET /oidc
 ```
 
 ```json
-{"issuer": "https://login.example.com", "client_id": "felix-canvas"}
+{"issuer": "https://login.example.com", "client_id": "felix-canvas", "scopes": "openid profile"}
 ```
 
 It signs in with that OpenID Connect provider using the authorization code
 flow with PKCE (S256), as a public client with the redirect URI
-`<page origin>/`, and keeps the ID token it gets. [design.md](design.md#authorization)
+`<page origin>/`, asking for `scopes`, and keeps the ID token it gets. [design.md](design.md#authorization)
 describes what the gateway does with it.
 
 ## Browser to gateway
