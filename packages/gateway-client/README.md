@@ -1,7 +1,7 @@
 # felix-gateway-client
 
 The browser client for [felix-gateway](https://github.com/GetFelix/felix-gateway). It opens a WebSocket, joins one
-scope (a room or a match) with an ID token, and then publishes, subscribes,
+scope with an ID token, and then publishes, subscribes,
 reads and watches caches and adds to counters, each named by its alias in the
 gateway's scope file.
 [docs/protocol.md](https://github.com/GetFelix/felix-gateway/blob/main/docs/protocol.md)

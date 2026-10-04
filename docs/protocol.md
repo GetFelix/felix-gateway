@@ -3,7 +3,7 @@
 A browser opens one WebSocket to the gateway at `/ws` and exchanges JSON text
 frames over it. The gateway relays each request to Felix and each Felix event
 back, without decoding payloads. One gateway serves every scope: a connection
-names its scope (a room, a match) and signs in with its first message, `join`,
+names its scope and signs in with its first message, `join`,
 and from then on reaches that scope and nothing else.
 
 The [scope file](configuration.md#the-scope-file) names the key a `join`
@@ -57,7 +57,7 @@ flow with PKCE (S256), as a public client, asking for `scopes`, and sends the
 ID token it gets in `join`. The gateway exchanges it at the Felix control
 plane for a Felix token narrowed to the one scope the connection opens: only
 the resources the scope file names for that scope, and only the actions it
-lists. A token for one room cannot reach another at the broker, even for
+lists. A token for one scope cannot reach another at the broker, even for
 someone allowed in both.
 
 The tenant must trust the provider, with the `client_id` as audience, and
