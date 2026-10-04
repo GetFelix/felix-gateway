@@ -1,6 +1,6 @@
 {
   "name": "felix-gateway-client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The browser client for felix-gateway, and an in-memory fake of it for tests",
   "license": "MIT",
   "repository": {

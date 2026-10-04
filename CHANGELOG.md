@@ -11,7 +11,12 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
-Tested against Felix 0.6.0-preview.2.
+## [0.2.0] - 2026-10-04
+
+Moves to Felix 0.6.0-preview.2, which this release is tested against. Browsers
+see two changes: a slow browser on a durable stream now gets every record,
+late and in order, instead of a gap in offsets, and an expired cache entry
+reaches watchers as a delete.
 
 ### Changed
 
