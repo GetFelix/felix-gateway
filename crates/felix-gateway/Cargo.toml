@@ -23,8 +23,8 @@ path = "src/main.rs"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
-felix-client = "0.6.0-preview"
-felix-wire = "0.6.0-preview"
+felix-client = "0.6.0-preview.2"
+felix-wire = "0.6.0-preview.2"
 hdrhistogram = { version = "7", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rustls = "0.23"

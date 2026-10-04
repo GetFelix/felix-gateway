@@ -29,8 +29,8 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Events waiting for a slow browser. When this fills, the subscription stops
-/// reading and Felix's own per-subscriber queue decides what to drop, so a
-/// loss shows up as an offset gap instead of happening silently here.
+/// reading and Felix's own per-subscriber queue decides what to drop. On a
+/// durable stream the subscription replays those drops from the log.
 const EVENT_QUEUE: usize = 1024;
 
 /// Writes waiting for Felix. A browser that outruns this stops being read.

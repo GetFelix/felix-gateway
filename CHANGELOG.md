@@ -11,6 +11,20 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+Tested against Felix 0.6.0-preview.2.
+
+### Changed
+
+- Built on felix-client and felix-wire 0.6.0-preview.2, and the dev stack runs
+  the `ghcr.io/getfelix` 0.6.0-preview.2 images.
+- A browser that falls behind on a durable stream gets every record, late and
+  in order, instead of a gap in offsets: Felix reports the drop and the
+  gateway's subscription replays it from the log. If retention has passed the
+  resume point the browser gets `trimmed`. In-memory streams still drop.
+- An expired cache entry reaches watchers as a `cache_change` with a `null`
+  payload, within about a second of its TTL, because Felix now writes a delete
+  for it. `expires_in_ms` is still sent.
+
 ## [0.1.0] - 2026-10-03
 
 The first release, extracted from Felix Canvas with its history. Tested
