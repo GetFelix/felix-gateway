@@ -4,19 +4,19 @@
 //! line of JSON when standard input closes.
 //!
 //! ```text
-//! cargo run --release -p felix-canvas-gateway --example viewers -- <count> <token file> <stream> <scope>
+//! cargo run --release -p felix-gateway --example viewers -- <count> <token file> <stream> <scope>
 //! ```
 //!
 //! `<stream>` is an alias from the scope file and `<scope>` the scope's value.
-//! It reads the gateway's `CANVAS_*` variables. The token needs
+//! It reads the gateway's `GATEWAY_*` variables. The token needs
 //! `stream.subscribe` on that stream.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use felix_canvas_gateway::{Config, resolve_brokers};
 use felix_client::{ClientConfig, ClusterClient, StartPosition};
+use felix_gateway::{Config, resolve_brokers};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;

@@ -1,5 +1,5 @@
 // A stand-in OpenID Connect provider for the development stack. It runs the
-// authorization code flow with PKCE that the canvas uses against a real
+// authorization code flow with PKCE that a browser app uses against a real
 // provider, but signs in anyone who picks a name: never expose it.
 //
 // GET /token?sub=<subject>&aud=<audience> also mints an ID token directly,
@@ -146,7 +146,7 @@ function redeem(form, reply) {
 
 createServer((request, response) => {
   const url = new URL(request.url, ISSUER);
-  // The browser calls discovery and the token endpoint from the canvas's origin.
+  // The browser calls discovery and the token endpoint from the app's origin.
   const reply = (status, body, type = "application/json") => {
     response.writeHead(status, {
       "content-type": type,

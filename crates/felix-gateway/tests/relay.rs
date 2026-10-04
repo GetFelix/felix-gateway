@@ -1,8 +1,8 @@
 //! The gateway against a real Felix broker, control plane and the stand-in
 //! identity provider. Ignored by default because they need the development
 //! stack running; see the README, or run `cargo test -- --include-ignored`
-//! with the `CANVAS_*` variables set. `CANVAS_SCOPE_FILE` must be the canvas's
-//! scope file, `deploy/scope.toml`.
+//! with the `GATEWAY_*` variables set. `GATEWAY_SCOPE_FILE` must be the test
+//! scope file, `dev/scope.toml`, which matches what `dev/seed.mjs` creates.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use felix_canvas_gateway::{Config, Gateway, Refused, ScopeConfig};
 use felix_client::{CacheWatchFilter, TokenFuture, TokenProvider};
+use felix_gateway::{Config, Gateway, Refused, ScopeConfig};
 use felix_wire::AckMode;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -23,7 +23,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 const WAIT: Duration = Duration::from_secs(10);
 
 fn config() -> Config {
-    Config::from_env().expect("CANVAS_* environment for the dev stack")
+    Config::from_env().expect("GATEWAY_* environment for the dev stack")
 }
 
 async fn start_gateway() -> (Gateway, SocketAddr) {
@@ -476,8 +476,8 @@ async fn a_room_without_a_snapshot_answers_null() {
 #[ignore = "needs a Felix broker"]
 async fn members_are_listed_watched_and_expire() {
     let mut config = config();
-    let scope = std::fs::read_to_string(std::env::var("CANVAS_SCOPE_FILE").unwrap()).unwrap();
-    assert!(scope.contains("ttl_s = 30"), "the canvas's scope file");
+    let scope = std::fs::read_to_string(std::env::var("GATEWAY_SCOPE_FILE").unwrap()).unwrap();
+    assert!(scope.contains("ttl_s = 30"), "the test scope file");
     config.scope = Arc::new(ScopeConfig::parse(&scope.replace("ttl_s = 30", "ttl_s = 2")).unwrap());
     let (_gateway, addr) = serve(config).await;
     let key = run_tag("member").replace(|c: char| !c.is_ascii_alphanumeric(), "-");
@@ -573,18 +573,18 @@ async fn a_token_for_one_room_cannot_reach_another_at_the_broker() {
         .publish(
             tenant,
             namespace,
-            "canvas.ops.lobby",
+            "demo.ops.lobby",
             tag.clone().into_bytes(),
             AckMode::PerMessage,
         )
         .await
         .expect("the lobby token publishes to the lobby");
     felix
-        .subscribe_from(tenant, namespace, "canvas.ops.lobby", None)
+        .subscribe_from(tenant, namespace, "demo.ops.lobby", None)
         .await
         .expect("and subscribes to it");
 
-    for stream in ["canvas.ops.studio", "canvas.presence.studio"] {
+    for stream in ["demo.ops.studio", "demo.presence.studio"] {
         let publish = felix
             .publish(
                 tenant,
@@ -600,18 +600,18 @@ async fn a_token_for_one_room_cannot_reach_another_at_the_broker() {
     }
     let client = felix.client().await;
     let read = client
-        .cache_get(tenant, namespace, "canvas.snap.studio", "latest")
+        .cache_get(tenant, namespace, "demo.snap.studio", "latest")
         .await;
     assert!(read.is_err(), "read the studio snapshot: {read:?}");
     let add = client
-        .counter_add(tenant, namespace, "canvas.seq.studio", "narrowed", 1)
+        .counter_add(tenant, namespace, "demo.seq.studio", "narrowed", 1)
         .await;
     assert!(add.is_err(), "added to a studio counter: {add:?}");
     let put = client
         .cache_put(
             tenant,
             namespace,
-            "canvas.members.studio",
+            "demo.members.studio",
             "narrowed",
             b"ana".to_vec().into(),
             Some(1000),
@@ -622,7 +622,7 @@ async fn a_token_for_one_room_cannot_reach_another_at_the_broker() {
         .watch_cache_retained(
             tenant,
             namespace,
-            "canvas.members.studio",
+            "demo.members.studio",
             CacheWatchFilter::Prefix(String::new()),
         )
         .await;

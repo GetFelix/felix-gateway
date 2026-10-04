@@ -1,8 +1,8 @@
 # Felix for local development and CI: a control plane, one broker, a stand-in
-# IdP, and a one-shot seed that creates the rooms, their members and the
-# service tokens.
+# IdP, and a one-shot seed that creates the rooms in dev/scope.toml, their
+# members and the broker's credential.
 # `dev/up.sh` starts it and waits until the broker is ready.
-name: felix-canvas
+name: felix-gateway
 
 services:
   idp:
@@ -63,7 +63,7 @@ services:
       FELIX_QUIC_LISTENERS: "1"
       # Acknowledge after the write, so acks carry the record's log offset.
       FELIX_ACK_ON_COMMIT: "true"
-      # Small delivery batches: a canvas wants latency, not throughput.
+      # Small delivery batches: browsers want latency, not throughput.
       FELIX_EVENT_BATCH_MAX_EVENTS: "8"
       FELIX_EVENT_BATCH_MAX_DELAY_US: "100"
       FELIX_FANOUT_BATCH: "8"

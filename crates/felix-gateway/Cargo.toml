@@ -1,11 +1,23 @@
 [package]
-name = "felix-canvas-gateway"
-version = "0.1.0"
-description = "Edge gateway that relays browser WebSocket sessions to Felix"
+name = "felix-gateway"
+description = "A WebSocket gateway between browsers and Felix, with sign-in narrowed to one room or match"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["felix", "websocket", "gateway", "pubsub"]
+categories = ["network-programming", "web-programming::websocket"]
+
+[lib]
+name = "felix_gateway"
+
+# The default binary: reads its settings from GATEWAY_* variables and the
+# scope from GATEWAY_SCOPE_FILE.
+[[bin]]
+name = "felix-gateway"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

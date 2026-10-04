@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::serve::{Listener, ListenerExt};
-use felix_canvas_gateway::{Config, Gateway};
+use felix_gateway::{Config, Gateway};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]

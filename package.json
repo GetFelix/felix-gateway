@@ -1,0 +1,19 @@
+{
+  "name": "felix-gateway-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/gateway-client"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "test": "npm test --workspaces --if-present",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "^3.9.9",
+    "typescript": "^7.0.2"
+  }
+}

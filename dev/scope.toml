@@ -1,0 +1,38 @@
+# The scope file the integration tests and the dev stack use. dev/seed.mjs
+# creates these resources for rooms `lobby` and `studio`.
+# docs/configuration.md describes the format.
+
+allow_throttle = true
+
+[scope]
+field = "room"
+
+# A durable log: every event has an offset.
+[[scope.streams]]
+alias = "ops"
+name = "demo.ops.{scope}"
+actions = ["publish", "subscribe"]
+
+# In memory only, at most once.
+[[scope.streams]]
+alias = "presence"
+name = "demo.presence.{scope}"
+actions = ["publish", "subscribe"]
+
+# Read only: something other than a browser writes it.
+[[scope.caches]]
+alias = "snap"
+name = "demo.snap.{scope}"
+actions = ["read"]
+
+# One entry per session, gone unless refreshed.
+[[scope.caches]]
+alias = "members"
+name = "demo.members.{scope}"
+actions = ["read", "write", "watch"]
+ttl_s = 30
+
+[[scope.counters]]
+alias = "seq"
+name = "demo.seq.{scope}"
+actions = ["add"]

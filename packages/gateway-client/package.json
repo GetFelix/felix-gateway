@@ -3,6 +3,19 @@
   "version": "0.1.0",
   "description": "The browser client for felix-gateway, and an in-memory fake of it for tests",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GetFelix/felix-gateway.git",
+    "directory": "packages/gateway-client"
+  },
+  "homepage": "https://github.com/GetFelix/felix-gateway#readme",
+  "bugs": "https://github.com/GetFelix/felix-gateway/issues",
+  "keywords": [
+    "felix",
+    "websocket",
+    "gateway",
+    "pubsub"
+  ],
   "type": "module",
   "exports": {
     ".": {

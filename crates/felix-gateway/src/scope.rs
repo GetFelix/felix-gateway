@@ -345,7 +345,7 @@ impl Scope {
 pub(crate) mod tests {
     use super::*;
 
-    /// A scope like the canvas's, plus an optional stream.
+    /// A scope with streams, caches and a counter, plus an optional stream.
     pub(crate) const EXAMPLE: &str = r#"
         allow_throttle = true
 
