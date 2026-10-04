@@ -11,8 +11,8 @@ use crate::protocol::ServerMessage;
 
 /// Paces how fast one connection reads its subscriptions, as if every event
 /// had to cross a link of a set speed. Felix keeps delivering at full rate, so
-/// the subscription's bounded queue fills and drops new events, and the
-/// browser sees the loss as a gap in offsets. Nothing is dropped here.
+/// the subscription's bounded queue fills and drops new events, which a
+/// durable stream then replays from the log. Nothing is dropped here.
 #[derive(Debug, Default)]
 pub(crate) struct Throttle {
     /// Zero when off.

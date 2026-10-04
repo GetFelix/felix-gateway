@@ -524,8 +524,8 @@ async fn members_are_listed_watched_and_expire() {
     member.send(set).await;
     watcher.member_change(&key).await;
     assert!(Browser::open(addr).await.member_keys().await.contains(&key));
-    // Not refreshed, so it expires.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // Not refreshed, so it expires, and Felix tells watchers.
+    assert_eq!(watcher.member_change(&key).await["payload"], Value::Null);
     assert!(
         !Browser::open(addr).await.member_keys().await.contains(&key),
         "an entry past its TTL is not listed"
@@ -676,7 +676,7 @@ async fn a_join_without_a_valid_sign_in_or_room_is_refused() {
 
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
-async fn a_throttled_browser_sees_a_gap_and_catches_up_while_others_miss_nothing() {
+async fn a_throttled_browser_falls_behind_and_still_gets_every_record() {
     const RECORDS: usize = 1000;
     let (_gateway, addr) = start_gateway().await;
     let tag = run_tag("throttled");
@@ -701,47 +701,20 @@ async fn a_throttled_browser_sees_a_gap_and_catches_up_while_others_miss_nothing
         .collect();
     assert_eq!(payloads, sent, "the browser keeping up gets every record");
 
-    // The throttled browser falls behind until Felix drops records for it,
-    // which shows up as a jump in offsets.
-    let mut seen = std::collections::BTreeSet::new();
-    let mut last: Option<u64> = None;
-    let resume_from = loop {
-        let message = slow.recv_type("event").await;
-        let offset = message["offset"].as_u64().unwrap();
-        let skipped = message["skipped_before"].as_u64().unwrap_or(0);
-        if let Some(last) = last
-            && offset > last + 1 + skipped
-        {
-            break last + 1;
-        }
-        last = Some(offset);
-        let payload = BASE64.decode(message["payload"].as_str().unwrap()).unwrap();
-        let payload = String::from_utf8(payload).unwrap();
-        if payload.starts_with(&tag) {
-            seen.insert(payload);
-        }
-        assert!(
-            seen.len() < RECORDS,
-            "the throttled browser got every record"
-        );
-    };
-
-    // Subscribing again from the last offset handled plus one fills the gap.
+    // By now Felix has dropped records for the throttled browser. Its
+    // subscription replays them from the log, so it gets each record once,
+    // in order.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     slow.send(json!({"type": "throttle", "bits_per_second": null}))
         .await;
-    slow.subscribe("ops", json!(resume_from)).await;
-    while seen.len() < RECORDS {
-        let message = slow.recv().await;
-        if message["type"] != "event" {
-            continue;
-        }
-        let payload = BASE64.decode(message["payload"].as_str().unwrap()).unwrap();
-        let payload = String::from_utf8(payload).unwrap();
-        if payload.starts_with(&tag) {
-            seen.insert(payload);
-        }
-    }
-    assert_eq!(seen.into_iter().collect::<Vec<_>>(), sent);
+    let (events, _) = slow.events(&tag, RECORDS).await;
+    let payloads: Vec<&str> = events.iter().map(|(_, payload)| payload.as_str()).collect();
+    assert_eq!(payloads, sent, "the throttled browser gets every record");
+    let offsets: Vec<u64> = events.iter().map(|(offset, _)| offset.unwrap()).collect();
+    assert!(
+        offsets.windows(2).all(|pair| pair[0] < pair[1]),
+        "{offsets:?}"
+    );
 }
 
 async fn http_post(addr: SocketAddr, path: &str, body: &str) -> u16 {

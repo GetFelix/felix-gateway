@@ -222,8 +222,9 @@ fresh `cache_entries`.
 Reads this connection's subscriptions no faster than a link of
 `bits_per_second` would carry them, counting each event's JSON text. `null` or
 0 lifts the limit. It stands in for a slow network: Felix keeps delivering at
-full speed, the subscription's bounded queue fills and drops new events, and
-the browser sees a gap. Other connections are not affected. There is no reply.
+full speed and the subscription's bounded queue fills, so the browser falls
+behind (see [Slow browsers](#slow-browsers)). Other connections are not
+affected. There is no reply.
 A gateway whose scope file does not set `allow_throttle` answers
 `unsupported`.
 
@@ -292,8 +293,10 @@ One record, in the order the broker delivered it. On a durable stream, events
 arrive in increasing offset order. `skipped_before` appears only when it is not
 zero: it counts the offsets just before this one that hold no event (a new
 leader's generation-start record), so the number of records dropped before this
-event is `offset - previous_offset - 1 - skipped_before`. Anything above zero
-is a drop the browser recovers from by subscribing again.
+event is `offset - previous_offset - 1 - skipped_before`. The gateway refills
+drops from the log itself (see [Slow browsers](#slow-browsers)), so this
+should stay zero; if it does not, subscribe again from the last offset handled
+plus one.
 
 Offsets are JSON numbers, exact in JavaScript up to 2^53.
 
@@ -344,10 +347,11 @@ is none.
 | `payload` | The entry, base64, or `null` when it was deleted |
 | `expires_in_ms` | Milliseconds until the entry expires, measured on the gateway's clock when it relayed the change; `null` for an entry with no TTL |
 
-Felix 0.6.0-preview expires entries lazily and sends nothing when one lapses
-([felix#960](https://github.com/GetFelix/felix/issues/960)), so the browser
-drops an entry itself once `expires_in_ms` has passed without a newer write. A
-relative time keeps the browser's own clock out of it.
+An entry that expires arrives as a `cache_change` with `payload` `null`,
+within about a second of its TTL passing (Felix 0.6.0-preview.2 and later).
+Reads treat it as gone at once, so a browser that needs the exact moment can
+still drop it when `expires_in_ms` passes without a newer write. A relative
+time keeps the browser's own clock out of it.
 
 ### `error`
 
@@ -376,14 +380,11 @@ The connection stays open after any error except an answer to `join`.
 
 The gateway holds up to 1,024 events for a browser that is not reading. Past
 that it stops reading the Felix subscription, and Felix's bounded
-per-subscriber queue drops new events. The gateway never drops on its own, so a
-loss on a durable stream always shows up as a gap in offsets.
-
-Felix drops the newest records, so when the last records of a burst are the
-ones dropped, nothing arrives after them to show the gap. An application that
-needs to notice that promptly can have each session publish its position on a
-second stream every few seconds, so a peer that sees a position ahead of its
-own knows it is behind.
+per-subscriber queue drops new events. On a durable stream Felix says so, and
+the gateway's subscription picks up from the log after the last event it
+relayed: a slow browser gets every record, late and in order, rather than a
+gap. If retention has passed that point by then, the browser gets `trimmed`.
+An in-memory stream has nothing to replay, so its dropped events are gone.
 
 ## HTTP endpoints
 

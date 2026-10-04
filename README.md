@@ -42,8 +42,8 @@ browser client.
 - A protocol version and negotiated features, so old and new browsers work
   against one gateway.
 - Per-connection ordering of publishes and cache writes, and a bounded buffer
-  per browser that never drops on its own, so a slow browser sees a gap in
-  offsets instead of silent loss.
+  per browser that never drops on its own, so a slow browser on a durable
+  stream falls behind and catches up from the log instead of losing records.
 - A slow-link throttle for demonstrating slow-consumer behaviour, off unless
   the scope file allows it.
 - Latency metrics for the browser leg and the Felix leg, apart.
@@ -127,15 +127,13 @@ is the reference.
 
 Pre-1.0. The protocol, the scope file format and the library API may change
 between minor versions; version 1 of the wire protocol is frozen, and later
-changes arrive as negotiated features. Tested against Felix 0.6.0-preview.
+changes arrive as negotiated features. Tested against Felix 0.6.0-preview.2.
 
 Known limits, all on the Felix side:
 
 - Each session opens its own Felix client, and a broker accepts a bounded
   number of connections, so very large audiences per gateway wait on Felix
   connection multiplexing.
-- Felix 0.6.0-preview sends nothing when a cache entry expires; the browser
-  drops it after `expires_in_ms`.
 - Felix events carry no publisher, which is why sender stamping lives in the
   gateway.
 
