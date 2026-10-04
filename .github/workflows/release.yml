@@ -394,7 +394,13 @@ jobs:
         run: |
           tag=$([ "$PRERELEASE" = true ] && echo next || echo latest)
           if [ "$PUSH" != true ]; then
-            npm publish -w felix-gateway-client --access public --tag "$tag" --dry-run
+            # npm refuses even a dry run over a published version, which is
+            # every pull request between releases. Packing checks the same files.
+            if npm view "felix-gateway-client@${VERSION}" version >/dev/null 2>&1; then
+              npm pack -w felix-gateway-client --dry-run
+            else
+              npm publish -w felix-gateway-client --access public --tag "$tag" --dry-run
+            fi
           elif npm view "felix-gateway-client@${VERSION}" version >/dev/null 2>&1; then
             echo "felix-gateway-client ${VERSION} is already on npm"
           else
