@@ -2,70 +2,25 @@
 
 A browser opens one WebSocket to the gateway at `/ws` and exchanges JSON text
 frames over it. The gateway relays each request to Felix and each Felix event
-back, without decoding payloads. One gateway serves every room: a connection
-names its room and signs in with its first message, `join`, and from then on
-reaches that room and nothing else.
+back, without decoding payloads. One gateway serves every scope: a connection
+names its scope (a room, a match) and signs in with its first message, `join`,
+and from then on reaches that scope and nothing else.
 
-The gateway itself knows nothing about canvases. A scope file, described
-[below](#the-scope-file), tells it what a connection opens (for the canvas, a
-room) and which Felix streams, caches and counters each one owns. Messages
-name those by alias. The canvas's scope file is `deploy/scope.toml`:
+The [scope file](configuration.md#the-scope-file) names the key a `join`
+carries the scope under and the Felix streams, caches and counters each scope
+owns. Messages name those by alias. The examples below use the test scope file,
+`dev/scope.toml`, which has scope field `room` and these aliases:
 
 | Alias | Kind | Felix name | Notes |
 |---|---|---|---|
-| `ops` | Stream | `canvas.ops.<room>` | Durable, kept until the broker's retention trims it. Every event has an offset |
-| `presence` | Stream | `canvas.presence.<room>` | In memory, at most once. Offsets are always `null` |
-| `snap` | Cache | `canvas.snap.<room>` | The snapshot, key `latest` |
-| `members` | Cache | `canvas.members.<room>` | One key per session, each expiring unless its session writes it again |
-| `seq` | Counter | `canvas.seq.<room>` | Per-session op sequence numbers |
+| `ops` | Stream | `demo.ops.<room>` | Durable. Every event has an offset |
+| `presence` | Stream | `demo.presence.<room>` | In memory, at most once. Offsets are always `null` |
+| `snap` | Cache | `demo.snap.<room>` | Read only |
+| `members` | Cache | `demo.members.<room>` | Entries expire 30 seconds after their last write |
+| `seq` | Counter | `demo.seq.<room>` | |
 
-Every room has its own streams and caches because Felix authorizes a cache as
-a whole, never one key of it.
-
-## The scope file
-
-The gateway reads it from the path in `CANVAS_SCOPE_FILE` when it starts, and
-refuses to start if it breaks any rule below.
-
-```toml
-# Whether a browser may slow its own connection with `throttle`. Default false.
-allow_throttle = true
-
-[scope]
-# The key `join` carries the scope's value under.
-field = "room"
-
-[[scope.streams]]
-alias = "ops"
-name = "canvas.ops.{scope}"
-actions = ["publish", "subscribe"]
-
-[[scope.caches]]
-alias = "members"
-name = "canvas.members.{scope}"
-actions = ["read", "write", "watch"]
-ttl_s = 30
-
-[[scope.counters]]
-alias = "seq"
-name = "canvas.seq.{scope}"
-actions = ["add"]
-```
-
-| Key | Meaning |
-|---|---|
-| `field` | 1 to 64 ASCII letters, digits, `-` or `_`, and not `type`, `token`, `protocol` or `features` |
-| `alias` | What messages call the resource. The same rule as `field`, unique within its kind |
-| `name` | The Felix name. `{scope}` is replaced by the scope's value, and must appear, or every scope would share the resource |
-| `actions` | What a session may do. Streams: `publish`, `subscribe`. Caches: `read` (`cache_get`), `write` (`cache_put`, `cache_delete`), `watch` (`cache_watch`). Counters: `add` |
-| `optional` | Default `false`. When `true`, a sign-in that does not reach this resource still joins, and `hello` lists the alias under `missing` |
-| `stamp_sender` | Streams only, default `false`. Each publish is prefixed with the publisher's Felix principal (the `sub` of its scope token) as a 2-byte big-endian length and the UTF-8 bytes, so a reader knows who sent it and a browser cannot speak for someone else |
-| `ttl_s` | Caches only. How long an entry written with `cache_put` lasts without another write, in seconds, above 0. Without it entries never expire |
-
-Each action needs one Felix permission on the resource: `stream.publish`,
-`stream.subscribe`, `cache.read` (read and watch), or `cache.write` (write,
-and a counter's add, since Felix keeps counters in caches). A join asks for
-exactly those.
+The `felix-gateway-client` npm package in `packages/gateway-client/` speaks
+this protocol for a browser.
 
 ## Versions and features
 
@@ -94,16 +49,21 @@ GET /oidc
 ```
 
 ```json
-{"issuer": "https://login.example.com", "client_id": "felix-canvas", "scopes": "openid profile"}
+{"issuer": "https://login.example.com", "client_id": "my-app", "scopes": "openid profile"}
 ```
 
 It signs in with that OpenID Connect provider using the authorization code
-flow with PKCE (S256), as a public client with the redirect URI
-`<page origin>/`, asking for `scopes`, and keeps the ID token it gets for that
-tab only, so two windows of one browser can be signed in to different
-accounts. A new tab signs in again; with a provider session that is usually a
-redirect with nothing to type. [design.md](design.md#authorization)
-describes what the gateway does with it.
+flow with PKCE (S256), as a public client, asking for `scopes`, and sends the
+ID token it gets in `join`. The gateway exchanges it at the Felix control
+plane for a Felix token narrowed to the one scope the connection opens: only
+the resources the scope file names for that scope, and only the actions it
+lists. A token for one room cannot reach another at the broker, even for
+someone allowed in both.
+
+The tenant must trust the provider, with the `client_id` as audience, and
+grant each person the permissions for the scopes they may open. The gateway
+never creates resources or grants; `dev/seed.mjs` shows what a deployment sets
+up.
 
 ## Browser to gateway
 
@@ -121,17 +81,20 @@ describes what the gateway does with it.
 | `token` | The ID token from signing in |
 
 The first message on every connection, and the only one allowed before
-`hello`. The gateway exchanges the ID token at the Felix control plane for a
-Felix token narrowed to this room's permissions and opens its Felix connection
-with it. It answers `hello`, or one `error` and then closes the connection:
+`hello`. The gateway exchanges the ID token for a narrowed Felix token and
+opens its Felix connection with it. It answers `hello`, or one `error` and
+then closes the connection:
 
-| Code | Meaning | What the canvas does |
-|---|---|---|
-| `forbidden` | The signed-in person is not a member of the room, or the room does not exist | Shows "You don't have access to this canvas" and stops |
-| `signed_out` | The ID token is missing, expired or from a provider the deployment does not trust | Offers to sign in again |
-| `unavailable` | The control plane or the brokers could not be reached | Reconnects as after any drop |
-| `unsupported` | The `join` asked for a protocol version this gateway does not speak | |
-| `bad_request` | The first message was not a `join`, or the room name is not allowed | |
+| Code | Meaning |
+|---|---|
+| `forbidden` | The signed-in person may not open this scope, or it does not exist |
+| `signed_out` | The ID token is missing, expired or from a provider the tenant does not trust |
+| `unavailable` | The control plane or the brokers could not be reached. Reconnect as after any drop |
+| `unsupported` | The `join` asked for a protocol version this gateway does not speak |
+| `bad_request` | The first message was not a `join`, or the scope's value is not allowed |
+
+A resource marked `optional` in the scope file may be missing from the
+person's grants without refusing the join; `hello` lists it under `missing`.
 
 Messages sent after `join` and before `hello` wait for the answer, so a page
 can send its first `subscribe` right after `join`. A connection that sends
@@ -154,7 +117,7 @@ earlier subscription. That is the recovery path: after a gap or an ended
 subscription, subscribe again from the last offset handled plus one.
 
 An offset the log no longer holds is answered with a `trimmed` error naming the
-oldest offset left. The browser then joins again from the snapshot, as below.
+oldest offset left.
 
 ### `publish`
 
@@ -166,14 +129,18 @@ oldest offset left. The browser then joins again from the snapshot, as below.
 |---|---|
 | `stream` | A stream alias whose actions include `publish` |
 | `payload` | The record, base64. The gateway passes the bytes through unread, after the sender's stamp on a `stamp_sender` stream |
-| `ack` | `true` to be told when Felix has the record. `false` publishes fire-and-forget, which is what cursors want. |
-| `id` | An integer chosen by the browser. It comes back on the `ack` or `error` for this publish. |
+| `ack` | `true` to be told when Felix has the record. `false` publishes fire-and-forget, which suits cursors |
+| `id` | An integer chosen by the browser. It comes back on the `ack` or `error` for this publish |
 
 A connection's publishes and cache writes reach Felix one at a time, in the
-order the browser sent them, so one session's ops land in the log in its own
-`seq` order. The gateway never resends a publish. When one fails the browser
-decides whether to retry, because only the op's `(sid, seq)` makes a retry safe
-to deduplicate.
+order the browser sent them. The gateway never resends a publish. When one
+fails the browser decides whether to retry, since only the application knows
+whether a record is safe to deduplicate.
+
+On a stream with `stamp_sender`, each payload reaches Felix prefixed with the
+publisher's Felix principal: a 2-byte big-endian length, then the principal's
+UTF-8 bytes. Readers learn who sent each record, and a browser cannot speak
+for someone else.
 
 ### `counter_add`
 
@@ -183,16 +150,13 @@ to deduplicate.
 
 | Field | Meaning |
 |---|---|
-| `counter` | A counter alias. The canvas has one, `seq`: per-session op sequence numbers |
+| `counter` | A counter alias whose actions include `add` |
 | `key` | 1 to 64 ASCII letters, digits, `-` or `_` |
 | `delta` | A signed 64-bit amount to add |
 | `id` | As for `publish`; it comes back on the `counter` or `error` |
 
 The gateway answers with a `counter` message carrying the sum after the add.
-The canvas reserves its sequence numbers this way: it adds 1,024 to its session's
-counter and uses the 1,024 numbers below the sum, fetching another block when
-half are gone. Felix counts an add retried after a lost answer twice, which
-only wastes numbers.
+Felix counts an add retried after a lost answer twice.
 
 ### `cache_get`
 
@@ -202,42 +166,7 @@ only wastes numbers.
 
 Reads one entry of a cache whose actions include `read`. `key` follows the
 rule for `counter_add`. The gateway answers with a `cache_value` message
-carrying the same `id`. The canvas reads its snapshot this way.
-
-### Joining
-
-A browser joins a room in this order:
-
-1. `subscribe` to `ops` from `"live"` and wait for `subscribed`. Its
-   `live_offset` is the tail `L`, and every op from `L` on will arrive as an
-   event, including any published while the next step is in flight.
-2. `cache_get` key `latest` of `snap`. Decode the snapshot with
-   `decodeSnapshot` from `model/`; it holds the room through offset `N`.
-3. Drop buffered events at or below `N`. If `N + 1 < L`, `subscribe` to `ops`
-   from `N + 1` to read the ops in between. With no snapshot, subscribe from 0.
-
-Reading the snapshot before subscribing would lose the ops published between
-the two. [design.md](design.md#join-and-snapshot) explains the rule.
-
-### Reading history
-
-A page may open more than one connection to the same room; each joins and is
-narrowed on its own. The canvas reads a room's history over a second one, so
-its live subscription is never replaced:
-
-1. `join` the room with the same ID token, then `subscribe` to `ops` from 0.
-   `subscribed` names the tail `L`; history is loaded once every offset below
-   `L` has arrived, and later events extend it.
-2. A jump in offsets is a drop, as on any subscription: `subscribe` again from
-   the first offset missing.
-3. A `trimmed` answer means retention has discarded the start of the log. Read
-   the snapshot with `cache_get` and `subscribe` from its offset plus one;
-   history starts there.
-
-Closing the connection ends the read. The gateway keeps nothing about it, and
-reading again later subscribes from the first offset the page does not hold.
-[design.md](design.md#history-and-the-time-scrubber) describes what the page
-does with it.
+carrying the same `id`.
 
 ### `cache_put`
 
@@ -250,9 +179,9 @@ Writes one entry of a cache whose actions include `write`, with the cache's
 the rule for `counter_add`. There is no reply; a failed write is an `error`
 with code `cache_failed` and the cache's alias.
 
-The canvas keeps its member list this way: each session writes its entry in
-`members`, keyed by session, on connecting and again every third of the TTL,
-so a session that stops writing drops out of everyone's list within one TTL.
+A presence list fits this: each session writes its entry, keyed by session, on
+connecting and again every third of the TTL, so a session that stops writing
+drops out of everyone's list within one TTL.
 
 ### `cache_delete`
 
@@ -260,17 +189,16 @@ so a session that stops writing drops out of everyone's list within one TTL.
 {"type": "cache_delete", "cache": "members", "key": "3f9a0c12d4e5b6a7"}
 ```
 
-Deletes one entry at once, needing `write` as `cache_put` does. A
-connection's cache writes and publishes reach Felix one at a time in the order
-sent, so a delete is never overtaken by the write before it.
+Deletes one entry at once, needing `write` as `cache_put` does. A delete is
+never overtaken by the write sent before it.
 
-A message sent while a page unloads may never leave it, so a closing tab also
-sends `POST /members/leave` with `navigator.sendBeacon`, which the browser
+A message sent while a page unloads may never leave it, so a closing tab can
+send `POST /members/leave` with `navigator.sendBeacon`, which the browser
 delivers after the page is gone. The body is
 `{"room": "lobby", "token": "<ID token>", "cache": "members", "key": "3f9a0c12d4e5b6a7"}`,
-with the room under the scope file's `field`, and the gateway exchanges the
-token exactly as for `join` before it deletes anything. It answers 204, 400
-for a bad room or key or a cache that does not allow `write`, or 403 with the
+with the scope under the scope file's `field`. The gateway exchanges the token
+exactly as for `join` before it deletes anything, and answers 204, 400 for a
+bad scope or key or a cache that does not allow `write`, or 403 with the
 refusal as an `error` message.
 
 ### `cache_watch`
@@ -293,11 +221,35 @@ fresh `cache_entries`.
 
 Reads this connection's subscriptions no faster than a link of
 `bits_per_second` would carry them, counting each event's JSON text. `null` or
-0 lifts the limit. It stands in for a slow network, so the slow-client
-demonstration runs anywhere: Felix keeps delivering at full speed, the
-subscription's bounded queue fills and drops new events, and the browser sees a
-gap. Other connections are not affected. There is no reply. A gateway whose
-scope file does not set `allow_throttle` answers `unsupported`.
+0 lifts the limit. It stands in for a slow network: Felix keeps delivering at
+full speed, the subscription's bounded queue fills and drops new events, and
+the browser sees a gap. Other connections are not affected. There is no reply.
+A gateway whose scope file does not set `allow_throttle` answers
+`unsupported`.
+
+## Patterns
+
+### Subscribe before reading
+
+When a cache holds a fold of a stream up to some offset, as a snapshot would,
+read it after subscribing, never before:
+
+1. `subscribe` to the stream from `"live"` and wait for `subscribed`. Its
+   `live_offset` is the tail `L`, and every record from `L` on will arrive as
+   an event, including any published while the next step is in flight.
+2. `cache_get` the fold. Say it covers the stream through offset `N`.
+3. Drop buffered events at or below `N`. If `N + 1 < L`, `subscribe` again
+   from `N + 1` to read the records in between. With no fold, subscribe from 0.
+
+Reading first would lose the records published between the read and the
+subscribe.
+
+### More than one connection
+
+A page may open more than one connection to the same scope; each joins and is
+narrowed on its own. A second connection can read a stream from offset 0 for
+history while the first keeps its live subscription. Closing it ends the read;
+the gateway keeps nothing about it.
 
 ## Gateway to browser
 
@@ -307,13 +259,13 @@ scope file does not set `allow_throttle` answers `unsupported`.
 {"type": "hello", "protocol": 1, "features": [], "namespace": "default", "room": "lobby", "cache_ttl_ms": {"members": 30000}}
 ```
 
-The answer to `join`: the session is open on this room.
+The answer to `join`: the session is open on this scope.
 
 | Field | Meaning |
 |---|---|
 | `protocol` | The version the session speaks |
 | `features` | The features of the `join` the gateway accepted |
-| `namespace` | The Felix namespace the room lives in |
+| `namespace` | The Felix namespace the scope's resources live in |
 | `room` | The scope's value, under the scope file's `field` |
 | `cache_ttl_ms` | How long an entry lasts without a write, for each cache with a `ttl_s` |
 | `missing` | Present only when not empty: aliases of `optional` resources this sign-in does not reach |
@@ -325,10 +277,10 @@ The answer to `join`: the session is open on this room.
 ```
 
 The subscription is registered with the broker. Anything published from this
-point on will be delivered, which is what the join path's subscribe-before-read
-rule waits for. `start_offset` is the first offset this subscription delivers
-and `live_offset` is the stream's tail when it was registered; both are `null`
-on a stream with no log, such as `presence`. From `"live"` the two are equal.
+point on will be delivered. `start_offset` is the first offset this
+subscription delivers and `live_offset` is the stream's tail when it was
+registered; both are `null` on a stream with no log, such as `presence`. From
+`"live"` the two are equal.
 
 ### `event`
 
@@ -336,15 +288,14 @@ on a stream with no log, such as `presence`. From `"live"` the two are equal.
 {"type": "event", "stream": "ops", "offset": 42, "payload": "haNzaWTP..."}
 ```
 
-One record, in the order the broker delivered it. On `ops`, events arrive in
-increasing offset order. `skipped_before` appears only when it is not zero: it
-counts the offsets just before this one that hold no event (a new leader's
-generation-start record), so the number of records dropped before this event is
-`offset - previous_offset - 1 - skipped_before`. Anything above zero is a drop
-the browser must recover from by subscribing again.
+One record, in the order the broker delivered it. On a durable stream, events
+arrive in increasing offset order. `skipped_before` appears only when it is not
+zero: it counts the offsets just before this one that hold no event (a new
+leader's generation-start record), so the number of records dropped before this
+event is `offset - previous_offset - 1 - skipped_before`. Anything above zero
+is a drop the browser recovers from by subscribing again.
 
-Offsets are JSON numbers. They are exact in JavaScript up to 2^53, far beyond
-what one room's log reaches.
+Offsets are JSON numbers, exact in JavaScript up to 2^53.
 
 ### `ack`
 
@@ -355,10 +306,10 @@ what one room's log reaches.
 Felix accepted publish `id`. `offset` is the record's log offset when the broker
 had one to give, and `null` when:
 
-- the stream has no log, as `presence`;
+- the stream has no log;
 - the broker acknowledged when it queued the record rather than after writing
-  it. That is Felix's default; the development stack in `dev/` sets
-  `FELIX_ACK_ON_COMMIT=true` so that ops acks carry offsets.
+  it. That is Felix's default; set `FELIX_ACK_ON_COMMIT=true` on the broker, as
+  `dev/` does, for acks with offsets.
 
 A publish with `"ack": false` gets no `ack`, only an `error` if it fails.
 
@@ -377,9 +328,7 @@ The counter's sum after the `counter_add` with this `id`.
 ```
 
 The answer to `cache_get`: the entry's bytes in base64, or `null` when there
-is none. For `snap`, that is the snapshot as the snapshotter wrote it, or
-`null` when the room has none yet. The gateway does not decode it.
-[Snapshot payload](#snapshot-payload) describes the format.
+is none.
 
 ### `cache_entries` and `cache_change`
 
@@ -395,10 +344,10 @@ is none. For `snap`, that is the snapshot as the snapshotter wrote it, or
 | `payload` | The entry, base64, or `null` when it was deleted |
 | `expires_in_ms` | Milliseconds until the entry expires, measured on the gateway's clock when it relayed the change; `null` for an entry with no TTL |
 
-The Felix release the canvas uses expires entries lazily and sends nothing when one
-lapses ([felix#960](https://github.com/GetFelix/felix/issues/960)), so the
-browser drops an entry itself once `expires_in_ms` has passed without a newer
-write. A relative time keeps the browser's own clock out of it.
+Felix 0.6.0-preview expires entries lazily and sends nothing when one lapses
+([felix#960](https://github.com/GetFelix/felix/issues/960)), so the browser
+drops an entry itself once `expires_in_ms` has passed without a newer write. A
+relative time keeps the browser's own clock out of it.
 
 ### `error`
 
@@ -412,14 +361,14 @@ The connection stays open after any error except an answer to `join`.
 
 | Code | Meaning |
 |---|---|
-| `bad_request` | The message did not parse, its payload was not base64, a key or room was not allowed, or it named an alias the scope file does not have or an action that alias does not allow |
+| `bad_request` | The message did not parse, its payload was not base64, a key or scope was not allowed, or it named an alias the scope file does not have or an action that alias does not allow |
 | `unsupported` | The message type is not one this gateway knows, a `join` asked for another protocol version, or `throttle` is not allowed |
-| `publish_failed` | Felix refused or lost the publish. It may have landed: retry with the same `(sid, seq)` |
-| `subscribe_failed` | Felix refused the subscription, for example an offset already trimmed |
+| `publish_failed` | Felix refused or lost the publish. It may have landed |
+| `subscribe_failed` | Felix refused the subscription |
 | `subscription_ended` | A subscription stopped delivering. Subscribe again from the last offset handled plus one |
 | `counter_failed` | Felix refused or lost a counter add. It may have been counted |
-| `cache_failed` | Felix refused or lost a cache read, write or delete. Ask again; for `members`, the next refresh writes it again |
-| `trimmed` | The subscription asked for an offset retention has discarded. `oldest` is the oldest offset left. Join again from the snapshot |
+| `cache_failed` | Felix refused or lost a cache read, write or delete |
+| `trimmed` | The subscription asked for an offset retention has discarded. `oldest` is the oldest offset left |
 | `watch_failed` | A cache watch was refused or stopped. Send `cache_watch` again |
 | `forbidden`, `signed_out`, `unavailable` | Only in answer to `join`; see [`join`](#join) |
 
@@ -428,25 +377,23 @@ The connection stays open after any error except an answer to `join`.
 The gateway holds up to 1,024 events for a browser that is not reading. Past
 that it stops reading the Felix subscription, and Felix's bounded
 per-subscriber queue drops new events. The gateway never drops on its own, so a
-loss always shows up as a gap in offsets.
+loss on a durable stream always shows up as a gap in offsets.
 
-The browser finds a loss in two ways:
+Felix drops the newest records, so when the last records of a burst are the
+ones dropped, nothing arrives after them to show the gap. An application that
+needs to notice that promptly can have each session publish its position on a
+second stream every few seconds, so a peer that sees a position ahead of its
+own knows it is behind.
 
-1. An `ops` event whose offset is past the one its subscription should deliver
-   next, after allowing for `skipped_before`. It subscribes again from the last
-   offset it applied plus one.
-2. A peer's presence `at` (see [Presence payload](#presence-payload)) still
-   above its own applied count two seconds after it arrived. Felix drops the
-   newest records, so when the last records of a burst are the ones dropped,
-   nothing arrives after them to show the gap. Every session publishes presence
-   at least every 3 seconds, so this finds the loss within a few seconds. The
-   grace period covers the normal case where a cursor message overtakes the
-   change it reports.
+## HTTP endpoints
 
-Either way the browser shows that it is catching up, reads the missing records
-from the log, and ends with the same state hash as everyone else.
-
-## Latency
+| Path | What |
+|---|---|
+| `GET /ws` | The WebSocket |
+| `GET /oidc` | How a browser signs in: `issuer`, `client_id`, `scopes` |
+| `POST /members/leave` | A closing tab's cache delete, described under [`cache_delete`](#cache_delete) |
+| `GET /metrics` | Latency, below |
+| anything else | A file of the web bundle in `GATEWAY_WEB_DIR`, when set |
 
 `GET /metrics` returns the two legs of the gateway separately, in microseconds:
 
@@ -464,122 +411,3 @@ from the log, and ends with the same state hash as everyone else.
 |---|---|
 | `browser_rtt` | Browser to gateway and back: a WebSocket ping every 5 seconds per connection, answered by the browser itself |
 | `felix_publish_ack` | Gateway to Felix and back, one histogram per stream alias in the scope file: from handing an acknowledged publish to Felix until its ack |
-
-## Op payload
-
-Payloads are opaque to the gateway. The canvas encodes ops on `ops` with the
-`model/` package: a MessagePack map with these keys.
-
-| Key | MessagePack type | Meaning |
-|---|---|---|
-| `sid` | uint | The authoring session, a u64 |
-| `seq` | uint | The session's op counter, a u32 |
-| `shape` | bin 16 | The target shape id, a u128, big-endian |
-| `kind` | uint | 0 create, 1 patch, 2 delete, 3 text |
-| `fields` | map | Only the fields this op changes; for `text`, the one field `y` |
-| `t` | uint, optional | When the author made the edit, in milliseconds since 1970 by its own clock. Only history shows it; the fold ignores it, and a value that is not a time is dropped |
-
-A move (a patch of `x` and `y`) encodes in about 90 bytes, 11 of them the time.
-
-### Shape fields
-
-A `create` carries every field of the new shape; a `patch` carries only those it
-changes. The fold in `model/` applies them last-writer-wins per field on log
-offset, and ignores a patch to a shape that does not exist, so a delete is final.
-
-| Field | Shapes | Meaning |
-|---|---|---|
-| `type` | all | `rect`, `ellipse`, `line`, `stroke` or `text`. A create with any other type is ignored. Never changes |
-| `x`, `y` | all | The top-left corner, or a line's start, in canvas units |
-| `w`, `h` | all | Size; for a line, the offset from start to end, which may be negative. A `text` shape's height follows its text, so its `h` is unused, and a `w` of 0 makes it grow with its longest line |
-| `z` | all | A fractional-index key: shapes stack in key order, then by id. A value that is not a key is ignored |
-| `points` | `stroke` | Pairs of coordinates relative to `x, y`. Never changes once created |
-
-### Text
-
-A `text` op changes the rich text of a `text` shape, a rectangle or an
-ellipse. Its one field, `y`, is a [Yjs](https://docs.yjs.dev) update in Yjs's
-version 2 encoding, to a document with one root XML fragment named `body`.
-The fold applies it to that shape's document, so concurrent typing merges
-instead of one person's text replacing another's. A shape's first `text` op
-creates its body, and a delete removes it.
-
-The fold ignores a `text` op on a shape that does not exist, on a line or a
-stroke, or whose update does not decode or is over 64 KB. A session's Yjs
-client id is the low 32 bits of its `sid` XORed with the high 32.
-
-The fragment holds what the editor writes through `y-prosemirror`:
-
-| Element | Attributes | Holds |
-|---|---|---|
-| `p` | none | Text |
-| `h` | `level`: 1, 2 or 3 | Text |
-| `ul`, `ol` | none | `li` elements |
-| `li` | none | A `p`, then any blocks, including lists nested up to three deep |
-
-Text carries marks as Yjs formatting attributes, each a map:
-
-| Mark | Value | Meaning |
-|---|---|---|
-| `b`, `i`, `u` | `{}` | Bold, italic, underline |
-| `a` | `{ href }` | A link; only `http:`, `https:` and `mailto:` addresses count |
-| `size` | `{ step }` | `small`, `large` or `huge`: 12, 20 or 28 canvas units against Medium's 16 |
-| `color` | `{ name }` | `muted`, `coral`, `orange`, `amber`, `green`, `blue`, `violet`, `magenta` or `rose`; Ink when absent |
-
-Anything else in the document is kept but never shown, and the state hash
-leaves it out.
-
-## Presence payload
-
-Records on `presence` are MessagePack maps, published fire-and-forget at most
-once a frame while the pointer or selection moves, and every 3 seconds
-otherwise. A session not heard from for 10 seconds is treated as gone.
-
-| Key | MessagePack type | Meaning |
-|---|---|---|
-| `sid` | uint | The session, as in ops |
-| `n` | uint | Increases with every message, so a session can time its own echo |
-| `name` | str | Display name |
-| `color` | uint | Index into the eight-colour presence palette |
-| `x`, `y` | float or nil | The pointer in canvas units, nil when it left the canvas |
-| `sel` | array of bin 16 | Ids of the selected shapes |
-| `gone` | bool | Present and true on a session's last message |
-| `at` | uint | How many changes the session has applied: the next offset it needs. Optional |
-| `txt` | array, optional | While the session edits text: `[shape, anchor, head]`, the shape id as bin 16 and the selection's two ends as encoded Yjs relative positions (`Y.encodeRelativePosition`), so a caret stays on its character while others type before it |
-
-The canvas samples the pointer once per animation frame and sends at most one
-message per 16 ms, so a 120 Hz screen still sends 60 a second. Cursors on other
-screens are eased toward each new position with a critically damped spring.
-
-## Member payload
-
-A member entry is a MessagePack map, encoded by `encodeMember` in `model/`.
-
-| Key | MessagePack type | Meaning |
-|---|---|---|
-| `name` | str | Display name, at most 24 characters |
-| `color` | uint | Index into the presence palette |
-| `person` | uint | A u64 hash of the signed-in account: the 64-bit FNV-1a of the JSON array `[iss, sub]` from the ID token |
-
-The key is the session, which is new on every page load; `person` stays the
-same for every tab and every visit signed in to one account, so the canvas
-uses it for anything that should outlast a reload. Two windows signed in to
-different accounts are two people, even in one browser. A
-person's colour is their `person` modulo eight, moved on to the next free
-colour while someone with a smaller `person` holds it. Everyone sees the same
-member list, so everyone settles on the same colours, and a reload keeps them.
-The people list shows each person once, however many tabs they have open or
-however many entries an unclean reload left behind.
-
-## Snapshot payload
-
-The snapshotter writes key `latest` of `canvas.snap.<room>` with `encodeSnapshot` from
-`model/`: a MessagePack map with these keys.
-
-| Key | MessagePack type | Meaning |
-|---|---|---|
-| `v` | uint | Format version, 2. Version 1 had no `texts` and still decodes |
-| `offset` | uint | The last log offset folded in. Continue from `offset + 1` |
-| `shapes` | array | One `[id, fields, written]` per shape: the id as bin 16, the fields as in ops, and a map from field name to the offset that last wrote it |
-| `seqs` | array | One `[sid, seq]` per session: the highest `seq` folded in, so a retried op that lands later is still recognised as a repeat |
-| `texts` | array | One `[id, state]` per body: the shape id as bin 16 and `Y.encodeStateAsUpdateV2` of its document |
