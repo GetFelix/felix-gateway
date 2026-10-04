@@ -1,6 +1,6 @@
 // The browser half of the gateway protocol. docs/protocol.md is the reference.
 // Streams, caches and counters are named by their alias in the gateway's
-// scope file. This file imports nothing, so it can stand on its own.
+// scope file.
 
 /** The protocol version this client speaks. */
 export const PROTOCOL = 1;
@@ -110,6 +110,12 @@ export class GatewayError extends Error {
     super(message);
   }
 }
+
+/**
+ * Everything a {@link GatewayClient} offers, without its private state, so
+ * code can accept a stand-in such as `FakeGateway` from `felix-gateway-client/fake`.
+ */
+export type Gateway = Pick<GatewayClient, keyof GatewayClient>;
 
 interface Pending {
   resolve: (value: number | string | null) => void;

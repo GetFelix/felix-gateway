@@ -6,14 +6,16 @@ FROM node:24-trixie-slim AS web
 WORKDIR /src
 # Every workspace's manifest, or npm ci refuses the lockfile.
 COPY package.json package-lock.json .npmrc tsconfig.base.json ./
+COPY packages/gateway-client/package.json packages/gateway-client/
 COPY model/package.json model/
 COPY web/package.json web/
 COPY snapshotter/package.json snapshotter/
 RUN --mount=type=cache,target=/root/.npm \
-    npm ci --include-workspace-root -w @felix-canvas/model -w @felix-canvas/web
+    npm ci --include-workspace-root -w felix-gateway-client -w @felix-canvas/model -w @felix-canvas/web
+COPY packages/gateway-client packages/gateway-client
 COPY model model
 COPY web web
-RUN npm run build -w @felix-canvas/model && npm run build -w @felix-canvas/web
+RUN npm run build -w felix-gateway-client -w @felix-canvas/model && npm run build -w @felix-canvas/web
 
 FROM rust:1.97-bookworm AS gateway
 WORKDIR /src
