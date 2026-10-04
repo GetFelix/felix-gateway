@@ -2,8 +2,7 @@
 //!
 //! It owns sockets and Felix connections and nothing else. Payloads are
 //! relayed as opaque bytes, so a scope's truth stays in the broker's log. The
-//! scope file names the scope (a room, a match) and the Felix resources each
-//! one owns.
+//! scope file names the scope's field and the Felix resources each scope owns.
 //!
 //! - `config`: [`Config`], read from the environment.
 //! - `protocol`: the JSON messages exchanged with a browser.

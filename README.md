@@ -3,15 +3,16 @@
 [![CI](https://github.com/GetFelix/felix-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/GetFelix/felix-gateway/actions/workflows/ci.yml)
 [![MIT license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-A WebSocket gateway between browsers and [Felix](https://github.com/GetFelix/felix),
-with sign-in narrowed to one room or match.
+A WebSocket gateway between browsers and [Felix](https://github.com/GetFelix/felix).
+Each connection signs in to one scope and gets a Felix token that reaches only
+that scope's resources.
 
 ## What it is
 
 Browsers cannot speak Felix's QUIC protocol, and a browser should never hold a
-token that reaches more than the one room it has open. The gateway sits between
-them. A browser opens a WebSocket, names its scope (a room, a match) and signs
-in with an OpenID Connect ID token. The gateway exchanges that token at the
+token that reaches more than the one scope it has open. The gateway sits between
+them. A browser opens a WebSocket, names its scope and signs in with an OpenID
+Connect ID token. The gateway exchanges that token at the
 Felix control plane for a Felix token narrowed to the scope's streams, caches
 and counters, opens a Felix connection with it, and relays JSON messages both
 ways without decoding payloads.
@@ -94,7 +95,7 @@ field = "room"                     # join carries {"room": "lobby", ...}
 
 [[scope.streams]]
 alias = "ops"                      # what messages call it
-name = "app.ops.{scope}"           # the Felix stream for room {scope}
+name = "app.ops.{scope}"           # the Felix stream for scope {scope}
 actions = ["publish", "subscribe"]
 
 [[scope.caches]]

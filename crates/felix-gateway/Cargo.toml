@@ -1,6 +1,6 @@
 [package]
 name = "felix-gateway"
-description = "A WebSocket gateway between browsers and Felix, with sign-in narrowed to one room or match"
+description = "A WebSocket gateway between browsers and Felix, with each connection narrowed to one scope"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

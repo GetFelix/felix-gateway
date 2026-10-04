@@ -232,7 +232,7 @@ pub(crate) struct Bound<'a, A> {
     pub(crate) name: String,
 }
 
-/// One value of the scope, such as one room.
+/// One value of the scope, such as `lobby` when the field is `room`.
 #[derive(Debug, Clone)]
 pub(crate) struct Scope {
     config: Arc<ScopeConfig>,
