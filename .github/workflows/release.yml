@@ -339,6 +339,13 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The environment the crates.io trusted publisher names, as in felix's
+    # release; only a real publish runs in it.
+    environment: ${{ needs.check.outputs.publish == 'true' && 'crates-io' || '' }}
+    permissions:
+      contents: read
+      # crates.io trusted publishing.
+      id-token: write
     env:
       PUSH: ${{ needs.check.outputs.publish }}
       VERSION: ${{ needs.check.outputs.version }}
@@ -348,9 +355,13 @@ jobs:
           ref: ${{ needs.check.outputs.ref }}
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: crates.io token
+        id: auth
+        if: env.PUSH == 'true'
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           if [ "$PUSH" != true ]; then
             cargo publish --locked --dry-run -p felix-gateway
@@ -358,7 +369,6 @@ jobs:
               "https://crates.io/api/v1/crates/felix-gateway/${VERSION}" >/dev/null 2>&1; then
             echo "felix-gateway ${VERSION} is already on crates.io"
           else
-            [ -n "$CARGO_REGISTRY_TOKEN" ] || { echo "::error::set the CARGO_REGISTRY_TOKEN secret"; exit 1; }
             cargo publish --locked -p felix-gateway
           fi
 
@@ -367,6 +377,7 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: ${{ needs.check.outputs.publish == 'true' && 'npm' || '' }}
     permissions:
       contents: read
       # npm trusted publishing and provenance.
@@ -386,11 +397,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run build -w felix-gateway-client
-      # Trusted publishing needs no token. NPM_TOKEN is the fallback for a
-      # package that has no trusted publisher set up yet.
       - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           tag=$([ "$PRERELEASE" = true ] && echo next || echo latest)
           if [ "$PUSH" != true ]; then
