@@ -410,6 +410,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      packages: read
     env:
       TAG: ${{ needs.check.outputs.tag }}
       VERSION: ${{ needs.check.outputs.version }}
@@ -420,6 +421,14 @@ jobs:
           name: release-files
 
       - uses: sigstore/cosign-installer@v3
+
+      # A new GHCR package starts private, so the first release's signature check must authenticate.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Release notes
         run: |
