@@ -396,7 +396,7 @@ is none. For `snap`, that is the snapshot as the snapshotter wrote it, or
 | `expires_in_ms` | Milliseconds until the entry expires, measured on the gateway's clock when it relayed the change; `null` for an entry with no TTL |
 
 The Felix release the canvas uses expires entries lazily and sends nothing when one
-lapses ([felix#960](https://github.com/gabloe/felix/issues/960)), so the
+lapses ([felix#960](https://github.com/GetFelix/felix/issues/960)), so the
 browser drops an entry itself once `expires_in_ms` has passed without a newer
 write. A relative time keeps the browser's own clock out of it.
 
