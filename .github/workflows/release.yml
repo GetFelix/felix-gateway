@@ -1,0 +1,456 @@
+name: Release
+
+# A v* tag releases that version: the image ghcr.io/getfelix/felix-gateway
+# (amd64 and arm64, signed), the felix-gateway crate, the felix-gateway-client
+# npm package, and a GitHub release with its notes from CHANGELOG.md.
+#
+# Run by hand with `tag` to release a tag that already exists. A crate or npm
+# version already published is skipped, so this also finishes a release that
+# failed part way. With `dry_run`, or for a tag that does not exist yet, it runs
+# every check and builds every part from the branch it was started on, and
+# publishes nothing. Pull requests get the same dry run for the version in the
+# tree.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to release, such as v0.1.0
+        required: true
+        type: string
+      dry_run:
+        description: Check and build everything, publish nothing
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'pull_request' && github.ref || inputs.tag || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/getfelix/felix-gateway
+
+jobs:
+  check:
+    name: Check and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      ref: ${{ steps.source.outputs.ref }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - name: Choose the source
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          case "$EVENT" in
+            push)
+              echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+              echo "ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            workflow_dispatch)
+              echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+              if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${INPUT_TAG}" >/dev/null 2>&1; then
+                echo "ref=refs/tags/${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+                echo "publish=$([ "$DRY_RUN" = true ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+              elif [ "$DRY_RUN" = true ]; then
+                echo "::notice::${INPUT_TAG} does not exist, so this dry run builds ${GITHUB_REF_NAME}"
+                echo "ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+                echo "publish=false" >> "$GITHUB_OUTPUT"
+              else
+                echo "::error::${INPUT_TAG} is not a tag. Push the tag first, or check dry_run to rehearse it."
+                exit 1
+              fi
+              ;;
+            *)
+              # The tag is read from the tree once it is checked out.
+              echo "ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.ref }}
+
+      # The changelog and the release scripts come from the commit this
+      # workflow runs from, so a tag cut before an entry was written can still
+      # be released from main.
+      - name: Release tools
+        uses: actions/checkout@v4
+        with:
+          path: .release-tools
+          sparse-checkout: |
+            CHANGELOG.md
+            .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Plan
+        id: plan
+        env:
+          TAG: ${{ steps.source.outputs.tag }}
+          PUBLISH: ${{ steps.source.outputs.publish }}
+        run: |
+          if [ -z "$TAG" ]; then
+            TAG="v$(grep -m1 -oP '^version\s*=\s*"\K[^"]+' Cargo.toml)"
+          fi
+          version="${TAG#v}"
+          {
+            echo "tag=${TAG}"
+            echo "version=${version}"
+            echo "prerelease=$([[ "$version" == *-* ]] && echo true || echo false)"
+            echo "publish=${PUBLISH}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - name: The tag matches every version in the tree
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: python3 .release-tools/.github/scripts/check-release-version.py "$TAG"
+
+      - name: Release notes from CHANGELOG.md
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          python3 .release-tools/.github/scripts/changelog-section.py "$TAG" .release-tools/CHANGELOG.md > notes.md
+          cat >> notes.md <<EOF
+
+          ## Install
+
+          \`\`\`bash
+          docker pull ${IMAGE}:${VERSION}
+          cargo install felix-gateway --version ${VERSION}
+          npm install felix-gateway-client@${VERSION}
+          \`\`\`
+
+          [docs/configuration.md](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/docs/configuration.md) covers the settings and the scope file.
+          EOF
+          cat notes.md
+
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Package the crate
+        run: |
+          cargo package --locked -p felix-gateway
+          mkdir -p dist
+          cp target/package/felix-gateway-*.crate dist/
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Pack the npm package
+        run: |
+          npm ci
+          npm run build -w felix-gateway-client
+          npm pack -w felix-gateway-client --pack-destination dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: |
+            dist/
+            notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Image (${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      PUSH: ${{ needs.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      # Untagged: a tag here would point at one platform until the manifest
+      # list moved it.
+      - name: Build${{ env.PUSH == 'true' && ' and push by digest' || '' }}
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: ${{ env.PUSH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=cacheonly' }}
+          provenance: ${{ env.PUSH == 'true' && 'mode=max' || 'false' }}
+          sbom: ${{ env.PUSH == 'true' }}
+          cache-from: type=gha,scope=felix-gateway-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=felix-gateway-${{ matrix.arch }}
+
+      # Recorded on every run, so a dry run exercises the same artifacts the
+      # manifest job combines.
+      - name: Record the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digest"
+          if [ "$PUSH" = true ]; then
+            echo "${DIGEST}" > "${RUNNER_TEMP}/digest/${{ matrix.arch }}"
+          else
+            echo "not-pushed" > "${RUNNER_TEMP}/digest/${{ matrix.arch }}"
+          fi
+
+      # Exact names, downloaded by name, so no pattern can pick up another
+      # job's artifacts.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: ${{ needs.check.outputs.publish == 'true' && 'Image manifest' || 'Image manifest (dry run)' }}
+    needs: [check, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      # Keyless signing: cosign gets a short-lived certificate for this
+      # workflow's OIDC identity, so there is no key to store.
+      id-token: write
+    outputs:
+      digest: ${{ steps.merge.outputs.digest }}
+    env:
+      PUSH: ${{ needs.check.outputs.publish }}
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-digest-amd64
+          path: ${{ runner.temp }}/digest
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-digest-arm64
+          path: ${{ runner.temp }}/digest
+
+      - name: Both platform digests
+        working-directory: ${{ runner.temp }}/digest
+        run: |
+          ls -1
+          [ "$(ls -1 | tr '\n' ' ')" = "amd64 arm64 " ] || { echo "::error::expected amd64 and arm64"; exit 1; }
+          cat amd64 arm64
+
+      - uses: docker/setup-buildx-action@v3
+        if: env.PUSH == 'true'
+
+      - uses: sigstore/cosign-installer@v3
+        if: env.PUSH == 'true'
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` only for a version without a pre-release suffix.
+      - name: Tags
+        if: env.PUSH == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=raw,value=latest,enable=${{ !contains(env.TAG, '-') }}
+
+      - name: Create the manifest list
+        if: env.PUSH == 'true'
+        id: merge
+        working-directory: ${{ runner.temp }}/digest
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            "${IMAGE}@$(cat amd64)" "${IMAGE}@$(cat arm64)"
+          tag=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          digest=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      # By digest, never by tag: a tag can be moved and the signature would follow it.
+      - name: Sign
+        if: env.PUSH == 'true'
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  crate:
+    name: ${{ needs.check.outputs.publish == 'true' && 'Crate' || 'Crate (dry run)' }}
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PUSH: ${{ needs.check.outputs.publish }}
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.ref }}
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ "$PUSH" != true ]; then
+            cargo publish --locked --dry-run -p felix-gateway
+          elif curl -fsS -A "felix-gateway release (github.com/${GITHUB_REPOSITORY})" \
+              "https://crates.io/api/v1/crates/felix-gateway/${VERSION}" >/dev/null 2>&1; then
+            echo "felix-gateway ${VERSION} is already on crates.io"
+          else
+            [ -n "$CARGO_REGISTRY_TOKEN" ] || { echo "::error::set the CARGO_REGISTRY_TOKEN secret"; exit 1; }
+            cargo publish --locked -p felix-gateway
+          fi
+
+  npm:
+    name: ${{ needs.check.outputs.publish == 'true' && 'npm package' || 'npm package (dry run)' }}
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # npm trusted publishing and provenance.
+      id-token: write
+    env:
+      PUSH: ${{ needs.check.outputs.publish }}
+      VERSION: ${{ needs.check.outputs.version }}
+      PRERELEASE: ${{ needs.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run build -w felix-gateway-client
+      # Trusted publishing needs no token. NPM_TOKEN is the fallback for a
+      # package that has no trusted publisher set up yet.
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          tag=$([ "$PRERELEASE" = true ] && echo next || echo latest)
+          if [ "$PUSH" != true ]; then
+            npm publish -w felix-gateway-client --access public --tag "$tag" --dry-run
+          elif npm view "felix-gateway-client@${VERSION}" version >/dev/null 2>&1; then
+            echo "felix-gateway-client ${VERSION} is already on npm"
+          else
+            npm install -g npm@latest
+            npm publish -w felix-gateway-client --access public --tag "$tag" --provenance
+          fi
+
+  release:
+    name: GitHub release
+    needs: [check, manifest, crate, npm]
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+      DIGEST: ${{ needs.manifest.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Release notes
+        run: |
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          {
+            echo
+            echo "## Image"
+            echo
+            echo "\`${IMAGE}:${VERSION}\` is \`${DIGEST}\`, signed with cosign:"
+            echo
+            echo '```bash'
+            echo "cosign verify ${IMAGE}@${DIGEST} \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> notes.md
+          cat notes.md
+          cat dist/SHA256SUMS
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: felix-gateway ${{ env.TAG }}
+          body_path: notes.md
+          prerelease: ${{ needs.check.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.check.outputs.prerelease == 'true' && 'false' || 'true' }}
+          files: |
+            dist/felix-gateway-${{ env.VERSION }}.crate
+            dist/felix-gateway-client-${{ env.VERSION }}.tgz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
