@@ -51,7 +51,10 @@ browser client.
 
 ## Quick start
 
-You need Docker, Rust 1.97 and Node 24.
+You need Docker or Podman, Rust 1.97 and Node 24. `dev/up.sh` uses Docker when
+its daemon is running and Podman otherwise (`podman machine start` first on
+macOS); set `CONTAINER_ENGINE=podman` to choose. See [Docker or
+Podman](https://getfelix.github.io/felix/getting-started/containers/).
 
 ```sh
 dev/up.sh                          # Felix, a stand-in IdP, and seeded rooms

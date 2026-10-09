@@ -11,6 +11,10 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Changed
+
+- `dev/up.sh` runs on Docker or Podman, and the docs show the Podman form.
+
 ## [0.2.0] - 2026-10-04
 
 Moves to Felix 0.6.0-preview.2, which this release is tested against. Browsers

@@ -6,7 +6,7 @@ name: felix-gateway
 
 services:
   idp:
-    image: node:24-alpine
+    image: docker.io/library/node:24-alpine
     command: ["node", "/app/idp.mjs"]
     environment:
       # Browsers sign in on the host, so the issuer is the host's address.
@@ -41,7 +41,7 @@ services:
         condition: service_healthy
 
   seed:
-    image: node:24-alpine
+    image: docker.io/library/node:24-alpine
     command: ["node", "/app/seed.mjs"]
     volumes:
       - ./seed.mjs:/app/seed.mjs:ro

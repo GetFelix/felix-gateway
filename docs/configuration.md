@@ -110,5 +110,8 @@ docker run -p 8787:8787 \
   ghcr.io/getfelix/felix-gateway:0.2.0
 ```
 
+`podman run` takes the same arguments. On SELinux hosts, mount the scope file
+with `:ro,Z`.
+
 Its health check fetches `/oidc`, which answers as soon as the gateway is
 listening.
