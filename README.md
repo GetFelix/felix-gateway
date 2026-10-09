@@ -54,7 +54,7 @@ browser client.
 You need Docker or Podman, Rust 1.97 and Node 24. `dev/up.sh` uses Docker when
 its daemon is running and Podman otherwise (`podman machine start` first on
 macOS); set `CONTAINER_ENGINE=podman` to choose. See [Docker or
-Podman](https://getfelix.github.io/felix/getting-started/containers/).
+Podman](https://docs.getfelix.dev/getting-started/containers/).
 
 ```sh
 dev/up.sh                          # Felix, a stand-in IdP, and seeded rooms
@@ -147,6 +147,8 @@ Known limits, all on the Felix side:
   Felix permissions and the image.
 - [packages/gateway-client/README.md](packages/gateway-client/README.md): the
   browser client.
+- [Browsers](https://docs.getfelix.dev/clients/browsers/) in the Felix docs:
+  how the gateway fits next to the other Felix clients.
 - [CHANGELOG.md](CHANGELOG.md): what changed in each release.
 
 ## Contributing
