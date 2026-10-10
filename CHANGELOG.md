@@ -32,12 +32,12 @@ release notes the Felix version it was tested against.
   address, and an optional per-alias write rate. They cover publishes, cache
   writes and deletes, counter adds and the leave beacon. A write over a rate
   is refused at once, never queued. `X-Forwarded-For` is used for the client
-  address only with `trusted_proxies` set (#9).
+  address only with `trusted_proxies` set (#11).
 - The `rate_limited` protocol feature: a session that asks for it gets the
   error code `rate_limited` with `retry_after_ms` for a refused write or join.
-  Other sessions get the code they already know for that request (#9).
-- `limits_refused` in `GET /metrics`, counting refusals by limit (#9).
-- `felix-gateway-client`: `GatewayError.retryAfterMs` (#9).
+  Other sessions get the code they already know for that request (#11).
+- `limits_refused` in `GET /metrics`, counting refusals by limit (#11).
+- `felix-gateway-client`: `GatewayError.retryAfterMs` (#11).
 
 ### Changed
 
@@ -46,7 +46,7 @@ release notes the Felix version it was tested against.
   principal (bursts of 200 and 2 MiB), payloads of at most 64 KiB, 8 sessions
   per principal and 32 per client address. A program embedding the library
   serves `Gateway::router()` with `into_make_service_with_connect_info` for
-  the address cap to apply (#9).
+  the address cap to apply (#11).
 - Built on felix-client and felix-wire 0.6.0-preview.4, and the dev stack runs
   the 0.6.0-preview.4 images (#10).
 - `dev/up.sh` runs on Docker or Podman, and the docs show the Podman form.
@@ -65,7 +65,7 @@ reaches watchers as a delete.
   principal (bursts of 200 and 2 MiB), payloads of at most 64 KiB, 8 sessions
   per principal and 32 per client address. A program embedding the library
   serves `Gateway::router()` with `into_make_service_with_connect_info` for
-  the address cap to apply (#9).
+  the address cap to apply (#11).
 - Built on felix-client and felix-wire 0.6.0-preview.2, and the dev stack runs
   the `ghcr.io/getfelix` 0.6.0-preview.2 images.
 - A browser that falls behind on a durable stream gets every record, late and
