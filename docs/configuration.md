@@ -47,12 +47,20 @@ gateway at startup, naming the ones missing.
 | `GATEWAY_FELIX_SHARED_CONNECTIONS` | `4` | How many connections sessions are spread over. Each session goes to the one with the fewest |
 
 They need Felix 0.6.0-preview.4 or later, on the control plane and the
-brokers. A join works like this:
+brokers. From 0.6.0-preview.5, Felix delegates only a scope token minted for
+the gateway that asks (step 2 below). Gateway 0.3.0 and earlier do not ask for
+one, so against Felix 0.6.0-preview.5 or later they need
+`FELIX_CONTROLPLANE_DELEGATE_UNBOUND_TOKENS=true` on the control plane. A join
+works like this:
 
-1. The browser's ID token is exchanged for a scope token, as without shared
-   connections.
-2. The gateway exchanges its own credential for a `felix-controlplane` token
+1. The gateway exchanges its own credential for a `felix-controlplane` token
    narrowed to `token.delegate`, kept until a minute before it expires.
+2. The browser's ID token is exchanged for a scope token, as without shared
+   connections, but with the gateway's token as the RFC 8693 `actor_token`.
+   The scope token then carries `may_act: {"sub": "<gateway principal>"}`, and
+   only the gateway can have it delegated. Refreshes keep `may_act`. If the
+   control plane refuses the gateway's token, the gateway gets a fresh one and
+   tries once more, then logs the error and answers `unavailable`.
 3. It calls `POST /v1/tenants/{tenant}/token/delegate` with the scope token.
    The control plane reissues it with the same user and grants and with
    `act: {"sub": "<gateway principal>"}`.

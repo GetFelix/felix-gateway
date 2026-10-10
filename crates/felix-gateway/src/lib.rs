@@ -153,7 +153,10 @@ impl Gateway {
         let Some(scope) = Scope::parse(&self.scope, scope) else {
             return Err(Refused::Forbidden);
         };
-        let grant = self.control_plane.exchange(id_token, &scope).await?;
+        let grant = self
+            .control_plane
+            .exchange(id_token, &scope, self.shared.as_ref().map(|s| &*s.actor))
+            .await?;
         Ok(grant.felix_token)
     }
 
