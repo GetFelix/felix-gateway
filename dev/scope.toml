@@ -36,3 +36,13 @@ ttl_s = 30
 alias = "seq"
 name = "demo.seq.{scope}"
 actions = ["add"]
+
+# The throttle test publishes 1,000 records at once, past the default write
+# rates. docs/configuration.md lists the defaults.
+[limits.session]
+writes_per_s = 2000
+write_burst = 2000
+
+[limits.principal]
+writes_per_s = 2000
+write_burst = 2000

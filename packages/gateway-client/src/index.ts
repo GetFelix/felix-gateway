@@ -50,8 +50,10 @@ export type ServerMessage =
         | "watch_failed"
         | "signed_out"
         | "forbidden"
-        | "unavailable";
+        | "unavailable"
+        | "rate_limited";
       oldest?: number;
+      retry_after_ms?: number;
       message: string;
     };
 
@@ -106,6 +108,8 @@ export class GatewayError extends Error {
   constructor(
     readonly code: string,
     message: string,
+    /** With `rate_limited`: milliseconds until the request would fit. */
+    readonly retryAfterMs?: number,
   ) {
     super(message);
   }
@@ -292,7 +296,7 @@ export class GatewayClient {
         this.#take(message.id)?.resolve(message.payload);
         break;
       case "error": {
-        const error = new GatewayError(message.code, message.message);
+        const error = new GatewayError(message.code, message.message, message.retry_after_ms);
         const pending = this.#take(message.id);
         if (pending) {
           pending.reject(error);

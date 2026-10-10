@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use anyhow::Result;
 use axum::serve::{Listener, ListenerExt};
 use felix_gateway::{Config, Gateway};
@@ -23,6 +25,10 @@ async fn main() -> Result<()> {
         tenant = %config.tenant,
         "gateway ready"
     );
-    axum::serve(listener, gateway.router()).await?;
+    // The client's address feeds the session cap per address.
+    let app = gateway
+        .router()
+        .into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, app).await?;
     Ok(())
 }

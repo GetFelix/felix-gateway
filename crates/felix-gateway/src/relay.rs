@@ -3,6 +3,7 @@
 //! the broker's.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,13 +14,17 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::Gateway;
-use crate::access::Refused;
+use crate::access::{Grant, Refused};
 use crate::felix::Felix;
-use crate::metrics::Metrics;
+use crate::limits::{self, SessionLimits, WriteCost};
+use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
-    CacheEntry, ClientMessage, ErrorCode, FEATURES, Join, PROTOCOL, ServerMessage, StartAt,
+    CacheEntry, ClientMessage, ErrorCode, FEATURES, Join, PROTOCOL, RATE_LIMITED, ServerMessage,
+    StartAt,
 };
-use crate::scope::{BAD_NAME, CacheAction, CounterAction, Scope, StreamAction, valid_name};
+use crate::scope::{
+    Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
+};
 use crate::throttle::Throttle;
 use crate::transport::{BrowserConnection, Incoming};
 
@@ -59,6 +64,9 @@ enum Write {
 /// One joined connection's tasks and queues.
 struct Session {
     felix: Arc<Felix>,
+    limits: SessionLimits,
+    /// The session asked for [`RATE_LIMITED`].
+    rate_limited: bool,
     throttle: Arc<Throttle>,
     events: mpsc::Sender<ServerMessage>,
     replies: mpsc::UnboundedSender<ServerMessage>,
@@ -77,9 +85,19 @@ enum Next {
     Stop,
 }
 
-/// Relay one browser connection until it closes.
-pub(crate) async fn run<C: BrowserConnection>(mut conn: C, gateway: Gateway) {
-    let Some((felix, hello)) = join(&mut conn, &gateway).await else {
+/// Relay one browser connection from `client` until it closes.
+pub(crate) async fn run<C: BrowserConnection>(
+    mut conn: C,
+    gateway: Gateway,
+    client: Option<IpAddr>,
+) {
+    let Some(Joined {
+        felix,
+        hello,
+        limits,
+        rate_limited,
+    }) = join(&mut conn, &gateway, client).await
+    else {
         return;
     };
     let felix = Arc::new(felix);
@@ -97,6 +115,8 @@ pub(crate) async fn run<C: BrowserConnection>(mut conn: C, gateway: Gateway) {
     ));
     let mut session = Session {
         felix,
+        limits,
+        rate_limited,
         throttle: Arc::new(Throttle::default()),
         events: events_tx,
         replies: replies_tx,
@@ -158,7 +178,8 @@ impl Session {
             Ok(message) => message,
             Err(err) => return Next::Reply(error(ErrorCode::BadRequest, err)),
         };
-        let scope = &self.felix.scope;
+        let felix = Arc::clone(&self.felix);
+        let scope = &felix.scope;
         match message {
             ClientMessage::Subscribe { stream, from } => {
                 let name = match scope.stream(&stream, StreamAction::Subscribe) {
@@ -204,6 +225,13 @@ impl Session {
                         ));
                     }
                 };
+                if let Err(refused) = self.charge(&bound, &stream, payload.len()) {
+                    let code = self.refusal_code(refused, ErrorCode::PublishFailed);
+                    return Next::Reply(with_id(
+                        id,
+                        limited(stream_error(stream, code, ""), refused),
+                    ));
+                }
                 if bound.resource.stamp_sender {
                     payload = stamped(&self.felix.principal, &payload);
                 }
@@ -223,8 +251,8 @@ impl Session {
                 delta,
                 id,
             } => {
-                let name = match scope.counter(&counter, CounterAction::Add) {
-                    Ok(bound) => bound.name,
+                let bound = match scope.counter(&counter, CounterAction::Add) {
+                    Ok(bound) => bound,
                     Err(refusal) => {
                         return Next::Reply(with_id(id, error(ErrorCode::BadRequest, refusal)));
                     }
@@ -232,6 +260,11 @@ impl Session {
                 if !valid_name(&key) {
                     return Next::Reply(with_id(id, error(ErrorCode::BadRequest, BAD_NAME)));
                 }
+                if let Err(refused) = self.charge(&bound, &counter, 0) {
+                    let code = self.refusal_code(refused, ErrorCode::CounterFailed);
+                    return Next::Reply(with_id(id, limited(error(code, ""), refused)));
+                }
+                let name = bound.name;
                 let felix = Arc::clone(&self.felix);
                 let replies = self.replies.clone();
                 tokio::spawn(async move {
@@ -318,14 +351,19 @@ impl Session {
         }
     }
 
-    async fn write_cache(&self, cache: String, key: String, payload: Option<Vec<u8>>) -> Next {
-        let bound = match self.felix.scope.cache(&cache, CacheAction::Write) {
+    async fn write_cache(&mut self, cache: String, key: String, payload: Option<Vec<u8>>) -> Next {
+        let felix = Arc::clone(&self.felix);
+        let bound = match felix.scope.cache(&cache, CacheAction::Write) {
             Ok(_) if !valid_name(&key) => {
                 return Next::Reply(cache_error(cache, ErrorCode::BadRequest, BAD_NAME));
             }
             Ok(bound) => bound,
             Err(refusal) => return Next::Reply(cache_error(cache, ErrorCode::BadRequest, refusal)),
         };
+        if let Err(refused) = self.charge(&bound, &cache, payload.as_ref().map_or(0, Vec::len)) {
+            let code = self.refusal_code(refused, ErrorCode::CacheFailed);
+            return Next::Reply(limited(cache_error(cache, code, ""), refused));
+        }
         let ttl = bound.resource.ttl();
         let name = bound.name;
         self.write(Write::Cache {
@@ -336,6 +374,42 @@ impl Session {
             ttl,
         })
         .await
+    }
+
+    /// Check one write of `bytes` to `bound` against the payload limit and
+    /// spend it from the session's rates.
+    fn charge<A: Action>(
+        &mut self,
+        bound: &Bound<'_, A>,
+        alias: &str,
+        bytes: usize,
+    ) -> Result<(), limits::Refused> {
+        let config = &self.felix.scope.config().limits;
+        if bytes > bound.resource.max_payload(config) {
+            self.limits.metrics().record_refusal(Refusal::MessageSize);
+            return Err(limits::Refused {
+                limit: Refusal::MessageSize,
+                retry_after: None,
+            });
+        }
+        let cost = WriteCost {
+            kind: A::KIND,
+            alias,
+            alias_rate: bound.resource.write_rate(),
+            bytes,
+        };
+        self.limits.charge(&cost, std::time::Instant::now())
+    }
+
+    /// The code a refused write is answered with: `bad_request` for one too
+    /// large, which retrying cannot fix, and otherwise `rate_limited`, or
+    /// `fallback` for a session that did not ask for it.
+    fn refusal_code(&self, refused: limits::Refused, fallback: ErrorCode) -> ErrorCode {
+        match refused.limit {
+            Refusal::MessageSize => ErrorCode::BadRequest,
+            _ if self.rate_limited => ErrorCode::RateLimited,
+            _ => fallback,
+        }
     }
 
     async fn write(&self, write: Write) -> Next {
@@ -407,13 +481,22 @@ async fn write_in_order(
     }
 }
 
+/// A session the gateway has opened, ready to say `hello`.
+struct Joined {
+    felix: Felix,
+    hello: ServerMessage,
+    limits: SessionLimits,
+    rate_limited: bool,
+}
+
 /// Wait for the browser's `join`, exchange its sign-in for a token that
 /// reaches only that scope, and connect to Felix with it. Anything else first,
 /// or a refusal, is answered with an error and ends the session.
 async fn join<C: BrowserConnection>(
     conn: &mut C,
     gateway: &Gateway,
-) -> Option<(Felix, ServerMessage)> {
+    client: Option<IpAddr>,
+) -> Option<Joined> {
     let first = tokio::time::timeout(JOIN_TIMEOUT, async {
         loop {
             match conn.recv().await? {
@@ -426,7 +509,7 @@ async fn join<C: BrowserConnection>(
     .ok()??;
     let refusal = match serde_json::from_str(&first) {
         Ok(ClientMessage::Join {}) => match serde_json::from_str(&first) {
-            Ok(join) => match accept(join, gateway).await {
+            Ok(join) => match accept(join, gateway, client).await {
                 Ok(joined) => return Some(joined),
                 Err(refusal) => refusal,
             },
@@ -440,7 +523,11 @@ async fn join<C: BrowserConnection>(
 }
 
 /// Open the session `join` asks for, and the `hello` that answers it.
-async fn accept(join: Join, gateway: &Gateway) -> Result<(Felix, ServerMessage), ServerMessage> {
+async fn accept(
+    join: Join,
+    gateway: &Gateway,
+    client: Option<IpAddr>,
+) -> Result<Joined, ServerMessage> {
     if join.protocol != PROTOCOL {
         return Err(error(
             ErrorCode::Unsupported,
@@ -454,7 +541,25 @@ async fn accept(join: Join, gateway: &Gateway) -> Result<(Felix, ServerMessage),
         .and_then(|value| value.as_str())
         .and_then(|value| Scope::parse(&gateway.scope, value))
         .ok_or_else(|| error(ErrorCode::BadRequest, format!("{field}: {BAD_NAME}")))?;
-    let (felix, missing) = connect(scope, &join.token, gateway).await?;
+    let rate_limited = join.features.iter().any(|feature| feature == RATE_LIMITED);
+    // The address cap is checked before the token exchange, and the principal
+    // cap, which needs the exchange's answer, before the Felix connection.
+    let session_refused = |refused: limits::Refused| {
+        let code = if rate_limited {
+            ErrorCode::RateLimited
+        } else {
+            ErrorCode::Unavailable
+        };
+        limited(error(code, ""), refused)
+    };
+    let ip = gateway.limiter.admit_ip(client).map_err(session_refused)?;
+    let grant = exchange(&scope, &join.token, gateway).await?;
+    let principal = gateway
+        .limiter
+        .admit_principal(&grant.principal, std::time::Instant::now())
+        .map_err(session_refused)?;
+    let missing = grant.missing.clone();
+    let felix = connect(scope, grant, gateway).await?;
     let hello = ServerMessage::Hello {
         protocol: PROTOCOL,
         features: join
@@ -467,37 +572,41 @@ async fn accept(join: Join, gateway: &Gateway) -> Result<(Felix, ServerMessage),
         cache_ttl_ms: gateway.scope.cache_ttl_ms(),
         missing,
     };
-    Ok((felix, hello))
+    Ok(Joined {
+        felix,
+        hello,
+        limits: SessionLimits::new(principal, ip, std::time::Instant::now()),
+        rate_limited,
+    })
 }
 
-/// Exchange `token` for `scope` and connect with the result. The error is the
+/// Exchange `token` for a grant that reaches `scope`. The error is the
 /// message to answer the browser with.
-pub(crate) async fn open(
-    scope: Scope,
+pub(crate) async fn exchange(
+    scope: &Scope,
     token: &str,
     gateway: &Gateway,
-) -> Result<Felix, ServerMessage> {
-    Ok(connect(scope, token, gateway).await?.0)
-}
-
-/// As [`open`], with the optional resources the session does not reach.
-async fn connect(
-    scope: Scope,
-    token: &str,
-    gateway: &Gateway,
-) -> Result<(Felix, Vec<String>), ServerMessage> {
-    let grant = gateway
+) -> Result<Grant, ServerMessage> {
+    gateway
         .control_plane
-        .exchange(token, &scope)
+        .exchange(token, scope)
         .await
         .map_err(|refusal| match refusal {
             Refused::SignedOut => error(ErrorCode::SignedOut, "sign in again"),
             Refused::Forbidden => error(ErrorCode::Forbidden, "not allowed in this scope"),
             Refused::Unavailable(err) => error(ErrorCode::Unavailable, err),
-        })?;
+        })
+}
+
+/// Connect to Felix with `grant`. The error is the message to answer the
+/// browser with.
+pub(crate) async fn connect(
+    scope: Scope,
+    grant: Grant,
+    gateway: &Gateway,
+) -> Result<Felix, ServerMessage> {
     let principal = grant.principal.clone();
-    let missing = grant.missing.clone();
-    let felix = match &gateway.shared {
+    match &gateway.shared {
         None => gateway
             .brokers
             .connect(gateway.control_plane.tokens(grant))
@@ -518,8 +627,7 @@ async fn connect(
             Felix::shared(&shared.pool, tokens, &gateway.brokers, scope, principal).await
         }
     }
-    .map_err(|err| error(ErrorCode::Unavailable, err))?;
-    Ok((felix, missing))
+    .map_err(|err| error(ErrorCode::Unavailable, err))
 }
 
 async fn send<C: BrowserConnection>(conn: &mut C, message: &ServerMessage) -> anyhow::Result<()> {
@@ -677,8 +785,28 @@ fn error(code: ErrorCode, err: impl std::fmt::Display) -> ServerMessage {
         cache: None,
         code,
         oldest: None,
+        retry_after_ms: None,
         message: format!("{err:#}"),
     }
+}
+
+/// `message`, an error, saying which limit refused and when to retry.
+pub(crate) fn limited(mut message: ServerMessage, refused: limits::Refused) -> ServerMessage {
+    if let ServerMessage::Error {
+        code,
+        retry_after_ms,
+        message: text,
+        ..
+    } = &mut message
+    {
+        *text = refused.message().to_string();
+        if *code == ErrorCode::RateLimited {
+            *retry_after_ms = refused
+                .retry_after
+                .map(|wait| u64::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u64::MAX));
+        }
+    }
+    message
 }
 
 fn stream_error(stream: String, code: ErrorCode, err: impl std::fmt::Display) -> ServerMessage {
@@ -742,6 +870,37 @@ mod tests {
             panic!("{message:?}");
         };
         assert_eq!((code, oldest), (ErrorCode::SubscribeFailed, None));
+    }
+
+    #[test]
+    fn a_limited_refusal_says_when_to_retry_only_under_its_own_code() {
+        let refused = limits::Refused {
+            limit: Refusal::SessionRate,
+            retry_after: Some(Duration::from_micros(2_500)),
+        };
+        let new = limited(
+            stream_error("ops".into(), ErrorCode::RateLimited, ""),
+            refused,
+        );
+        let ServerMessage::Error {
+            retry_after_ms,
+            message,
+            ..
+        } = &new
+        else {
+            panic!("{new:?}");
+        };
+        assert_eq!(*retry_after_ms, Some(3), "rounded up, never early");
+        assert_eq!(message, refused.message());
+
+        let old = limited(
+            stream_error("ops".into(), ErrorCode::PublishFailed, ""),
+            refused,
+        );
+        let ServerMessage::Error { retry_after_ms, .. } = old else {
+            panic!("{old:?}");
+        };
+        assert_eq!(retry_after_ms, None, "an old browser sees no new field");
     }
 
     #[test]

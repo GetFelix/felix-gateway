@@ -110,6 +110,7 @@ below.
 
 ```toml
 # Whether a browser may slow its own connection with `throttle`. Default false.
+# A demo switch: leave it off on a public gateway.
 allow_throttle = false
 
 [scope]
@@ -138,11 +139,15 @@ ttl_s = 30
 alias = "seq"
 name = "app.seq.{scope}"
 actions = ["add"]
+
+# Optional; every key has a default. See "Write limits" below.
+[limits]
+max_payload_bytes = 65536
 ```
 
 | Key | Meaning |
 |---|---|
-| `allow_throttle` | Top level, default `false`. Whether `throttle` is allowed |
+| `allow_throttle` | Top level, default `false`. Whether `throttle` is allowed. It exists to demonstrate a slow browser, and it lets a browser hold its subscriptions' queues full, so keep it `false` on a public gateway |
 | `field` | 1 to 64 ASCII letters, digits, `-` or `_`, and not `type`, `token`, `protocol` or `features` |
 | `alias` | What messages call the resource. The same rule as `field`, unique within its kind |
 | `name` | The Felix name. `{scope}` is replaced by the scope's value, and must appear, or every scope would share the resource |
@@ -150,8 +155,94 @@ actions = ["add"]
 | `optional` | Default `false`. When `true`, a sign-in that does not reach this resource still joins, and `hello` lists the alias under `missing`. A spectator without publish rights on a player's input stream is the usual case |
 | `stamp_sender` | Streams only, default `false`. Each publish is prefixed with the publisher's Felix principal (the `sub` of its scope token) as a 2-byte big-endian length and the UTF-8 bytes, so a reader knows who sent it and a browser cannot speak for someone else |
 | `ttl_s` | Caches only. How long an entry written with `cache_put` lasts without another write, in seconds, above 0. Without it entries never expire |
+| `max_payload_bytes` | Streams and caches. The largest payload, decoded, that one `publish` or `cache_put` may carry, in place of `limits.max_payload_bytes` |
+| `writes_per_s` | Writes a second one session may make to this resource, on top of the session and principal rates below. Unset or 0 is no limit of its own |
+| `write_burst` | The burst for `writes_per_s`, above 0. Default: one second's worth |
 
 Unknown keys are an error, so a typo fails at startup instead of being ignored.
+
+## Write limits
+
+The `[limits]` table bounds what browsers can write through the gateway. It
+covers every write the gateway relays: `publish`, `cache_put`, `cache_delete`,
+`counter_add`, and the `POST /members/leave` beacon. Every key is optional,
+and the defaults below apply when the table is left out.
+
+```toml
+[limits]
+max_payload_bytes = 65536      # largest payload of one write, decoded
+sessions_per_principal = 8     # sessions one person may hold, across scopes
+sessions_per_ip = 32           # sessions one client address may hold
+trusted_proxies = 0            # proxies whose X-Forwarded-For entries to trust
+
+[limits.session]               # each session on its own
+writes_per_s = 50
+write_burst = 100
+bytes_per_s = 262144           # 256 KiB
+byte_burst = 1048576           # 1 MiB
+
+[limits.principal]             # every session of one person together
+writes_per_s = 100
+write_burst = 200
+bytes_per_s = 524288           # 512 KiB
+byte_burst = 2097152           # 2 MiB
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_payload_bytes` | `65536` | The largest payload, decoded from base64, that one `publish` or `cache_put` may carry, above 0. A stream or cache can set its own. A larger write is answered `bad_request` |
+| `sessions_per_principal` | `8` | Sessions one Felix principal may hold at once on this gateway, in any scope. 0 is no limit |
+| `sessions_per_ip` | `32` | Sessions one client address may hold at once. 0 is no limit |
+| `trusted_proxies` | `0` | How many proxies in front of the gateway append to `X-Forwarded-For`. 0 ignores the header |
+| `writes_per_s`, `write_burst` | per table | Writes a second, and how many may come at once. Every write counts as one |
+| `bytes_per_s`, `byte_burst` | per table | Payload bytes a second, and how many may come at once. A cache delete and a counter add count no bytes |
+
+Each rate is a token bucket that starts full: a session may write
+`write_burst` writes at once, then `writes_per_s` a second. A write must fit
+the session's rates, the principal's, and its resource's `writes_per_s` when
+it has one. One that does not is refused at once, spends nothing, and never
+reaches Felix; the gateway does not queue it. A rate of 0 turns that bucket
+off. `byte_burst` must be at least the largest `max_payload_bytes`, or a write
+that size could never pass, and the gateway refuses to start otherwise.
+
+A principal's rate is shared by all its sessions, and it outlasts them until
+it has refilled, so reconnecting does not buy a fresh burst. The leave beacon has
+no session and counts against its principal's rates only.
+
+How a browser learns of a refusal is in
+[docs/protocol.md](protocol.md#limits). In short: a browser that asks for the
+`rate_limited` feature gets `rate_limited` with `retry_after_ms`, and one that
+does not gets the failure code it already knows for that request.
+
+The gateway does not read a WebSocket message larger than the largest
+`max_payload_bytes` in base64 plus 16 KiB; such a message closes the
+connection.
+
+### Client addresses
+
+`sessions_per_ip` counts sessions by the address the TCP connection comes
+from. Behind a load balancer or reverse proxy that is the proxy's address, so
+set `trusted_proxies` to the number of proxies that append to
+`X-Forwarded-For`. The gateway then takes the entry that many places from the
+right, which the nearest of those proxies wrote; entries further left could
+have come from the browser. A header with fewer entries, or an entry that is
+not an address, falls back to the socket's address. Leave `trusted_proxies`
+at 0 unless every connection comes through such proxies, since a browser
+reaching the gateway directly could otherwise choose its own address.
+
+The binary always knows the socket's address. A program that embeds the
+library must serve `Gateway::router()` with
+`into_make_service_with_connect_info::<SocketAddr>()`; without that, and
+without `trusted_proxies`, the address cap is not applied.
+
+### Felix limits underneath
+
+The gateway's limits come first. Felix still applies its own: with shared
+connections, the broker keeps each user's subscription cap and publish byte
+budget on every connection (see [Shared connections](#shared-connections)),
+so a person within the gateway's rates can still get `publish_failed` or
+`subscribe_failed` from the broker. Without shared connections each session's
+own connection has the broker's per-connection limits.
 
 ## Felix permissions
 

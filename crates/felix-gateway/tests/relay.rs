@@ -60,7 +60,9 @@ async fn serve(config: Config) -> (Gateway, SocketAddr) {
     let gateway = Gateway::new(&config).expect("read the broker CA");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = gateway.router();
+    let router = gateway
+        .router()
+        .into_make_service_with_connect_info::<SocketAddr>();
     tokio::spawn(async move { axum::serve(listener, router).await });
     (gateway, addr)
 }
@@ -101,12 +103,17 @@ struct Browser {
 impl Browser {
     /// Open a connection and send `join`, without waiting for the answer.
     async fn connect(gateway: SocketAddr, room: &str, token: &str) -> Self {
+        Self::connect_with(gateway, room, token, json!([])).await
+    }
+
+    /// As [`Browser::connect`], asking for `features`.
+    async fn connect_with(gateway: SocketAddr, room: &str, token: &str, features: Value) -> Self {
         let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{gateway}/ws"))
             .await
             .expect("open WebSocket");
         let mut browser = Self { socket, next_id: 0 };
         browser
-            .send(json!({"type": "join", "protocol": 1, "features": [], "room": room, "token": token}))
+            .send(json!({"type": "join", "protocol": 1, "features": features, "room": room, "token": token}))
             .await;
         browser
     }
@@ -741,6 +748,105 @@ async fn a_throttled_browser_falls_behind_and_still_gets_every_record() {
         offsets.windows(2).all(|pair| pair[0] < pair[1]),
         "{offsets:?}"
     );
+}
+
+/// A scope like `dev/scope.toml`'s `ops` and `members`, with tight limits.
+const LIMITED_SCOPE: &str = r#"
+    [scope]
+    field = "room"
+
+    [[scope.streams]]
+    alias = "ops"
+    name = "demo.ops.{scope}"
+    actions = ["publish", "subscribe"]
+
+    [[scope.caches]]
+    alias = "members"
+    name = "demo.members.{scope}"
+    actions = ["read", "write", "watch"]
+    ttl_s = 30
+
+    [limits]
+    max_payload_bytes = 1024
+
+    [limits.session]
+    writes_per_s = 2
+    write_burst = 3
+"#;
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_burst_over_the_write_limit_is_refused_and_a_later_publish_lands() {
+    let mut config = config();
+    config.scope = Arc::new(ScopeConfig::parse(LIMITED_SCOPE).unwrap());
+    let (gateway, addr) = serve(config).await;
+    let tag = run_tag("limited");
+
+    let token = sign_in("ana").await;
+    let mut browser = Browser::connect_with(addr, "lobby", &token, json!(["rate_limited"])).await;
+    let hello = browser.recv().await;
+    assert_eq!(hello["features"], json!(["rate_limited"]), "{hello}");
+
+    // The session's burst is 3 writes; the next two are refused at once,
+    // without reaching Felix, and say when one would fit.
+    for i in 0..5 {
+        browser.publish("ops", &format!("{tag}/{i}"), true).await;
+    }
+    let mut acked = Vec::new();
+    let mut refused = Vec::new();
+    for _ in 0..5 {
+        let reply = browser.recv().await;
+        match reply["type"].as_str() {
+            Some("ack") => acked.push(reply["id"].as_u64().unwrap()),
+            Some("error") => {
+                assert_eq!(
+                    (reply["code"].as_str(), reply["stream"].as_str()),
+                    (Some("rate_limited"), Some("ops")),
+                    "{reply}"
+                );
+                let wait = reply["retry_after_ms"].as_u64().expect("retry_after_ms");
+                assert!((1..=1000).contains(&wait), "{reply}");
+                refused.push((reply["id"].as_u64().unwrap(), wait));
+            }
+            _ => panic!("unexpected reply: {reply}"),
+        }
+    }
+    acked.sort_unstable();
+    assert_eq!(acked, [0, 1, 2]);
+    let ids: Vec<u64> = refused.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, [3, 4]);
+
+    let wait = refused.iter().map(|(_, wait)| *wait).max().unwrap();
+    tokio::time::sleep(Duration::from_millis(wait + 50)).await;
+    let id = browser.publish("ops", &format!("{tag}/retry"), true).await;
+    assert_eq!(browser.recv_type("ack").await["id"], id);
+
+    // A payload over the alias's size limit is a bad request: retrying it
+    // cannot help.
+    let id = browser.publish("ops", &"x".repeat(2048), true).await;
+    let too_big = browser.recv().await;
+    assert_eq!(
+        (too_big["code"].as_str(), too_big["id"].as_u64()),
+        (Some("bad_request"), Some(id)),
+        "{too_big}"
+    );
+
+    // A browser that did not ask for `rate_limited` gets the code it knows.
+    let mut old = Browser::join(addr, "ben", "lobby").await;
+    for i in 0..4 {
+        old.publish("ops", &format!("{tag}/old/{i}"), true).await;
+    }
+    let mut codes = Vec::new();
+    for _ in 0..4 {
+        let reply = old.recv().await;
+        codes.push(reply["code"].as_str().unwrap_or("ack").to_string());
+    }
+    codes.sort();
+    assert_eq!(codes, ["ack", "ack", "ack", "publish_failed"]);
+
+    let refusals = &gateway.metrics().limits_refused;
+    assert_eq!(refusals["session_rate"], 3);
+    assert_eq!(refusals["message_size"], 1);
 }
 
 #[tokio::test]
