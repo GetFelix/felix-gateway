@@ -136,8 +136,7 @@ impl ControlPlane {
             if actor.is_none() || response.status() != StatusCode::FORBIDDEN {
                 break response;
             }
-            // A 403 is either the user's RBAC or the gateway's own token, and
-            // only the message tells them apart.
+            // A 403 is either the user's RBAC or the gateway's own token.
             let body = response.text().await.unwrap_or_default();
             if !refuses_actor(&body) {
                 return Err(Refused::Forbidden);
@@ -418,13 +417,10 @@ fn split(permissions: &[Permission]) -> (BTreeSet<&str>, BTreeSet<&str>) {
         .unzip()
 }
 
-/// Whether a 403 body from the exchange is about the gateway's actor token
-/// rather than the user. Felix says "actor token" in both such refusals.
+/// Whether a 403 body from the exchange refuses the gateway's actor token
+/// rather than the user.
 fn refuses_actor(body: &str) -> bool {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|body| body["message"].as_str().map(str::to_owned))
-        .is_some_and(|message| message.contains("actor token"))
+    serde_json::from_str::<Value>(body).is_ok_and(|body| body["code"] == "actor_refused")
 }
 
 #[derive(Deserialize)]
@@ -536,7 +532,7 @@ mod tests {
         calls: Mutex<Vec<(String, Option<String>, Value)>>,
         /// Statuses `/token/delegate` answers with before it succeeds.
         refusals: Mutex<Vec<StatusCode>>,
-        /// Statuses and messages a user's exchange answers with before it
+        /// Statuses and error codes a user's exchange answers with before it
         /// succeeds.
         user_refusals: Mutex<Vec<(StatusCode, &'static str)>>,
         exchanges: AtomicUsize,
@@ -627,10 +623,10 @@ mod tests {
     /// A user's exchange: the next refusal, or a token holding every
     /// permission asked for.
     fn user_exchange(fake: &Fake, body: &Value) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-        if let Some((status, message)) = fake.user_refusals.lock().unwrap().pop() {
+        if let Some((status, code)) = fake.user_refusals.lock().unwrap().pop() {
             return Err((
                 status,
-                Json(json!({ "code": "forbidden", "message": message })),
+                Json(json!({ "code": code, "message": "refused", "request_id": null })),
             ));
         }
         let names = |key: &str| -> Vec<String> {
@@ -826,7 +822,7 @@ mod tests {
         fake.user_refusals
             .lock()
             .unwrap()
-            .push((StatusCode::FORBIDDEN, "invalid actor token"));
+            .push((StatusCode::FORBIDDEN, "actor_refused"));
         assert!(
             control_plane
                 .exchange("ana-id-token", &lobby(), Some(&actor))
@@ -841,11 +837,8 @@ mod tests {
         assert_ne!(actors[0], actors[1], "the retry uses a fresh gateway token");
 
         fake.user_refusals.lock().unwrap().extend([
-            (
-                StatusCode::FORBIDDEN,
-                "the actor token lacks token.delegate on the tenant",
-            ),
-            (StatusCode::FORBIDDEN, "invalid actor token"),
+            (StatusCode::FORBIDDEN, "actor_refused"),
+            (StatusCode::FORBIDDEN, "actor_refused"),
         ]);
         let Err(Refused::Unavailable(err)) = control_plane
             .exchange("ana-id-token", &lobby(), Some(&actor))
@@ -863,7 +856,7 @@ mod tests {
         fake.user_refusals
             .lock()
             .unwrap()
-            .push((StatusCode::FORBIDDEN, "no permissions"));
+            .push((StatusCode::FORBIDDEN, "forbidden"));
         assert!(matches!(
             control_plane
                 .exchange("ana-id-token", &lobby(), Some(&actor))

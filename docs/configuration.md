@@ -59,8 +59,9 @@ works like this:
    connections, but with the gateway's token as the RFC 8693 `actor_token`.
    The scope token then carries `may_act: {"sub": "<gateway principal>"}`, and
    only the gateway can have it delegated. Refreshes keep `may_act`. If the
-   control plane refuses the gateway's token, the gateway gets a fresh one and
-   tries once more, then logs the error and answers `unavailable`.
+   control plane refuses the gateway's token (403 with code `actor_refused`),
+   the gateway gets a fresh one and tries once more, then logs the error and
+   answers `unavailable`.
 3. It calls `POST /v1/tenants/{tenant}/token/delegate` with the scope token.
    The control plane reissues it with the same user and grants and with
    `act: {"sub": "<gateway principal>"}`.
