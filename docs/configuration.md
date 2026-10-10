@@ -22,10 +22,24 @@ roles that let people open them are set up before the gateway starts.
 | `GATEWAY_FELIX_CA_FILE` | unset | PEM certificates to trust for the broker. Unset means the platform trust store |
 | `GATEWAY_FELIX_CONTROL_PLANE` | `http://127.0.0.1:8443` | The Felix control plane's base URL, where each browser's sign-in is exchanged |
 | `GATEWAY_WEB_DIR` | unset | A built web app to serve on every path the gateway does not route itself |
+| `GATEWAY_PING_INTERVAL_S` | `5` | Seconds between the WebSocket pings sent to each browser. 0 sends none, which also turns off `GATEWAY_PING_TIMEOUT_S` and the `browser_rtt` metric |
+| `GATEWAY_PING_TIMEOUT_S` | `30` | Seconds a session may send nothing, not even a pong, before the gateway closes it. Longer than the interval, or 0 for never |
 | `RUST_LOG` | `info` | Log filter, as `tracing-subscriber` reads it |
 
 `/oidc` returns the issuer, client ID and scopes, so the browser app needs no
 configuration of its own to sign in.
+
+The pings find browsers that are gone without having closed, such as one whose
+network dropped. Without them such a session stays open until the operating
+system gives up on the TCP connection, which takes minutes, and it keeps its
+place under `sessions_per_principal` all that time, so the person rejoining
+can be refused. A session closed for silence ends like any other: its
+subscriptions stop, writes already handed over complete, and its session slots
+are freed. A message from the browser counts as much as a pong, so a busy one
+is never closed for missing a pong. The pings also keep an idle connection
+from being cut by a proxy or load balancer with an idle timeout, commonly 60
+seconds; keep the interval well under the shortest one in front of the
+gateway.
 
 ## Shared connections
 

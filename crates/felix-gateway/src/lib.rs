@@ -45,7 +45,7 @@ use serde_json::{Map, Value, json};
 use tower_http::services::ServeDir;
 
 pub use access::Refused;
-pub use config::{Config, SharedConfig, resolve_brokers};
+pub use config::{Config, Heartbeat, SharedConfig, resolve_brokers};
 pub use metrics::{Metrics, Snapshot, Summary};
 pub use scope::ScopeConfig;
 
@@ -68,6 +68,7 @@ pub struct Gateway {
     oidc: Arc<Value>,
     web_dir: Option<PathBuf>,
     scope: Arc<ScopeConfig>,
+    heartbeat: Heartbeat,
 }
 
 impl Gateway {
@@ -115,6 +116,7 @@ impl Gateway {
             })),
             web_dir: config.web_dir.clone(),
             scope: Arc::clone(&config.scope),
+            heartbeat: config.heartbeat,
         })
     }
 

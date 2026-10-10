@@ -11,6 +11,17 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Fixed
+
+- A session whose network drops without a close is now closed after 30
+  seconds without a word from the browser, pong included, instead of when the
+  operating system gives up on the connection minutes later. It no longer
+  holds a `sessions_per_principal` slot meanwhile, so a person rejoining is
+  not refused. The gateway already pinged every 5 seconds to measure
+  `browser_rtt`; `GATEWAY_PING_INTERVAL_S` and `GATEWAY_PING_TIMEOUT_S` set
+  both times, and 0 turns either off. `Config` has a new `heartbeat` field
+  (#16).
+
 ## [0.3.1] - 2026-10-10
 
 Tested against Felix 0.6.0-preview.5. With shared connections the gateway now
