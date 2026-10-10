@@ -11,6 +11,12 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-10
+
+Tested against Felix 0.6.0-preview.5. A browser session whose network drops
+without a close is now closed by a heartbeat timeout, which frees its
+session-cap slot for a person rejoining.
+
 ### Fixed
 
 - A session whose network drops without a close is now closed after 30
