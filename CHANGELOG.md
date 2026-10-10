@@ -11,6 +11,18 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-09
+
+Built on Felix 0.6.0-preview.4, which this release is tested against. Sessions
+can share a few Felix connections, each acting as its user with a token
+delegated to the gateway; that needs Felix 0.6.0-preview.4, `token.delegate`
+for the gateway's principal and a client certificate, and per-session
+connections remain the default. Write limits are on by default, so a busy
+session can now be refused writes it was allowed before; the defaults are
+under "Write limits" in docs/configuration.md. A session that negotiates the
+`rate_limited` feature gets that error code, with a retry time, when it is
+refused.
+
 ### Added
 
 - Shared connections: when `GATEWAY_FELIX_CREDENTIAL_FILE`,
