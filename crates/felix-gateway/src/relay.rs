@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,8 +13,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use felix_client::{CacheChange, CacheWatchItem, CursorErrorReason, SubscribeCursorError};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::{Interval, Sleep};
 
-use crate::Gateway;
 use crate::access::{Grant, Refused};
 use crate::felix::Felix;
 use crate::limits::{self, SessionLimits, WriteCost};
@@ -27,8 +28,7 @@ use crate::scope::{
 };
 use crate::throttle::Throttle;
 use crate::transport::{BrowserConnection, Incoming};
-
-const PING_INTERVAL: Duration = Duration::from_secs(5);
+use crate::{Gateway, Heartbeat};
 
 /// How long a new connection may take to send its `join`.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -124,35 +124,65 @@ pub(crate) async fn run<C: BrowserConnection>(
         subscriptions: HashMap::new(),
         watches: HashMap::new(),
     };
-    let mut ping = tokio::time::interval(PING_INTERVAL);
+    let mut pulse = Pulse::new(gateway.heartbeat);
     if send(&mut conn, &hello).await.is_err() {
         return;
     }
 
     loop {
-        let outbound = tokio::select! {
-            incoming = conn.recv() => match incoming {
-                None => break,
-                Some(Incoming::RoundTrip(elapsed)) => {
-                    gateway.metrics.record_browser_rtt(elapsed);
-                    continue;
-                }
-                Some(Incoming::Message(text)) => match session.handle(&text).await {
-                    Next::Continue => continue,
-                    Next::Reply(reply) => reply,
-                    Next::Stop => break,
+        let step = tokio::select! {
+            incoming = conn.recv() => Step::Incoming(incoming),
+            Some(event) = events_rx.recv() => Step::Send(event),
+            Some(reply) = replies_rx.recv() => Step::Send(reply),
+            beat = pulse.next() => match beat {
+                Beat::Ping => Step::Ping,
+                // The loop may have been busy past the deadline with a frame
+                // already waiting, so look once more before giving up.
+                Beat::Silent => tokio::select! {
+                    biased;
+                    incoming = conn.recv() => Step::Incoming(incoming),
+                    () = std::future::ready(()) => {
+                        tracing::debug!("closing a session silent for {:?}", gateway.heartbeat.timeout);
+                        break;
+                    }
                 },
             },
-            Some(event) = events_rx.recv() => event,
-            Some(reply) = replies_rx.recv() => reply,
-            _ = ping.tick() => {
-                if conn.ping().await.is_err() {
+        };
+        let outbound = match step {
+            Step::Incoming(incoming) => {
+                pulse.heard();
+                match incoming {
+                    None => break,
+                    Some(Incoming::RoundTrip(elapsed)) => {
+                        gateway.metrics.record_browser_rtt(elapsed);
+                        continue;
+                    }
+                    Some(Incoming::Message(text)) => match session.handle(&text).await {
+                        Next::Continue => continue,
+                        Next::Reply(reply) => reply,
+                        Next::Stop => break,
+                    },
+                }
+            }
+            Step::Send(message) => message,
+            Step::Ping => {
+                // A send to a vanished browser can wait on a full TCP buffer
+                // for minutes, so the silence timeout bounds it.
+                let sent = tokio::select! {
+                    sent = conn.ping() => sent.is_ok(),
+                    () = pulse.silent() => false,
+                };
+                if !sent {
                     break;
                 }
                 continue;
             }
         };
-        if send(&mut conn, &outbound).await.is_err() {
+        let sent = tokio::select! {
+            sent = send(&mut conn, &outbound) => sent.is_ok(),
+            () = pulse.silent() => false,
+        };
+        if !sent {
             break;
         }
     }
@@ -170,6 +200,77 @@ pub(crate) async fn run<C: BrowserConnection>(
     // cache delete lands; only their replies are lost.
     drop(writes);
     let _ = writer.await;
+}
+
+/// When to ping the browser, and when its silence has gone on too long. Any
+/// frame the session reads counts as hearing from it: a pong is what an idle
+/// browser sends, and a message proves the connection works just as well.
+struct Pulse {
+    ping: Option<Interval>,
+    timeout: Duration,
+    deadline: Option<Pin<Box<Sleep>>>,
+}
+
+enum Beat {
+    Ping,
+    Silent,
+}
+
+/// What the relay loop does next.
+enum Step {
+    Incoming(Option<Incoming>),
+    Send(ServerMessage),
+    Ping,
+}
+
+impl Pulse {
+    fn new(heartbeat: Heartbeat) -> Self {
+        let on = !heartbeat.interval.is_zero();
+        Self {
+            ping: on.then(|| tokio::time::interval(heartbeat.interval)),
+            timeout: heartbeat.timeout,
+            deadline: (on && !heartbeat.timeout.is_zero())
+                .then(|| Box::pin(tokio::time::sleep(heartbeat.timeout))),
+        }
+    }
+
+    fn heard(&mut self) {
+        if let Some(deadline) = &mut self.deadline {
+            deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + self.timeout);
+        }
+    }
+
+    /// The next ping is due, or the browser has been silent too long.
+    /// Cancel-safe.
+    async fn next(&mut self) -> Beat {
+        let Self { ping, deadline, .. } = self;
+        let tick = async {
+            match ping {
+                Some(ping) => ping.tick().await,
+                None => std::future::pending().await,
+            }
+        };
+        let silent = async {
+            match deadline {
+                Some(deadline) => deadline.as_mut().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = tick => Beat::Ping,
+            () = silent => Beat::Silent,
+        }
+    }
+
+    /// Resolves once the browser has been silent too long.
+    async fn silent(&mut self) {
+        match &mut self.deadline {
+            Some(deadline) => deadline.as_mut().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 impl Session {
@@ -840,6 +941,53 @@ fn with_id(id: u64, mut message: ServerMessage) -> ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pulse(interval_ms: u64, timeout_ms: u64) -> Pulse {
+        Pulse::new(Heartbeat {
+            interval: Duration::from_millis(interval_ms),
+            timeout: Duration::from_millis(timeout_ms),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_browser_is_pinged_until_the_timeout() {
+        let start = tokio::time::Instant::now();
+        let mut pulse = pulse(1000, 2500);
+        let mut pings = Vec::new();
+        while let Beat::Ping = pulse.next().await {
+            pings.push(start.elapsed().as_millis());
+        }
+        assert_eq!(pings, [0, 1000, 2000]);
+        assert_eq!(start.elapsed(), Duration::from_millis(2500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_browser_that_answers_is_kept() {
+        let start = tokio::time::Instant::now();
+        let mut pulse = pulse(1000, 2500);
+        for _ in 0..20 {
+            assert!(matches!(pulse.next().await, Beat::Ping));
+            pulse.heard();
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(19));
+        // Once it stops answering, the timeout runs from the last answer.
+        while let Beat::Ping = pulse.next().await {}
+        assert_eq!(start.elapsed(), Duration::from_millis(21_500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_turns_pings_or_the_timeout_off() {
+        let mut off = pulse(0, 2500);
+        let next = tokio::time::timeout(Duration::from_secs(3600), off.next());
+        assert!(next.await.is_err(), "no pings and no timeout");
+
+        let mut never_silent = pulse(1000, 0);
+        for _ in 0..100 {
+            assert!(matches!(never_silent.next().await, Beat::Ping));
+        }
+        let silent = tokio::time::timeout(Duration::from_secs(3600), never_silent.silent());
+        assert!(silent.await.is_err());
+    }
 
     #[test]
     fn a_trimmed_offset_is_reported_with_the_oldest_left() {

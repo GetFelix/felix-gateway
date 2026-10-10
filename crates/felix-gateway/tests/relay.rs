@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use felix_client::{CacheWatchFilter, TokenFuture, TokenProvider};
-use felix_gateway::{Config, Gateway, Refused, ScopeConfig, SharedConfig};
+use felix_gateway::{Config, Gateway, Heartbeat, Refused, ScopeConfig, SharedConfig};
 use felix_wire::AckMode;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -847,6 +847,65 @@ async fn a_burst_over_the_write_limit_is_refused_and_a_later_publish_lands() {
     let refusals = &gateway.metrics().limits_refused;
     assert_eq!(refusals["session_rate"], 3);
     assert_eq!(refusals["message_size"], 1);
+}
+
+/// One session per person, pinged every 200 ms and closed after a second of
+/// silence.
+fn heartbeat_config() -> Config {
+    let mut config = config();
+    let scope = std::fs::read_to_string(std::env::var("GATEWAY_SCOPE_FILE").unwrap()).unwrap();
+    config.scope = Arc::new(
+        ScopeConfig::parse(&format!("{scope}\n[limits]\nsessions_per_principal = 1\n")).unwrap(),
+    );
+    config.heartbeat = Heartbeat {
+        interval: Duration::from_millis(200),
+        timeout: Duration::from_secs(1),
+    };
+    config
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_browser_that_stops_answering_pings_is_closed_and_frees_its_session() {
+    let (_gateway, addr) = serve(heartbeat_config()).await;
+    // A socket that is not read never answers a ping, like a browser whose
+    // network dropped.
+    let mut gone = Browser::join(addr, "cleo", "lobby").await;
+    let token = sign_in("cleo").await;
+    let mut refused = Browser::connect(addr, "lobby", &token).await;
+    assert_eq!(refused.refusal().await["code"], "unavailable");
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    Browser::join(addr, "cleo", "lobby").await;
+    let closed = tokio::time::timeout(WAIT, async {
+        while let Some(Ok(frame)) = gone.socket.next().await {
+            if matches!(frame, Message::Close(_)) {
+                break;
+            }
+        }
+    });
+    assert!(closed.await.is_ok(), "the gateway closed the silent socket");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_browser_that_answers_pings_keeps_its_session() {
+    let (_gateway, addr) = serve(heartbeat_config()).await;
+    let mut browser = Browser::join(addr, "cleo", "lobby").await;
+    // Reading the socket answers pings, as a browser does on its own.
+    let mut pings = 0;
+    let until = tokio::time::Instant::now() + Duration::from_millis(2500);
+    while let Ok(frame) = tokio::time::timeout_at(until, browser.socket.next()).await {
+        match frame {
+            Some(Ok(Message::Ping(_))) => pings += 1,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+    assert!(pings >= 5, "{pings} pings");
+    assert_eq!(
+        browser.subscribe("ops", json!("live")).await["stream"],
+        "ops"
+    );
 }
 
 #[tokio::test]

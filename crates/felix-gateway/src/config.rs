@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -52,6 +53,59 @@ pub struct Config {
     /// Shared connections, set when the gateway has a credential and a client
     /// certificate of its own. `None` gives every session its own connection.
     pub shared: Option<SharedConfig>,
+    /// `GATEWAY_PING_INTERVAL_S` and `GATEWAY_PING_TIMEOUT_S`: how often a
+    /// browser is pinged, and how long a silent one is kept.
+    pub heartbeat: Heartbeat,
+}
+
+/// How the gateway notices a browser that has gone without closing, such as
+/// one whose network dropped. Every interval it sends a WebSocket ping, which
+/// browsers answer without page code; a session that has sent nothing, not
+/// even a pong, for `timeout` is closed like any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heartbeat {
+    /// Time between pings. Zero sends none and turns the timeout off too,
+    /// since an idle browser would then have nothing to answer.
+    pub interval: Duration,
+    /// How long a session may be silent before it is closed. Zero never
+    /// closes one for silence.
+    pub timeout: Duration,
+}
+
+impl Default for Heartbeat {
+    /// A ping every 5 seconds, well inside the 60-second idle timeout common
+    /// on proxies and load balancers, and closed after 30 silent seconds, six
+    /// unanswered pings.
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(5),
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl Heartbeat {
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let seconds = |name: &str, default: Duration| match var(name) {
+            Some(value) => value
+                .parse::<u64>()
+                .map(Duration::from_secs)
+                .with_context(|| format!("{name} must be a whole number of seconds")),
+            None => Ok(default),
+        };
+        let default = Self::default();
+        let heartbeat = Self {
+            interval: seconds("GATEWAY_PING_INTERVAL_S", default.interval)?,
+            timeout: seconds("GATEWAY_PING_TIMEOUT_S", default.timeout)?,
+        };
+        anyhow::ensure!(
+            heartbeat.interval.is_zero()
+                || heartbeat.timeout.is_zero()
+                || heartbeat.timeout > heartbeat.interval,
+            "GATEWAY_PING_TIMEOUT_S must be longer than GATEWAY_PING_INTERVAL_S, or 0"
+        );
+        Ok(heartbeat)
+    }
 }
 
 /// What the gateway needs to carry many users over a few Felix connections:
@@ -140,6 +194,7 @@ impl Config {
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from)
         };
+        let set = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
         let listen = var("GATEWAY_LISTEN", "127.0.0.1:8787")
             .parse()
             .context("parse GATEWAY_LISTEN")?;
@@ -171,9 +226,8 @@ impl Config {
             scope: Arc::new(ScopeConfig::load(
                 &path("GATEWAY_SCOPE_FILE").context("set GATEWAY_SCOPE_FILE to the scope file")?,
             )?),
-            shared: SharedConfig::from_vars(|name| {
-                std::env::var(name).ok().filter(|value| !value.is_empty())
-            })?,
+            shared: SharedConfig::from_vars(set)?,
+            heartbeat: Heartbeat::from_vars(set)?,
         })
     }
 }
@@ -231,6 +285,32 @@ mod tests {
         two.pop();
         two.push(("GATEWAY_FELIX_SHARED_CONNECTIONS", "0"));
         assert!(shared(&two).is_err());
+    }
+
+    fn heartbeat(vars: &[(&str, &str)]) -> Result<Heartbeat> {
+        Heartbeat::from_vars(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn the_heartbeat_reads_seconds_and_wants_a_timeout_past_the_interval() {
+        assert_eq!(heartbeat(&[]).unwrap(), Heartbeat::default());
+        let set = heartbeat(&[
+            ("GATEWAY_PING_INTERVAL_S", "20"),
+            ("GATEWAY_PING_TIMEOUT_S", "60"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (set.interval, set.timeout),
+            (Duration::from_secs(20), Duration::from_secs(60))
+        );
+        assert!(heartbeat(&[("GATEWAY_PING_INTERVAL_S", "0")]).is_ok());
+        assert!(heartbeat(&[("GATEWAY_PING_TIMEOUT_S", "0")]).is_ok());
+        assert!(heartbeat(&[("GATEWAY_PING_TIMEOUT_S", "5")]).is_err());
+        assert!(heartbeat(&[("GATEWAY_PING_INTERVAL_S", "soon")]).is_err());
     }
 
     #[test]

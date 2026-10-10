@@ -104,6 +104,13 @@ Messages sent after `join` and before `hello` wait for the answer, so a page
 can send its first `subscribe` right after `join`. A connection that sends
 nothing for 10 seconds is closed.
 
+After `hello` the gateway sends a WebSocket ping every 5 seconds and closes a
+session that has sent nothing, not even a pong, for 30 seconds. Browsers and
+Node's `WebSocket` answer pings without page code, so a page need not do
+anything; a session is closed this way only when its connection has gone
+quiet, such as after a network drop. Both times are settings, in
+[docs/configuration.md](configuration.md#environment).
+
 ### `subscribe`
 
 ```json
@@ -464,7 +471,7 @@ An in-memory stream has nothing to replay, so its dropped events are gone.
 
 | Histogram | What it times |
 |---|---|
-| `browser_rtt` | Browser to gateway and back: a WebSocket ping every 5 seconds per connection, answered by the browser itself |
+| `browser_rtt` | Browser to gateway and back: the WebSocket ping sent every `GATEWAY_PING_INTERVAL_S` (default 5 seconds) per connection, answered by the browser itself |
 | `felix_publish_ack` | Gateway to Felix and back, one histogram per stream alias in the scope file: from handing an acknowledged publish to Felix until its ack |
 
 `limits_refused` counts refusals since the gateway started, by the limit that
