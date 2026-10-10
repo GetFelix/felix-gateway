@@ -3,6 +3,10 @@
 //! stack running; see the README, or run `cargo test -- --include-ignored`
 //! with the `GATEWAY_*` variables set. `GATEWAY_SCOPE_FILE` must be the test
 //! scope file, `dev/scope.toml`, which matches what `dev/seed.mjs` creates.
+//!
+//! With `GATEWAY_FELIX_CREDENTIAL_FILE` and the client certificate set, the
+//! same tests run over shared connections. The tests named `shared_*` always
+//! do, against the dev stack's second broker.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use felix_client::{CacheWatchFilter, TokenFuture, TokenProvider};
-use felix_gateway::{Config, Gateway, Refused, ScopeConfig};
+use felix_gateway::{Config, Gateway, Refused, ScopeConfig, SharedConfig};
 use felix_wire::AckMode;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -28,6 +32,28 @@ fn config() -> Config {
 
 async fn start_gateway() -> (Gateway, SocketAddr) {
     serve(config()).await
+}
+
+/// Where `dev/up.sh` leaves certificates and credentials.
+fn dev_state(file: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../dev/state")
+        .join(file)
+}
+
+/// The gateway on one shared connection to the broker that binds tokens to
+/// client certificates.
+fn shared_config() -> Config {
+    let mut config = config();
+    config.brokers = vec!["127.0.0.1:5001".into()];
+    config.ca_file = Some(dev_state("ca.pem"));
+    config.shared = Some(SharedConfig {
+        credential_file: dev_state("gateway.token"),
+        client_cert: dev_state("gateway-cert.pem"),
+        client_key: dev_state("gateway-key.pem"),
+        connections: 1,
+    });
+    config
 }
 
 async fn serve(config: Config) -> (Gateway, SocketAddr) {
@@ -715,6 +741,119 @@ async fn a_throttled_browser_falls_behind_and_still_gets_every_record() {
         offsets.windows(2).all(|pair| pair[0] < pair[1]),
         "{offsets:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn shared_users_on_one_connection_each_have_their_own_subscription_cap() {
+    let (_gateway, addr) = serve(shared_config()).await;
+    let tag = run_tag("shared-cap");
+    // The broker allows each user 6 subscriptions on a connection. Ana takes
+    // all of hers over three sessions.
+    let mut anas = Vec::new();
+    for _ in 0..3 {
+        let mut ana = Browser::open(addr).await;
+        ana.subscribe("ops", json!("live")).await;
+        ana.subscribe("presence", json!("live")).await;
+        anas.push(ana);
+    }
+    let mut over = Browser::open(addr).await;
+    over.send(json!({"type": "subscribe", "stream": "ops", "from": "live"}))
+        .await;
+    let refused = over.recv().await;
+    assert_eq!(
+        (refused["code"].as_str(), refused["stream"].as_str()),
+        (Some("subscribe_failed"), Some("ops")),
+        "{refused}"
+    );
+
+    // Ben shares the connection and still has room of his own.
+    let mut ben = Browser::join(addr, "ben", "lobby").await;
+    ben.subscribe("ops", json!("live")).await;
+    ben.subscribe("presence", json!("live")).await;
+    let id = ben.publish("ops", &format!("{tag}/ben"), true).await;
+    assert_eq!(ben.recv_type("ack").await["id"], id);
+    let (events, _) = anas[0].events(&tag, 1).await;
+    assert_eq!(events[0].1, format!("{tag}/ben"));
+}
+
+/// `subject`, a scope token, delegated to the gateway signed in as `actor`.
+async fn delegate_as(actor: &str, subject: &str) -> String {
+    let config = config();
+    let base = format!(
+        "{}/v1/tenants/{}/token",
+        config.control_plane, config.tenant
+    );
+    let http = reqwest::Client::new();
+    let exchanged: Value = http
+        .post(format!("{base}/exchange"))
+        .bearer_auth(sign_in(actor).await)
+        .json(&json!({"audience": "felix-controlplane", "requested": ["token.delegate"]}))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("the gateway's sign-in is exchanged")
+        .json()
+        .await
+        .unwrap();
+    let delegated: Value = http
+        .post(format!("{base}/delegate"))
+        .bearer_auth(exchanged["felix_token"].as_str().unwrap())
+        .json(&json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": subject,
+        }))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("the token is delegated")
+        .json()
+        .await
+        .unwrap();
+    delegated["access_token"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn shared_connections_refuse_a_token_not_delegated_to_the_gateway() {
+    let (gateway, _addr) = serve(shared_config()).await;
+    let config = config();
+    let ana = gateway
+        .scope_token(&sign_in("ana").await, "lobby")
+        .await
+        .expect("ana may open the lobby");
+
+    let undelegated = gateway.attach_shared(Arc::new(Fixed(ana.clone()))).await;
+    assert!(
+        undelegated.is_err(),
+        "a token without act passed on the gateway's certificate"
+    );
+    let elsewhere = delegate_as("demo-other-gateway", &ana).await;
+    let elsewhere = gateway.attach_shared(Arc::new(Fixed(elsewhere))).await;
+    assert!(
+        elsewhere.is_err(),
+        "a token whose act is another principal passed on the gateway's certificate"
+    );
+
+    let ours = delegate_as("demo-gateway", &ana).await;
+    let identity = gateway
+        .attach_shared(Arc::new(Fixed(ours)))
+        .await
+        .expect("a token delegated to the gateway passes");
+    identity
+        .client()
+        .publisher()
+        .await
+        .unwrap()
+        .publish(
+            &config.tenant,
+            &config.namespace,
+            "demo.ops.lobby",
+            run_tag("delegated").into_bytes(),
+            AckMode::PerMessage,
+        )
+        .await
+        .expect("and publishes with ana's grants");
 }
 
 async fn http_post(addr: SocketAddr, path: &str, body: &str) -> u16 {

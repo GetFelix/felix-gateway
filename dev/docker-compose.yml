@@ -1,7 +1,12 @@
-# Felix for local development and CI: a control plane, one broker, a stand-in
-# IdP, and a one-shot seed that creates the rooms in dev/scope.toml, their
-# members and the broker's credential.
-# `dev/up.sh` starts it and waits until the broker is ready.
+# Felix for local development and CI: a control plane, two brokers, a
+# stand-in IdP, and a one-shot seed that creates the rooms in dev/scope.toml,
+# their members, the brokers' credential and the gateway's.
+# `dev/up.sh` makes the certificates, starts it and waits until the brokers
+# are ready.
+#
+# `broker` serves any client. `broker-mtls` asks for a client certificate and
+# binds tokens to it, which is what shared connections need; its per-user
+# subscription cap is small so the tests can reach it.
 name: felix-gateway
 
 services:
@@ -22,7 +27,7 @@ services:
       retries: 15
 
   controlplane:
-    image: ghcr.io/getfelix/felix-controlplane:0.6.0-preview.2
+    image: ghcr.io/getfelix/felix-controlplane:0.6.0-preview.4
     environment:
       # In-memory store: a restart of the stack starts from nothing.
       FELIX_BOOTSTRAP_ENABLED: "true"
@@ -51,7 +56,7 @@ services:
         condition: service_healthy
 
   broker:
-    image: ghcr.io/getfelix/felix-broker:0.6.0-preview.2
+    image: ghcr.io/getfelix/felix-broker:0.6.0-preview.4
     environment:
       FELIX_CONTROLPLANE_URL: http://controlplane:8443
       FELIX_NODE_TOKEN_FILE: /state/node.token
@@ -81,5 +86,35 @@ services:
       seed:
         condition: service_completed_successfully
 
+  broker-mtls:
+    image: ghcr.io/getfelix/felix-broker:0.6.0-preview.4
+    environment:
+      FELIX_CONTROLPLANE_URL: http://controlplane:8443
+      FELIX_NODE_TOKEN_FILE: /state/node.token
+      FELIX_DURABLE_STORAGE_DIR: /var/lib/felix
+      FELIX_TLS_CERT: /state/broker-mtls-cert.pem
+      FELIX_TLS_KEY: /state/broker-mtls-key.pem
+      FELIX_TLS_CLIENT_CA: /state/ca.pem
+      FELIX_TLS_CLIENT_CERT_BIND_SUBJECT: "true"
+      FELIX_MAX_SUBSCRIPTIONS_PER_CONN: "6"
+      FELIX_MAX_SUBSCRIPTIONS_PER_CONN_TOTAL: "64"
+      FELIX_QUIC_LISTENERS: "1"
+      FELIX_ACK_ON_COMMIT: "true"
+      FELIX_EVENT_BATCH_MAX_EVENTS: "8"
+      FELIX_EVENT_BATCH_MAX_DELAY_US: "100"
+      FELIX_FANOUT_BATCH: "8"
+      FELIX_SUB_QUEUE_BOUND: "8192"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:5001:5000/udp"
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ./state:/state
+      - felix-data-mtls:/var/lib/felix
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
 volumes:
   felix-data:
+  felix-data-mtls:

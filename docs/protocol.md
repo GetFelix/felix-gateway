@@ -89,7 +89,7 @@ then closes the connection:
 |---|---|
 | `forbidden` | The signed-in person may not open this scope, or it does not exist |
 | `signed_out` | The ID token is missing, expired or from a provider the tenant does not trust |
-| `unavailable` | The control plane or the brokers could not be reached. Reconnect as after any drop |
+| `unavailable` | The control plane or the brokers could not be reached, or, on a gateway with shared connections, the control plane would not delegate the token to the gateway. Reconnect as after any drop |
 | `unsupported` | The `join` asked for a protocol version this gateway does not speak |
 | `bad_request` | The first message was not a `join`, or the scope's value is not allowed |
 
@@ -252,6 +252,11 @@ narrowed on its own. A second connection can read a stream from offset 0 for
 history while the first keeps its live subscription. Closing it ends the read;
 the gateway keeps nothing about it.
 
+On a gateway with shared connections, one person's sessions on the same Felix
+connection share that person's broker limits: the subscription and cache watch
+cap, and the bytes of publishes not yet answered. Other people's sessions never
+count against them.
+
 ## Gateway to browser
 
 ### `hello`
@@ -368,7 +373,7 @@ The connection stays open after any error except an answer to `join`.
 | `bad_request` | The message did not parse, its payload was not base64, a key or scope was not allowed, or it named an alias the scope file does not have or an action that alias does not allow |
 | `unsupported` | The message type is not one this gateway knows, a `join` asked for another protocol version, or `throttle` is not allowed |
 | `publish_failed` | Felix refused or lost the publish. It may have landed |
-| `subscribe_failed` | Felix refused the subscription |
+| `subscribe_failed` | Felix refused the subscription, for instance because this person already holds as many subscriptions and cache watches as the broker allows one user on a connection |
 | `subscription_ended` | A subscription stopped delivering. Subscribe again from the last offset handled plus one |
 | `counter_failed` | Felix refused or lost a counter add. It may have been counted |
 | `cache_failed` | Felix refused or lost a cache read, write or delete |

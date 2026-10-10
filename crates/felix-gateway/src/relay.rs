@@ -497,15 +497,29 @@ async fn connect(
         })?;
     let principal = grant.principal.clone();
     let missing = grant.missing.clone();
-    let client = gateway
-        .brokers
-        .connect(gateway.control_plane.tokens(grant))
-        .await
-        .map_err(|err| error(ErrorCode::Unavailable, err))?;
-    Ok((
-        Felix::new(client, &gateway.brokers, scope, principal),
-        missing,
-    ))
+    let felix = match &gateway.shared {
+        None => gateway
+            .brokers
+            .connect(gateway.control_plane.tokens(grant))
+            .await
+            .map(|client| Felix::new(client, &gateway.brokers, scope, principal)),
+        Some(shared) => {
+            let delegated =
+                shared.actor.delegate(&grant.felix_token).await.map_err(
+                    |refusal| match refusal {
+                        Refused::Unavailable(err) => error(ErrorCode::Unavailable, err),
+                        _ => error(ErrorCode::Unavailable, "the gateway cannot act for you"),
+                    },
+                )?;
+            let tokens =
+                gateway
+                    .control_plane
+                    .delegated_tokens(grant, delegated, Arc::clone(&shared.actor));
+            Felix::shared(&shared.pool, tokens, &gateway.brokers, scope, principal).await
+        }
+    }
+    .map_err(|err| error(ErrorCode::Unavailable, err))?;
+    Ok((felix, missing))
 }
 
 async fn send<C: BrowserConnection>(conn: &mut C, message: &ServerMessage) -> anyhow::Result<()> {

@@ -11,8 +11,26 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Added
+
+- Shared connections: when `GATEWAY_FELIX_CREDENTIAL_FILE`,
+  `GATEWAY_FELIX_CLIENT_CERT` and `GATEWAY_FELIX_CLIENT_KEY` are set, sessions
+  share a few Felix connections (`GATEWAY_FELIX_SHARED_CONNECTIONS`, default
+  4), each acting as its user with a token delegated to the gateway, and
+  re-delegated at each refresh. Needs Felix 0.6.0-preview.4, `token.delegate`
+  for the gateway's principal, and a client certificate issued to it. Setting
+  only some of the three stops the gateway at startup. Per-session connections
+  remain the default (#8).
+- `Gateway::attach_shared`, which attaches an identity to a shared connection
+  with given tokens (#8).
+- `dev/up.sh` starts a second broker on port 5001 that asks for client
+  certificates and binds tokens to them, with certificates for it and the
+  gateway (#8).
+
 ### Changed
 
+- Built on felix-client and felix-wire 0.6.0-preview.4, and the dev stack runs
+  the 0.6.0-preview.4 images (#8).
 - `dev/up.sh` runs on Docker or Podman, and the docs show the Podman form.
 
 ## [0.2.0] - 2026-10-04

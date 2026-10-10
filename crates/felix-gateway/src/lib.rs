@@ -11,7 +11,8 @@
 //! - `throttle`: a pretend slow link, for the slow-client demonstration.
 //! - `access`: each session's sign-in exchanged for a token narrowed to its scope.
 //! - `scope`: the scope file, and the Felix resources one scope owns.
-//! - `felix`: the brokers, and one session's connection to them.
+//! - `felix`: the brokers, and one session's connection to them, its own or
+//!   shared.
 //! - `metrics`: latency of the browser leg and the Felix leg, apart.
 
 mod access;
@@ -39,21 +40,23 @@ use serde_json::{Map, Value, json};
 use tower_http::services::ServeDir;
 
 pub use access::Refused;
-pub use config::{Config, resolve_brokers};
+pub use config::{Config, SharedConfig, resolve_brokers};
 pub use metrics::{Metrics, Snapshot, Summary};
 pub use scope::ScopeConfig;
 
-use access::ControlPlane;
-use felix::Brokers;
+use access::{Actor, ControlPlane};
+use felix::{Brokers, Pool};
 use scope::{BAD_NAME, CacheAction, Scope, valid_name};
 use transport::websocket::WebSocketConnection;
 
-/// A gateway ready to serve browsers. It opens a Felix connection per
-/// session, with that session's own credentials.
+/// A gateway ready to serve browsers. Each session reaches Felix with its own
+/// user's credentials, on a connection of its own or, when
+/// [`Config::shared`] is set, as its user on a connection the gateway shares.
 #[derive(Clone)]
 pub struct Gateway {
     brokers: Arc<Brokers>,
     control_plane: ControlPlane,
+    shared: Option<Shared>,
     metrics: Arc<Metrics>,
     oidc: Arc<Value>,
     web_dir: Option<PathBuf>,
@@ -65,15 +68,29 @@ impl Gateway {
     /// in `config`.
     ///
     /// # Errors
-    /// When the CA file cannot be read.
+    /// When the CA file, or the client certificate or key of shared
+    /// connections, cannot be read.
     pub fn new(config: &Config) -> Result<Self> {
+        let brokers = Arc::new(Brokers::new(config)?);
+        let control_plane =
+            ControlPlane::new(&config.control_plane, &config.tenant, &config.namespace);
+        let shared = match &config.shared {
+            Some(shared) => {
+                let actor = Arc::new(Actor::new(
+                    control_plane.clone(),
+                    shared.credential_file.clone(),
+                ));
+                Some(Shared {
+                    pool: Arc::new(Pool::new(Arc::clone(&brokers), shared, Arc::clone(&actor))?),
+                    actor,
+                })
+            }
+            None => None,
+        };
         Ok(Self {
-            brokers: Arc::new(Brokers::new(config)?),
-            control_plane: ControlPlane::new(
-                &config.control_plane,
-                &config.tenant,
-                &config.namespace,
-            ),
+            brokers,
+            control_plane,
+            shared,
             metrics: Arc::new(Metrics::new(
                 config.scope.scope.streams.iter().map(|s| s.alias.as_str()),
             )),
@@ -127,6 +144,42 @@ impl Gateway {
     pub async fn connect_felix(&self, tokens: Arc<dyn TokenProvider>) -> Result<ClusterClient> {
         self.brokers.connect(tokens).await
     }
+
+    /// A client acting with `tokens` on one of the gateway's shared
+    /// connections, the way a session's identity is attached. The tokens are
+    /// presented as they are, without delegation.
+    ///
+    /// # Errors
+    /// When shared connections are not configured, or the broker refuses the
+    /// tokens on the gateway's connection.
+    pub async fn attach_shared(&self, tokens: Arc<dyn TokenProvider>) -> Result<SharedIdentity> {
+        let shared = self
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("shared connections are not configured"))?;
+        Ok(SharedIdentity(
+            felix::attach_identity(&shared.pool, tokens).await?,
+        ))
+    }
+}
+
+/// One identity on a shared connection, from [`Gateway::attach_shared`].
+/// Dropping it closes its streams and leaves the connection.
+pub struct SharedIdentity(Arc<felix::Identity>);
+
+impl SharedIdentity {
+    /// The client that acts as this identity.
+    pub fn client(&self) -> &felix_client::Client {
+        &self.0.client
+    }
+}
+
+/// What shared connections need: the pool, and the gateway's own credential
+/// to delegate users' tokens with.
+#[derive(Clone)]
+struct Shared {
+    pool: Arc<Pool>,
+    actor: Arc<Actor>,
 }
 
 async fn websocket(State(gateway): State<Gateway>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
