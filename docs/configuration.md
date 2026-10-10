@@ -283,7 +283,7 @@ docker run -p 8787:8787 \
   -e GATEWAY_FELIX_BROKERS=felix-broker:5000 \
   -e GATEWAY_FELIX_CONTROL_PLANE=https://felix-controlplane:8443 \
   -v "$PWD/scope.toml:/etc/felix-gateway/scope.toml:ro" \
-  ghcr.io/getfelix/felix-gateway:0.3.0
+  ghcr.io/getfelix/felix-gateway:0.3.1
 ```
 
 For shared connections, mount the credential, certificate and key too, and set
