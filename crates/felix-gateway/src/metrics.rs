@@ -1,8 +1,9 @@
 //! Latency of the gateway's two legs, kept apart so a slow request can be
-//! blamed on the right hop.
+//! blamed on the right hop, and counts of what the write limits refused.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
@@ -13,6 +14,41 @@ pub struct Metrics {
     browser_rtt: Mutex<Histogram<u64>>,
     /// Keyed by stream alias.
     felix_publish_ack: HashMap<String, Mutex<Histogram<u64>>>,
+    /// Indexed by [`Refusal`].
+    refused: [AtomicU64; Refusal::ALL.len()],
+}
+
+/// Which limit refused a write or a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    MessageSize,
+    SessionRate,
+    AliasRate,
+    PrincipalRate,
+    PrincipalSessions,
+    IpSessions,
+}
+
+impl Refusal {
+    const ALL: [Self; 6] = [
+        Self::MessageSize,
+        Self::SessionRate,
+        Self::AliasRate,
+        Self::PrincipalRate,
+        Self::PrincipalSessions,
+        Self::IpSessions,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::MessageSize => "message_size",
+            Self::SessionRate => "session_rate",
+            Self::AliasRate => "alias_rate",
+            Self::PrincipalRate => "principal_rate",
+            Self::PrincipalSessions => "principal_sessions",
+            Self::IpSessions => "ip_sessions",
+        }
+    }
 }
 
 /// Percentiles of one histogram, in microseconds.
@@ -32,6 +68,8 @@ pub struct Snapshot {
     pub browser_rtt: Summary,
     /// Gateway to Felix and back: an acknowledged publish, for each stream.
     pub felix_publish_ack: BTreeMap<String, Summary>,
+    /// Writes and sessions refused by each limit since the gateway started.
+    pub limits_refused: BTreeMap<String, u64>,
 }
 
 fn histogram() -> Mutex<Histogram<u64>> {
@@ -48,7 +86,12 @@ impl Metrics {
                 .into_iter()
                 .map(|stream| (stream.to_string(), histogram()))
                 .collect(),
+            refused: Default::default(),
         }
+    }
+
+    pub(crate) fn record_refusal(&self, refusal: Refusal) {
+        self.refused[refusal as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_browser_rtt(&self, elapsed: Duration) {
@@ -69,6 +112,13 @@ impl Metrics {
                 .felix_publish_ack
                 .iter()
                 .map(|(stream, histogram)| (stream.clone(), summarize(histogram)))
+                .collect(),
+            limits_refused: Refusal::ALL
+                .iter()
+                .map(|refusal| {
+                    let count = self.refused[*refusal as usize].load(Ordering::Relaxed);
+                    (refusal.name().to_string(), count)
+                })
                 .collect(),
         }
     }

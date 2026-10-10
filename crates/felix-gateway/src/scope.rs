@@ -10,6 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
+use crate::limits::LimitsConfig;
+
 /// Where a scope's value goes in a resource name.
 const PLACEHOLDER: &str = "{scope}";
 
@@ -26,6 +28,9 @@ pub struct ScopeConfig {
     /// Whether a browser may slow its own connection with `throttle`.
     #[serde(default)]
     pub(crate) allow_throttle: bool,
+    /// Write rates, payload sizes and session caps.
+    #[serde(default)]
+    pub(crate) limits: LimitsConfig,
     pub(crate) scope: ScopeSpec,
 }
 
@@ -58,11 +63,29 @@ pub(crate) struct Resource<A> {
     pub(crate) stamp_sender: bool,
     /// Caches only: how long a written entry lasts without another write.
     ttl_s: Option<u64>,
+    /// Streams and caches: the largest payload one write may carry, in place
+    /// of `limits.max_payload_bytes`.
+    max_payload_bytes: Option<usize>,
+    /// Writes a second one session may make to this resource.
+    writes_per_s: Option<u64>,
+    /// The burst for `writes_per_s`. Default: one second's worth.
+    write_burst: Option<u64>,
 }
 
 impl<A> Resource<A> {
     pub(crate) fn ttl(&self) -> Option<Duration> {
         self.ttl_s.map(Duration::from_secs)
+    }
+
+    /// The largest payload one write may carry.
+    pub(crate) fn max_payload(&self, limits: &LimitsConfig) -> usize {
+        self.max_payload_bytes.unwrap_or(limits.max_payload_bytes)
+    }
+
+    /// This resource's own write rate per session, as writes a second and burst.
+    pub(crate) fn write_rate(&self) -> Option<(u64, u64)> {
+        let rate = self.writes_per_s.filter(|rate| *rate > 0)?;
+        Some((rate, self.write_burst.unwrap_or(rate)))
     }
 }
 
@@ -154,7 +177,18 @@ impl ScopeConfig {
         check(&config.scope.streams)?;
         check(&config.scope.caches)?;
         check(&config.scope.counters)?;
+        config.limits.check(config.largest_payload())?;
         Ok(config)
+    }
+
+    /// The largest payload any stream or cache allows.
+    pub(crate) fn largest_payload(&self) -> usize {
+        let limits = &self.limits;
+        let streams = self.scope.streams.iter().map(|s| s.max_payload(limits));
+        let caches = self.scope.caches.iter().map(|c| c.max_payload(limits));
+        streams
+            .chain(caches)
+            .fold(limits.max_payload_bytes, usize::max)
     }
 
     /// The Felix name of stream `alias` in `scope`, if the file declares one.
@@ -202,6 +236,18 @@ fn check<A: Action>(resources: &[Resource<A>]) -> Result<()> {
         ensure!(
             resource.ttl_s != Some(0),
             "{kind} {alias:?}: ttl_s must be above 0"
+        );
+        ensure!(
+            resource.max_payload_bytes.is_none() || kind != CounterAction::KIND,
+            "{kind} {alias:?}: a counter has no payload to limit"
+        );
+        ensure!(
+            resource.max_payload_bytes != Some(0),
+            "{kind} {alias:?}: max_payload_bytes must be above 0"
+        );
+        ensure!(
+            resource.write_burst != Some(0),
+            "{kind} {alias:?}: write_burst must be above 0"
         );
     }
     Ok(())
@@ -430,6 +476,51 @@ pub(crate) mod tests {
             lobby.config().cache_ttl_ms(),
             BTreeMap::from([("members".to_string(), 30_000)])
         );
+    }
+
+    #[test]
+    fn limits_default_and_aliases_override_the_payload_size() {
+        let defaults = ScopeConfig::parse(EXAMPLE).unwrap();
+        assert_eq!(defaults.limits.max_payload_bytes, 64 * 1024);
+        assert_eq!(defaults.limits.sessions_per_principal, 8);
+        assert_eq!(defaults.limits.sessions_per_ip, 32);
+        assert_eq!(defaults.limits.trusted_proxies, 0);
+        assert_eq!(defaults.limits.session_rates().writes_per_s, 50);
+        assert_eq!(defaults.limits.principal_rates().write_burst, 200);
+        assert_eq!(defaults.largest_payload(), 64 * 1024);
+
+        let text = EXAMPLE.replace(
+            "actions = [\"publish\", \"subscribe\"]",
+            "actions = [\"publish\", \"subscribe\"]\nmax_payload_bytes = 200000\nwrites_per_s = 5",
+        ) + "\n[limits]\nmax_payload_bytes = 1024\n[limits.session]\nbyte_burst = 200000\n\
+               [limits.principal]\nwrites_per_s = 0\nbyte_burst = 300000\n";
+        let config = ScopeConfig::parse(&text).unwrap();
+        let ops = &config.scope.streams[0];
+        let input = &config.scope.streams[1];
+        assert_eq!(ops.max_payload(&config.limits), 200_000);
+        assert_eq!(input.max_payload(&config.limits), 1024);
+        assert_eq!((ops.write_rate(), input.write_rate()), (Some((5, 5)), None));
+        assert_eq!(config.largest_payload(), 200_000);
+        let session = config.limits.session_rates();
+        assert_eq!((session.writes_per_s, session.byte_burst), (50, 200_000));
+        assert_eq!(config.limits.principal_rates().writes_per_s, 0);
+
+        // A payload limit above a byte burst is refused.
+        let too_big = text.replace("200000", "5000000");
+        assert!(ScopeConfig::parse(&too_big).is_err());
+        let counter_size = EXAMPLE.replace(
+            "actions = [\"add\"]",
+            "actions = [\"add\"]\nmax_payload_bytes = 10",
+        );
+        assert!(ScopeConfig::parse(&counter_size).is_err());
+        assert!(ScopeConfig::parse(&(EXAMPLE.to_string() + "\n[limits]\nbogus = 1\n")).is_err());
+    }
+
+    #[test]
+    fn the_dev_scope_file_parses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/scope.toml");
+        let config = ScopeConfig::load(&path).unwrap();
+        assert_eq!(config.limits.session_rates().write_burst, 2000);
     }
 
     #[test]

@@ -26,9 +26,27 @@ release notes the Felix version it was tested against.
 - `dev/up.sh` starts a second broker on port 5001 that asks for client
   certificates and binds tokens to them, with certificates for it and the
   gateway (#10).
+- Write limits, set in the scope file's `[limits]` table: writes and bytes a
+  second per session and per principal, each with a burst, a payload size
+  limit per stream and cache, session caps per principal and per client
+  address, and an optional per-alias write rate. They cover publishes, cache
+  writes and deletes, counter adds and the leave beacon. A write over a rate
+  is refused at once, never queued. `X-Forwarded-For` is used for the client
+  address only with `trusted_proxies` set (#11).
+- The `rate_limited` protocol feature: a session that asks for it gets the
+  error code `rate_limited` with `retry_after_ms` for a refused write or join.
+  Other sessions get the code they already know for that request (#11).
+- `limits_refused` in `GET /metrics`, counting refusals by limit (#11).
+- `felix-gateway-client`: `GatewayError.retryAfterMs` (#11).
 
 ### Changed
 
+- The write limits are on by default: 50 writes and 256 KiB a second per
+  session (bursts of 100 and 1 MiB), 100 writes and 512 KiB a second per
+  principal (bursts of 200 and 2 MiB), payloads of at most 64 KiB, 8 sessions
+  per principal and 32 per client address. A program embedding the library
+  serves `Gateway::router()` with `into_make_service_with_connect_info` for
+  the address cap to apply (#11).
 - Built on felix-client and felix-wire 0.6.0-preview.4, and the dev stack runs
   the 0.6.0-preview.4 images (#10).
 - `dev/up.sh` runs on Docker or Podman, and the docs show the Podman form.
@@ -42,6 +60,12 @@ reaches watchers as a delete.
 
 ### Changed
 
+- The write limits are on by default: 50 writes and 256 KiB a second per
+  session (bursts of 100 and 1 MiB), 100 writes and 512 KiB a second per
+  principal (bursts of 200 and 2 MiB), payloads of at most 64 KiB, 8 sessions
+  per principal and 32 per client address. A program embedding the library
+  serves `Gateway::router()` with `into_make_service_with_connect_info` for
+  the address cap to apply (#11).
 - Built on felix-client and felix-wire 0.6.0-preview.2, and the dev stack runs
   the `ghcr.io/getfelix` 0.6.0-preview.2 images.
 - A browser that falls behind on a durable stream gets every record, late and

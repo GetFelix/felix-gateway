@@ -33,7 +33,10 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
 - A `join` without `protocol` is version 1, and one without `features` asks
   for none. Version 1 is frozen: a change that an older browser would misread
   is a new feature or a new version, never an edit to version 1.
-- This gateway speaks version 1 and has no features yet.
+- This gateway speaks version 1 and has one feature, `rate_limited`: a write
+  or join refused by one of the gateway's [limits](#limits) is answered with
+  the code `rate_limited` and a `retry_after_ms`. Without it, the refusal
+  uses the code the request already fails with.
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
   error, and the connection stays open.
@@ -92,6 +95,7 @@ then closes the connection:
 | `unavailable` | The control plane or the brokers could not be reached, or, on a gateway with shared connections, the control plane would not delegate the token to the gateway. Reconnect as after any drop |
 | `unsupported` | The `join` asked for a protocol version this gateway does not speak |
 | `bad_request` | The first message was not a `join`, or the scope's value is not allowed |
+| `rate_limited` | Only with the `rate_limited` feature: the person or the client address already holds as many sessions as the gateway allows. Without the feature this is `unavailable`. Retry once another session has closed |
 
 A resource marked `optional` in the scope file may be missing from the
 person's grants without refusing the join; `hello` lists it under `missing`.
@@ -137,6 +141,10 @@ order the browser sent them. The gateway never resends a publish. When one
 fails the browser decides whether to retry, since only the application knows
 whether a record is safe to deduplicate.
 
+A publish over one of the gateway's [limits](#limits) is answered at once
+with an `error` carrying its `id`, even with `"ack": false`, and never
+reaches Felix.
+
 On a stream with `stamp_sender`, each payload reaches Felix prefixed with the
 publisher's Felix principal: a 2-byte big-endian length, then the principal's
 UTF-8 bytes. Readers learn who sent each record, and a browser cannot speak
@@ -156,7 +164,9 @@ for someone else.
 | `id` | As for `publish`; it comes back on the `counter` or `error` |
 
 The gateway answers with a `counter` message carrying the sum after the add.
-Felix counts an add retried after a lost answer twice.
+Felix counts an add retried after a lost answer twice. An add over a
+[limit](#limits) is answered with an `error` carrying its `id`, and was not
+counted.
 
 ### `cache_get`
 
@@ -177,7 +187,8 @@ carrying the same `id`.
 Writes one entry of a cache whose actions include `write`, with the cache's
 `ttl_s` when it has one; `hello` gives each TTL in milliseconds. `key` follows
 the rule for `counter_add`. There is no reply; a failed write is an `error`
-with code `cache_failed` and the cache's alias.
+with code `cache_failed` and the cache's alias. A write over a
+[limit](#limits) is an `error` with the cache's alias too.
 
 A presence list fits this: each session writes its entry, keyed by session, on
 connecting and again every third of the TTL, so a session that stops writing
@@ -190,7 +201,8 @@ drops out of everyone's list within one TTL.
 ```
 
 Deletes one entry at once, needing `write` as `cache_put` does. A delete is
-never overtaken by the write sent before it.
+never overtaken by the write sent before it. It counts against the write
+[limits](#limits) as a write of no bytes.
 
 A message sent while a page unloads may never leave it, so a closing tab can
 send `POST /members/leave` with `navigator.sendBeacon`, which the browser
@@ -198,8 +210,9 @@ delivers after the page is gone. The body is
 `{"room": "lobby", "token": "<ID token>", "cache": "members", "key": "3f9a0c12d4e5b6a7"}`,
 with the scope under the scope file's `field`. The gateway exchanges the token
 exactly as for `join` before it deletes anything, and answers 204, 400 for a
-bad scope or key or a cache that does not allow `write`, or 403 with the
-refusal as an `error` message.
+bad scope or key or a cache that does not allow `write`, 403 with the
+refusal as an `error` message, or 429 when its sender is over the write
+rate.
 
 ### `cache_watch`
 
@@ -226,7 +239,8 @@ full speed and the subscription's bounded queue fills, so the browser falls
 behind (see [Slow browsers](#slow-browsers)). Other connections are not
 affected. There is no reply.
 A gateway whose scope file does not set `allow_throttle` answers
-`unsupported`.
+`unsupported`. It is a demonstration switch and should stay off on a public
+gateway.
 
 ## Patterns
 
@@ -365,12 +379,13 @@ time keeps the browser's own clock out of it.
 ```
 
 `id` is present when the error answers one request, and `stream` or `cache`
-when it is about one stream or cache. `oldest` is present only on `trimmed`.
+when it is about one stream or cache. `oldest` is present only on `trimmed`,
+and `retry_after_ms` only on `rate_limited`.
 The connection stays open after any error except an answer to `join`.
 
 | Code | Meaning |
 |---|---|
-| `bad_request` | The message did not parse, its payload was not base64, a key or scope was not allowed, or it named an alias the scope file does not have or an action that alias does not allow |
+| `bad_request` | The message did not parse, its payload was not base64 or was larger than the alias allows, a key or scope was not allowed, or it named an alias the scope file does not have or an action that alias does not allow |
 | `unsupported` | The message type is not one this gateway knows, a `join` asked for another protocol version, or `throttle` is not allowed |
 | `publish_failed` | Felix refused or lost the publish. It may have landed |
 | `subscribe_failed` | Felix refused the subscription, for instance because this person already holds as many subscriptions and cache watches as the broker allows one user on a connection |
@@ -379,7 +394,37 @@ The connection stays open after any error except an answer to `join`.
 | `cache_failed` | Felix refused or lost a cache read, write or delete |
 | `trimmed` | The subscription asked for an offset retention has discarded. `oldest` is the oldest offset left |
 | `watch_failed` | A cache watch was refused or stopped. Send `cache_watch` again |
+| `rate_limited` | Only for a session that asked for the `rate_limited` feature. A gateway [limit](#limits) refused the write, or the `join`. Nothing reached Felix. `retry_after_ms`, when present, is how long until the write would fit |
 | `forbidden`, `signed_out`, `unavailable` | Only in answer to `join`; see [`join`](#join) |
+
+## Limits
+
+The gateway's [scope file](configuration.md#write-limits) sets how fast a
+session and a person may write, how large one payload may be, and how many
+sessions a person and a client address may hold. A write over a rate is
+refused at once instead of queued, and spends nothing, so a later write that
+fits still goes through. A browser that needs its writes in order should
+stop at a refused one and resend from there.
+
+| Refused | Code with `rate_limited` | Code without |
+|---|---|---|
+| A `publish` over a rate | `rate_limited`, with `retry_after_ms` | `publish_failed` |
+| A `counter_add` over a rate | `rate_limited`, with `retry_after_ms` | `counter_failed` |
+| A `cache_put` or `cache_delete` over a rate | `rate_limited`, with `retry_after_ms` | `cache_failed` |
+| A payload over `max_payload_bytes` | `bad_request` | `bad_request` |
+| A `join` over a session cap | `rate_limited` | `unavailable` |
+
+```json
+{"type": "error", "id": 7, "stream": "ops", "code": "rate_limited", "retry_after_ms": 120, "message": "this session is writing faster than the gateway allows"}
+```
+
+`retry_after_ms` is measured when the gateway refused, against the limit that
+needs the longest wait; other sessions of the same person may spend the rate
+first. A WebSocket message far larger than any payload the scope allows
+closes the connection.
+
+On a gateway with shared connections, Felix's per-user limits apply as well,
+and arrive as the usual `publish_failed` or `subscribe_failed`.
 
 ## Slow browsers
 
@@ -398,7 +443,7 @@ An in-memory stream has nothing to replay, so its dropped events are gone.
 | `GET /ws` | The WebSocket |
 | `GET /oidc` | How a browser signs in: `issuer`, `client_id`, `scopes` |
 | `POST /members/leave` | A closing tab's cache delete, described under [`cache_delete`](#cache_delete) |
-| `GET /metrics` | Latency, below |
+| `GET /metrics` | Latency and limit refusals, below |
 | anything else | A file of the web bundle in `GATEWAY_WEB_DIR`, when set |
 
 `GET /metrics` returns the two legs of the gateway separately, in microseconds:
@@ -409,6 +454,10 @@ An in-memory stream has nothing to replay, so its dropped events are gone.
   "felix_publish_ack": {
     "ops": {"count": 40, "p50_us": 650, "p90_us": 900, "p99_us": 1500, "max_us": 2100},
     "presence": {"count": 0, "p50_us": 0, "p90_us": 0, "p99_us": 0, "max_us": 0}
+  },
+  "limits_refused": {
+    "alias_rate": 0, "ip_sessions": 0, "message_size": 1, "principal_rate": 0,
+    "principal_sessions": 0, "session_rate": 12
   }
 }
 ```
@@ -417,3 +466,15 @@ An in-memory stream has nothing to replay, so its dropped events are gone.
 |---|---|
 | `browser_rtt` | Browser to gateway and back: a WebSocket ping every 5 seconds per connection, answered by the browser itself |
 | `felix_publish_ack` | Gateway to Felix and back, one histogram per stream alias in the scope file: from handing an acknowledged publish to Felix until its ack |
+
+`limits_refused` counts refusals since the gateway started, by the limit that
+refused:
+
+| Key | Refused |
+|---|---|
+| `message_size` | A payload over `max_payload_bytes` |
+| `session_rate` | A write over the session's rates |
+| `alias_rate` | A write over its resource's `writes_per_s` |
+| `principal_rate` | A write over the person's rates, including leave beacons |
+| `principal_sessions` | A `join` over `sessions_per_principal` |
+| `ip_sessions` | A `join` over `sessions_per_ip` |

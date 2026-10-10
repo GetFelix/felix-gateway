@@ -13,11 +13,14 @@
 //! - `scope`: the scope file, and the Felix resources one scope owns.
 //! - `felix`: the brokers, and one session's connection to them, its own or
 //!   shared.
-//! - `metrics`: latency of the browser leg and the Felix leg, apart.
+//! - `limits`: write rates, payload sizes and session caps.
+//! - `metrics`: latency of the browser leg and the Felix leg, apart, and what
+//!   the limits refused.
 
 mod access;
 mod config;
 mod felix;
+mod limits;
 mod metrics;
 pub mod protocol;
 mod relay;
@@ -25,13 +28,15 @@ mod scope;
 mod throttle;
 pub mod transport;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use axum::Extension;
 use axum::Router;
-use axum::extract::{State, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use felix_client::{ClusterClient, TokenProvider};
@@ -46,6 +51,7 @@ pub use scope::ScopeConfig;
 
 use access::{Actor, ControlPlane};
 use felix::{Brokers, Pool};
+use limits::Limiter;
 use scope::{BAD_NAME, CacheAction, Scope, valid_name};
 use transport::websocket::WebSocketConnection;
 
@@ -58,6 +64,7 @@ pub struct Gateway {
     control_plane: ControlPlane,
     shared: Option<Shared>,
     metrics: Arc<Metrics>,
+    limiter: Arc<Limiter>,
     oidc: Arc<Value>,
     web_dir: Option<PathBuf>,
     scope: Arc<ScopeConfig>,
@@ -87,13 +94,20 @@ impl Gateway {
             }
             None => None,
         };
+        let metrics = Arc::new(Metrics::new(
+            config.scope.scope.streams.iter().map(|s| s.alias.as_str()),
+        ));
+        let limiter = Arc::new(Limiter::new(
+            config.scope.limits.clone(),
+            config.scope.largest_payload(),
+            Arc::clone(&metrics),
+        ));
         Ok(Self {
             brokers,
             control_plane,
             shared,
-            metrics: Arc::new(Metrics::new(
-                config.scope.scope.streams.iter().map(|s| s.alias.as_str()),
-            )),
+            metrics,
+            limiter,
             oidc: Arc::new(json!({
                 "issuer": config.oidc_issuer,
                 "client_id": config.oidc_client_id,
@@ -106,7 +120,12 @@ impl Gateway {
 
     /// The HTTP routes: `/ws` for browsers, `/oidc` for how a browser signs
     /// in, `/members/leave` for a closing tab's goodbye, and `/metrics` for
-    /// latency. Every other path is a file of the web bundle, when there is one.
+    /// latency and refusals. Every other path is a file of the web bundle,
+    /// when there is one.
+    ///
+    /// Serve it with `into_make_service_with_connect_info::<SocketAddr>()` so
+    /// the session cap per client address can see the address. Without it,
+    /// and without `trusted_proxies`, that cap is not applied.
     pub fn router(&self) -> Router {
         let router = Router::new()
             .route("/ws", get(websocket))
@@ -120,7 +139,8 @@ impl Gateway {
         }
     }
 
-    /// Latency recorded since the gateway started.
+    /// Latency recorded, and writes and sessions refused, since the gateway
+    /// started.
     pub fn metrics(&self) -> Snapshot {
         self.metrics.snapshot()
     }
@@ -182,8 +202,24 @@ struct Shared {
     actor: Arc<Actor>,
 }
 
-async fn websocket(State(gateway): State<Gateway>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
-    upgrade.on_upgrade(move |socket| relay::run(WebSocketConnection::new(socket), gateway))
+async fn websocket(
+    State(gateway): State<Gateway>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let forwarded_for: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    let client = gateway
+        .limiter
+        .client_ip(peer.map(|peer| peer.0.0.ip()), &forwarded_for);
+    // A frame larger than any payload the scope allows is not read at all.
+    upgrade
+        .max_message_size(gateway.limiter.max_frame_bytes)
+        .on_upgrade(move |socket| relay::run(WebSocketConnection::new(socket), gateway, client))
 }
 
 #[derive(Deserialize)]
@@ -224,12 +260,24 @@ async fn leave(State(gateway): State<Gateway>, body: String) -> impl IntoRespons
         Ok(cache) => cache.name,
         Err(refusal) => return (StatusCode::BAD_REQUEST, refusal),
     };
-    let felix = match relay::open(scope, &leave.token, &gateway).await {
+    let refused = |refusal: protocol::ServerMessage| {
+        let body = serde_json::to_string(&refusal).expect("server messages serialize");
+        (StatusCode::FORBIDDEN, body)
+    };
+    let grant = match relay::exchange(&scope, &leave.token, &gateway).await {
+        Ok(grant) => grant,
+        Err(refusal) => return refused(refusal),
+    };
+    if let Err(limit) =
+        gateway
+            .limiter
+            .charge_principal(&grant.principal, 0, std::time::Instant::now())
+    {
+        return (StatusCode::TOO_MANY_REQUESTS, limit.message().to_string());
+    }
+    let felix = match relay::connect(scope, grant, &gateway).await {
         Ok(felix) => felix,
-        Err(refusal) => {
-            let body = serde_json::to_string(&refusal).expect("server messages serialize");
-            return (StatusCode::FORBIDDEN, body);
-        }
+        Err(refusal) => return refused(refusal),
     };
     match felix.cache_delete(&cache, &leave.key).await {
         Ok(()) => (StatusCode::NO_CONTENT, String::new()),

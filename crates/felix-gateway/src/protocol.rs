@@ -9,9 +9,14 @@ use serde_json::{Map, Value};
 /// The protocol version this gateway speaks. A `join` without one means 1.
 pub const PROTOCOL: u32 = 1;
 
-/// Optional capabilities a `join` may ask for in `features`. None exist yet;
-/// `hello` answers with the ones asked for that are listed here.
-pub const FEATURES: &[&str] = &[];
+/// Optional capabilities a `join` may ask for in `features`; `hello` answers
+/// with the ones asked for that are listed here.
+pub const FEATURES: &[&str] = &[RATE_LIMITED];
+
+/// The feature under which a write or join refused by a limit is answered
+/// with [`ErrorCode::RateLimited`] and `retry_after_ms`. Without it the
+/// refusal uses the request's own failure code.
+pub const RATE_LIMITED: &str = "rate_limited";
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -173,6 +178,10 @@ pub enum ServerMessage {
         /// With [`ErrorCode::Trimmed`]: the oldest offset the log still holds.
         #[serde(skip_serializing_if = "Option::is_none")]
         oldest: Option<u64>,
+        /// With [`ErrorCode::RateLimited`]: milliseconds until the write
+        /// would fit.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
         message: String,
     },
 }
@@ -208,6 +217,9 @@ pub enum ErrorCode {
     Unavailable,
     /// A cache watch was refused or stopped. Watch again.
     WatchFailed,
+    /// A gateway limit refused the write or the join; nothing reached Felix.
+    /// Only for sessions that asked for [`RATE_LIMITED`].
+    RateLimited,
 }
 
 /// One cache entry, keyed without the cache's name.
@@ -383,6 +395,26 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn serializes_a_rate_limited_refusal_with_when_to_retry() {
+        let refusal = ServerMessage::Error {
+            id: Some(7),
+            stream: Some("ops".into()),
+            cache: None,
+            code: ErrorCode::RateLimited,
+            oldest: None,
+            retry_after_ms: Some(120),
+            message: "slow down".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&refusal).unwrap(),
+            json!({
+                "type": "error", "id": 7, "stream": "ops", "code": "rate_limited",
+                "retry_after_ms": 120, "message": "slow down"
+            })
+        );
     }
 
     #[test]

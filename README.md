@@ -44,8 +44,13 @@ browser client.
 - Per-connection ordering of publishes and cache writes, and a bounded buffer
   per browser that never drops on its own, so a slow browser on a durable
   stream falls behind and catches up from the log instead of losing records.
+- Write limits for a public deployment: write and byte rates per session and
+  per person with a burst allowance, a payload size limit per alias, and
+  session caps per person and per client address. A write over a rate is
+  refused with a retryable error instead of queued, and `/metrics` counts the
+  refusals. Felix's own per-user limits still apply underneath.
 - A slow-link throttle for demonstrating slow-consumer behaviour, off unless
-  the scope file allows it.
+  the scope file allows it. Keep it off on a public gateway.
 - Shared connections: with a credential and a client certificate of its own,
   the gateway carries every session over a few Felix connections, each session
   acting as its own user with a token delegated to the gateway. The broker
@@ -117,6 +122,7 @@ name = "app.seq.{scope}"
 actions = ["add"]
 ```
 
+Write limits are on by default; the `[limits]` table changes them.
 The gateway never creates resources or grants; set those up in Felix first.
 [docs/configuration.md](docs/configuration.md) lists every variable, every
 scope file key and the Felix permissions each action needs.

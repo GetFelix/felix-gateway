@@ -125,6 +125,20 @@ describe("GatewayClient", () => {
     expect(errors.map(([error, stream]) => [error.code, stream])).toEqual([["trimmed", "ops"]]);
   });
 
+  it("says when a rate-limited request may be retried", async () => {
+    const { client, socket } = await connect();
+    const publish = client.publish("ops", bytes(1));
+    socket.receive({
+      type: "error",
+      id: 0,
+      stream: "ops",
+      code: "rate_limited",
+      retry_after_ms: 120,
+      message: "slow down",
+    });
+    await expect(publish).rejects.toMatchObject({ code: "rate_limited", retryAfterMs: 120 });
+  });
+
   it("decodes cache entries and changes", async () => {
     const { client, socket } = await connect();
     const seen: unknown[] = [];
