@@ -149,8 +149,8 @@ is the reference.
 
 Pre-1.0. The protocol, the scope file format and the library API may change
 between minor versions; version 1 of the wire protocol is frozen, and later
-changes arrive as negotiated features. Tested against Felix 0.6.0-preview.4,
-which shared connections require.
+changes arrive as negotiated features. Tested against Felix 0.6.0-preview.5.
+Shared connections require 0.6.0-preview.4 or later.
 
 Known limits, all on the Felix side:
 

@@ -11,10 +11,14 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
-Shared connections work with Felix 0.6.0-preview.5, which delegates only scope
-tokens minted for the gateway that asks. Against that Felix, gateway 0.3.0
-with shared connections needs `FELIX_CONTROLPLANE_DELEGATE_UNBOUND_TOKENS=true`
-on the control plane; this release does not.
+## [0.3.1] - 2026-10-10
+
+Tested against Felix 0.6.0-preview.5. With shared connections the gateway now
+sends `actor_token` on the token exchange, which bound delegation needs: use
+Felix 0.6.0-preview.5 or later. Against preview.5, gateway 0.3.0 and earlier
+with shared connections need `FELIX_CONTROLPLANE_DELEGATE_UNBOUND_TOKENS=true`
+on the control plane; this release does not. Per-session connections are
+unaffected.
 
 ### Changed
 
