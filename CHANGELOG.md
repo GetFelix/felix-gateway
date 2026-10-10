@@ -11,6 +11,20 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+Shared connections work with Felix 0.6.0-preview.5, which delegates only scope
+tokens minted for the gateway that asks. Against that Felix, gateway 0.3.0
+with shared connections needs `FELIX_CONTROLPLANE_DELEGATE_UNBOUND_TOKENS=true`
+on the control plane; this release does not.
+
+### Changed
+
+- With shared connections, the exchange of a browser's sign-in sends the
+  gateway's control-plane token as the RFC 8693 `actor_token`, so the scope
+  token is minted for the gateway (`may_act`). If the control plane refuses
+  that token, the gateway retries once with a fresh one, then logs it as a
+  setup error and answers `unavailable`. Felix 0.6.0-preview.4 ignores the
+  field. Per-session connections are unchanged (#13).
+
 ## [0.3.0] - 2026-10-09
 
 Built on Felix 0.6.0-preview.4, which this release is tested against. Sessions

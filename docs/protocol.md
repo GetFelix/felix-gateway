@@ -92,7 +92,7 @@ then closes the connection:
 |---|---|
 | `forbidden` | The signed-in person may not open this scope, or it does not exist |
 | `signed_out` | The ID token is missing, expired or from a provider the tenant does not trust |
-| `unavailable` | The control plane or the brokers could not be reached, or, on a gateway with shared connections, the control plane would not delegate the token to the gateway. Reconnect as after any drop |
+| `unavailable` | The control plane or the brokers could not be reached, or, on a gateway with shared connections, the control plane would not accept the gateway's own token or would not delegate the token to the gateway. Reconnect as after any drop |
 | `unsupported` | The `join` asked for a protocol version this gateway does not speak |
 | `bad_request` | The first message was not a `join`, or the scope's value is not allowed |
 | `rate_limited` | Only with the `rate_limited` feature: the person or the client address already holds as many sessions as the gateway allows. Without the feature this is `unavailable`. Retry once another session has closed |

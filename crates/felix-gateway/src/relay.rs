@@ -589,7 +589,11 @@ pub(crate) async fn exchange(
 ) -> Result<Grant, ServerMessage> {
     gateway
         .control_plane
-        .exchange(token, scope)
+        .exchange(
+            token,
+            scope,
+            gateway.shared.as_ref().map(|shared| &*shared.actor),
+        )
         .await
         .map_err(|refusal| match refusal {
             Refused::SignedOut => error(ErrorCode::SignedOut, "sign in again"),

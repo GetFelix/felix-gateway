@@ -58,6 +58,9 @@ struct DelegateResponse {
 /// The RFC 8693 grant `/token/delegate` takes.
 const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
+/// The RFC 8693 type of every token the gateway hands the control plane.
+const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
+
 /// A gateway token this close to expiry is replaced before use, so a
 /// delegation never goes out with one about to lapse.
 const RENEW_BEFORE: Duration = Duration::from_secs(60);
@@ -96,23 +99,67 @@ impl ControlPlane {
     /// The exchange only narrows what RBAC grants, so membership is decided
     /// by the scope's role in Felix. A sign-in whose token lacks any required
     /// grant is refused here rather than failing piecemeal later.
-    pub(crate) async fn exchange(&self, id_token: &str, scope: &Scope) -> Result<Grant, Refused> {
+    ///
+    /// With shared connections, `actor` is the gateway: its control-plane
+    /// token goes along as the RFC 8693 `actor_token`, because Felix only
+    /// delegates a token minted for the gateway that asks.
+    pub(crate) async fn exchange(
+        &self,
+        id_token: &str,
+        scope: &Scope,
+        actor: Option<&Actor>,
+    ) -> Result<Grant, Refused> {
         let permissions = scope.permissions(&self.tenant, &self.namespace);
         let (actions, objects) = split(&permissions);
-        let response = self
-            .http
-            .post(format!(
-                "{}/v1/tenants/{}/token/exchange",
-                self.url, self.tenant
-            ))
-            .bearer_auth(id_token)
-            .json(&json!({ "requested": actions, "resources": objects }))
-            .send()
-            .await
-            .map_err(|err| Refused::Unavailable(err.into()))?;
+        let mut request = json!({ "requested": actions, "resources": objects });
+        let mut fresh = false;
+        let response = loop {
+            if let Some(actor) = actor {
+                let token = actor
+                    .control_plane_token(fresh)
+                    .await
+                    .map_err(Refused::Unavailable)?;
+                request["actor_token"] = token.into();
+                request["actor_token_type"] = JWT_TOKEN_TYPE.into();
+            }
+            let response = self
+                .http
+                .post(format!(
+                    "{}/v1/tenants/{}/token/exchange",
+                    self.url, self.tenant
+                ))
+                .bearer_auth(id_token)
+                .json(&request)
+                .send()
+                .await
+                .map_err(|err| Refused::Unavailable(err.into()))?;
+            if actor.is_none() || response.status() != StatusCode::FORBIDDEN {
+                break response;
+            }
+            // A 403 is either the user's RBAC or the gateway's own token, and
+            // only the message tells them apart.
+            let body = response.text().await.unwrap_or_default();
+            if !refuses_actor(&body) {
+                return Err(Refused::Forbidden);
+            }
+            if !fresh {
+                fresh = true;
+                continue;
+            }
+            tracing::error!(
+                %body,
+                "the control plane refused the gateway's token as the actor of an exchange; \
+                 does the gateway's principal hold token.delegate on the tenant?"
+            );
+            return Err(Refused::Unavailable(anyhow::anyhow!(
+                "the gateway cannot act for users"
+            )));
+        };
         match response.status() {
             StatusCode::UNAUTHORIZED => return Err(Refused::SignedOut),
             StatusCode::FORBIDDEN => return Err(Refused::Forbidden),
+            // 409 included: a Raft control plane answers it until every
+            // member understands actor tokens.
             status if !status.is_success() => {
                 return Err(Refused::Unavailable(anyhow::anyhow!(
                     "the token exchange answered {status}"
@@ -208,7 +255,7 @@ impl ControlPlane {
             .json(&json!({
                 "grant_type": TOKEN_EXCHANGE_GRANT,
                 "subject_token": subject,
-                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "subject_token_type": JWT_TOKEN_TYPE,
             }))
             .send()
             .await
@@ -371,6 +418,15 @@ fn split(permissions: &[Permission]) -> (BTreeSet<&str>, BTreeSet<&str>) {
         .unzip()
 }
 
+/// Whether a 403 body from the exchange is about the gateway's actor token
+/// rather than the user. Felix says "actor token" in both such refusals.
+fn refuses_actor(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|body| body["message"].as_str().map(str::to_owned))
+        .is_some_and(|message| message.contains("actor token"))
+}
+
 #[derive(Deserialize)]
 struct Claims {
     #[serde(default)]
@@ -480,6 +536,9 @@ mod tests {
         calls: Mutex<Vec<(String, Option<String>, Value)>>,
         /// Statuses `/token/delegate` answers with before it succeeds.
         refusals: Mutex<Vec<StatusCode>>,
+        /// Statuses and messages a user's exchange answers with before it
+        /// succeeds.
+        user_refusals: Mutex<Vec<(StatusCode, &'static str)>>,
         exchanges: AtomicUsize,
         /// `exp` of the gateway tokens the exchange mints.
         gateway_exp: AtomicU64,
@@ -516,12 +575,15 @@ mod tests {
                 post(
                     |State(fake): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                         fake.record("exchange", &headers, &body);
+                        if body.get("audience").is_none() {
+                            return user_exchange(&fake, &body);
+                        }
                         let n = fake.exchanges.fetch_add(1, Ordering::SeqCst);
                         let exp = fake.gateway_exp.load(Ordering::SeqCst);
-                        Json(json!({
+                        Ok(Json(json!({
                             "felix_token": jwt(json!({ "sub": "gateway", "exp": exp, "n": n })),
                             "refresh_token": "unused",
-                        }))
+                        })))
                     },
                 ),
             )
@@ -560,6 +622,37 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
         ControlPlane::new(&format!("http://{addr}"), "t", "default")
+    }
+
+    /// A user's exchange: the next refusal, or a token holding every
+    /// permission asked for.
+    fn user_exchange(fake: &Fake, body: &Value) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        if let Some((status, message)) = fake.user_refusals.lock().unwrap().pop() {
+            return Err((
+                status,
+                Json(json!({ "code": "forbidden", "message": message })),
+            ));
+        }
+        let names = |key: &str| -> Vec<String> {
+            body[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        let perms: Vec<String> = names("requested")
+            .iter()
+            .flat_map(|action| {
+                names("resources")
+                    .into_iter()
+                    .map(move |object| format!("{action}:{object}"))
+            })
+            .collect();
+        Ok(Json(json!({
+            "felix_token": jwt(json!({ "sub": "ana", "perms": perms })),
+            "refresh_token": "r1",
+        })))
     }
 
     /// A credential file holding `token`, unique to `test`.
@@ -680,5 +773,118 @@ mod tests {
             panic!("a 403 from /token/delegate is unavailable");
         };
         assert_eq!(err.to_string(), "the gateway cannot act for users");
+    }
+
+    fn user_exchanges(fake: &Fake) -> Vec<Value> {
+        fake.calls("exchange")
+            .into_iter()
+            .map(|(_, body)| body)
+            .filter(|body| body.get("audience").is_none())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_shared_gateway_exchanges_with_its_own_token_as_the_actor() {
+        let (fake, control_plane, actor, _) = actor("actor-token", now() + 3600).await;
+        let grant = control_plane
+            .exchange("ana-id-token", &lobby(), Some(&actor))
+            .await
+            .unwrap();
+        assert_eq!(grant.principal, "ana");
+
+        let exchanges = fake.calls("exchange");
+        let (gateway_bearer, gateway_body) = &exchanges[0];
+        assert_eq!(gateway_bearer.as_deref(), Some("gateway-id-token"));
+        assert_eq!(gateway_body["audience"], "felix-controlplane");
+        let (bearer, body) = &exchanges[1];
+        assert_eq!(bearer.as_deref(), Some("ana-id-token"));
+        assert_eq!(
+            claims(body["actor_token"].as_str().unwrap()).unwrap().sub,
+            "gateway"
+        );
+        assert_eq!(body["actor_token_type"], JWT_TOKEN_TYPE);
+    }
+
+    #[tokio::test]
+    async fn a_per_session_exchange_names_no_actor() {
+        let (fake, control_plane, _, _) = actor("no-actor", now() + 3600).await;
+        control_plane
+            .exchange("ana-id-token", &lobby(), None)
+            .await
+            .unwrap();
+        let exchanges = fake.calls("exchange");
+        assert_eq!(exchanges.len(), 1, "no gateway token is fetched");
+        let (bearer, body) = &exchanges[0];
+        assert_eq!(bearer.as_deref(), Some("ana-id-token"));
+        assert!(body.get("actor_token").is_none(), "{body}");
+        assert!(body.get("actor_token_type").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_actor_token_is_replaced_once_then_is_the_gateways_problem() {
+        let (fake, control_plane, actor, _) = actor("actor-refused", now() + 3600).await;
+        fake.user_refusals
+            .lock()
+            .unwrap()
+            .push((StatusCode::FORBIDDEN, "invalid actor token"));
+        assert!(
+            control_plane
+                .exchange("ana-id-token", &lobby(), Some(&actor))
+                .await
+                .is_ok()
+        );
+        let actors: Vec<Value> = user_exchanges(&fake)
+            .into_iter()
+            .map(|body| body["actor_token"].clone())
+            .collect();
+        assert_eq!(actors.len(), 2);
+        assert_ne!(actors[0], actors[1], "the retry uses a fresh gateway token");
+
+        fake.user_refusals.lock().unwrap().extend([
+            (
+                StatusCode::FORBIDDEN,
+                "the actor token lacks token.delegate on the tenant",
+            ),
+            (StatusCode::FORBIDDEN, "invalid actor token"),
+        ]);
+        let Err(Refused::Unavailable(err)) = control_plane
+            .exchange("ana-id-token", &lobby(), Some(&actor))
+            .await
+        else {
+            panic!("a twice-refused actor token is unavailable");
+        };
+        assert_eq!(err.to_string(), "the gateway cannot act for users");
+        assert_eq!(user_exchanges(&fake).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_user_refused_by_rbac_is_forbidden_without_a_retry() {
+        let (fake, control_plane, actor, _) = actor("user-refused", now() + 3600).await;
+        fake.user_refusals
+            .lock()
+            .unwrap()
+            .push((StatusCode::FORBIDDEN, "no permissions"));
+        assert!(matches!(
+            control_plane
+                .exchange("ana-id-token", &lobby(), Some(&actor))
+                .await,
+            Err(Refused::Forbidden)
+        ));
+        assert_eq!(user_exchanges(&fake).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_not_yet_upgraded_is_unavailable() {
+        let (fake, control_plane, actor, _) = actor("conflict", now() + 3600).await;
+        fake.user_refusals
+            .lock()
+            .unwrap()
+            .push((StatusCode::CONFLICT, "conflict"));
+        assert!(matches!(
+            control_plane
+                .exchange("ana-id-token", &lobby(), Some(&actor))
+                .await,
+            Err(Refused::Unavailable(_))
+        ));
     }
 }
