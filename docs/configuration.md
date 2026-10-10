@@ -27,6 +27,82 @@ roles that let people open them are set up before the gateway starts.
 `/oidc` returns the issuer, client ID and scopes, so the browser app needs no
 configuration of its own to sign in.
 
+## Shared connections
+
+By default every browser session opens its own Felix connection with its own
+scope token. That needs no setup beyond the variables above, but a broker
+accepts a bounded number of connections, so it limits how many sessions one
+gateway can serve.
+
+With shared connections, the gateway opens a few connections as itself and
+each session acts as its user on one of them. They are on when all three of
+these are set, and off when none is. Setting only some of them stops the
+gateway at startup, naming the ones missing.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GATEWAY_FELIX_CREDENTIAL_FILE` | unset | A file holding an ID token for the gateway's own principal, from an identity provider the tenant trusts, such as a Kubernetes projected service account token. Read again at each exchange, so a token rotated in place is used |
+| `GATEWAY_FELIX_CLIENT_CERT` | unset | PEM certificate chain, leaf first, issued to the gateway's principal. Read at each new connection |
+| `GATEWAY_FELIX_CLIENT_KEY` | unset | The PEM private key of that certificate |
+| `GATEWAY_FELIX_SHARED_CONNECTIONS` | `4` | How many connections sessions are spread over. Each session goes to the one with the fewest |
+
+They need Felix 0.6.0-preview.4 or later, on the control plane and the
+brokers. A join works like this:
+
+1. The browser's ID token is exchanged for a scope token, as without shared
+   connections.
+2. The gateway exchanges its own credential for a `felix-controlplane` token
+   narrowed to `token.delegate`, kept until a minute before it expires.
+3. It calls `POST /v1/tenants/{tenant}/token/delegate` with the scope token.
+   The control plane reissues it with the same user and grants and with
+   `act: {"sub": "<gateway principal>"}`.
+4. The session attaches to a shared connection as the user, with the delegated
+   token (`Client::with_identity` in felix-client).
+
+A delegated token has no refresh token. Before it expires, the gateway
+refreshes the user's scope token, which re-runs RBAC, and delegates the new
+one. A person removed from the scope loses access at that refresh. A session's
+identity is closed when the browser disconnects, and the connection stays with
+everyone else.
+
+The broker checks each request against the user's delegated token only, and
+keeps a subscription cap (`FELIX_MAX_SUBSCRIPTIONS_PER_CONN`) and a publish
+byte budget (`FELIX_BROKER_PUBLISH_CONN_INFLIGHT_BYTES`) per user on each
+connection, under connection-wide ceilings
+(`FELIX_MAX_SUBSCRIPTIONS_PER_CONN_TOTAL`,
+`FELIX_BROKER_PUBLISH_CONN_TOTAL_INFLIGHT_BYTES`). A user at the subscription
+cap gets `subscribe_failed`, and one at the publish budget is slowed or gets
+`publish_failed`; others on the connection are not held back by them until the
+ceilings are reached. The defaults for those ceilings
+are four users' worth, so a busy gateway may want more connections or higher
+ceilings.
+
+The Felix side needs:
+
+- A principal for the gateway. Felix names a signed-in principal by the
+  SHA-256 of `<issuer>|<subject>` in hex; that is the id the certificate and
+  the grants below use.
+- `token.delegate` over `tenant:{tenant}` for that principal. `tenant.manage`
+  does not include it.
+- One broker grant for that principal, any grant, because the control plane
+  mints no token without a permission and the shared connections open with the
+  gateway's own broker token. The gateway sends no requests of its own;
+  `dev/seed.mjs` grants `cache.read` on a cache that does not exist.
+- A client certificate whose subject alternative names include the URI
+  `felix:principal:<id>`, from a CA the brokers trust (`FELIX_TLS_CLIENT_CA`).
+  With `FELIX_TLS_CLIENT_CERT_BIND_SUBJECT=true` the brokers accept a token on
+  that connection only when its `act.sub`, or its `sub`, is that principal.
+
+`dev/up.sh` sets all of this up against a second broker on port 5001 and
+prints the variables to use.
+
+Each shared connection goes to one broker. Felix's cluster client, which
+follows a shard to its new owner when it moves, does not carry identities yet,
+so on a multi-broker cluster a subscription whose shard moves ends with
+`subscription_ended` and the browser subscribes again. A subscription that
+falls behind on a durable stream still resumes from the log, as it does on a
+connection of its own.
+
 ## The scope file
 
 The gateway reads it when it starts and refuses to start if it breaks any rule
@@ -109,6 +185,9 @@ docker run -p 8787:8787 \
   -v "$PWD/scope.toml:/etc/felix-gateway/scope.toml:ro" \
   ghcr.io/getfelix/felix-gateway:0.2.0
 ```
+
+For shared connections, mount the credential, certificate and key too, and set
+the three variables to their paths in the container.
 
 `podman run` takes the same arguments. On SELinux hosts, mount the scope file
 with `:ro,Z`.

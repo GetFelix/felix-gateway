@@ -1,9 +1,16 @@
 //! Per-session Felix credentials. A browser's sign-in is exchanged at the
 //! Felix control plane for a token narrowed to one scope, so the broker, not
 //! the gateway, is what keeps a session out of every other scope.
+//!
+//! With shared connections, each scope token is then delegated to the
+//! gateway: the control plane reissues it with `act` naming the gateway, so a
+//! broker that binds tokens to client certificates accepts it on the
+//! gateway's connection, still limited to the user's grants.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -11,7 +18,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use felix_client::{RefreshingToken, TokenProvider};
 use reqwest::StatusCode;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::scope::{Permission, Scope};
 
@@ -41,6 +48,28 @@ pub(crate) struct Grant {
 struct TokenResponse {
     felix_token: String,
     refresh_token: String,
+}
+
+#[derive(Deserialize)]
+struct DelegateResponse {
+    access_token: String,
+}
+
+/// The RFC 8693 grant `/token/delegate` takes.
+const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+
+/// A gateway token this close to expiry is replaced before use, so a
+/// delegation never goes out with one about to lapse.
+const RENEW_BEFORE: Duration = Duration::from_secs(60);
+
+/// Why `/token/delegate` refused.
+#[derive(Debug)]
+enum Delegation {
+    /// The gateway's own token was not accepted; a fresh one may be.
+    ActorRefused,
+    /// The gateway may not act for users, or not for this token.
+    Forbidden(String),
+    Failed(anyhow::Error),
 }
 
 /// The Felix control plane, as the gateway uses it.
@@ -144,6 +173,195 @@ impl ControlPlane {
     }
 }
 
+impl ControlPlane {
+    /// Exchange the gateway's own `credential` for a Felix token, asking with
+    /// `request` for its audience and narrowing.
+    async fn own_token(&self, credential: &str, request: Value) -> Result<String> {
+        let answer: TokenResponse = self
+            .http
+            .post(format!(
+                "{}/v1/tenants/{}/token/exchange",
+                self.url, self.tenant
+            ))
+            .bearer_auth(credential)
+            .json(&request)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .context("exchange the gateway's credential")?
+            .json()
+            .await
+            .context("read the gateway's token")?;
+        Ok(answer.felix_token)
+    }
+
+    /// Have `subject`, a user's scope token, reissued to name the holder of
+    /// `actor` as the one presenting it.
+    async fn delegate(&self, actor: &str, subject: &str) -> Result<String, Delegation> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/v1/tenants/{}/token/delegate",
+                self.url, self.tenant
+            ))
+            .bearer_auth(actor)
+            .json(&json!({
+                "grant_type": TOKEN_EXCHANGE_GRANT,
+                "subject_token": subject,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            }))
+            .send()
+            .await
+            .map_err(|err| Delegation::Failed(err.into()))?;
+        match response.status() {
+            StatusCode::UNAUTHORIZED => return Err(Delegation::ActorRefused),
+            StatusCode::FORBIDDEN => {
+                let body = response.text().await.unwrap_or_default();
+                return Err(Delegation::Forbidden(body));
+            }
+            status if !status.is_success() => {
+                return Err(Delegation::Failed(anyhow::anyhow!(
+                    "the token delegation answered {status}"
+                )));
+            }
+            _ => {}
+        }
+        let answer: DelegateResponse = response
+            .json()
+            .await
+            .map_err(|err| Delegation::Failed(err.into()))?;
+        Ok(answer.access_token)
+    }
+
+    /// Tokens for one session on a shared connection: `delegated` first, then
+    /// on each refresh the user's scope token is refreshed and delegated
+    /// again. A delegated token has no refresh token of its own, and its
+    /// expiry is never later than the scope token's.
+    pub(crate) fn delegated_tokens(
+        &self,
+        grant: Grant,
+        delegated: String,
+        actor: Arc<Actor>,
+    ) -> Arc<dyn TokenProvider> {
+        let control_plane = self.clone();
+        let refresh_token = Arc::new(Mutex::new(grant.refresh_token));
+        Arc::new(RefreshingToken::with_initial(delegated, move || {
+            let control_plane = control_plane.clone();
+            let refresh_token = Arc::clone(&refresh_token);
+            let actor = Arc::clone(&actor);
+            async move {
+                let scope_token = control_plane.refresh(&refresh_token).await?;
+                actor
+                    .delegate(&scope_token)
+                    .await
+                    .map_err(|refused| match refused {
+                        Refused::Unavailable(err) => err,
+                        other => anyhow::anyhow!("delegate the refreshed token: {other:?}"),
+                    })
+            }
+        }))
+    }
+}
+
+/// The gateway's own identity at the control plane: an ID token in a file,
+/// exchanged for a `felix-controlplane` token that may delegate users'
+/// tokens, and for a broker token for its own connections.
+pub(crate) struct Actor {
+    control_plane: ControlPlane,
+    credential_file: PathBuf,
+    /// The control-plane token and its `exp`, kept until close to expiry.
+    held: tokio::sync::Mutex<Option<(String, Option<u64>)>>,
+}
+
+impl Actor {
+    pub(crate) fn new(control_plane: ControlPlane, credential_file: PathBuf) -> Self {
+        Self {
+            control_plane,
+            credential_file,
+            held: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    fn credential(&self) -> Result<String> {
+        let token = std::fs::read_to_string(&self.credential_file)
+            .with_context(|| format!("read {}", self.credential_file.display()))?;
+        Ok(token.trim().to_string())
+    }
+
+    /// A broker token for the gateway's own principal, which is what its
+    /// shared connections open with. It carries every broker grant the
+    /// principal has; the gateway sends no requests of its own on it.
+    pub(crate) async fn broker_token(&self) -> Result<String> {
+        let credential = self.credential()?;
+        self.control_plane
+            .own_token(&credential, json!({ "audience": "felix-broker" }))
+            .await
+    }
+
+    /// The `felix-controlplane` token to delegate with, narrowed to
+    /// `token.delegate`.
+    async fn control_plane_token(&self, fresh: bool) -> Result<String> {
+        let mut held = self.held.lock().await;
+        if !fresh
+            && let Some((token, expires)) = held.as_ref()
+            && expires.is_none_or(|exp| exp > now() + RENEW_BEFORE.as_secs())
+        {
+            return Ok(token.clone());
+        }
+        let credential = self.credential()?;
+        let token = self
+            .control_plane
+            .own_token(
+                &credential,
+                json!({ "audience": "felix-controlplane", "requested": ["token.delegate"] }),
+            )
+            .await?;
+        let expires = claims(&token).and_then(|claims| claims.exp);
+        *held = Some((token.clone(), expires));
+        Ok(token)
+    }
+
+    /// `scope_token` delegated to the gateway. A refusal is the gateway's
+    /// setup, not the user's, so it is reported as unavailable and logged in
+    /// full for the operator.
+    pub(crate) async fn delegate(&self, scope_token: &str) -> Result<String, Refused> {
+        let mut fresh = false;
+        loop {
+            let actor = self
+                .control_plane_token(fresh)
+                .await
+                .map_err(Refused::Unavailable)?;
+            match self.control_plane.delegate(&actor, scope_token).await {
+                Ok(token) => return Ok(token),
+                Err(Delegation::ActorRefused) if !fresh => fresh = true,
+                Err(Delegation::ActorRefused) => {
+                    tracing::error!("the control plane does not accept the gateway's token");
+                    return Err(Refused::Unavailable(anyhow::anyhow!(
+                        "the gateway cannot act for users"
+                    )));
+                }
+                Err(Delegation::Forbidden(detail)) => {
+                    tracing::error!(
+                        %detail,
+                        "the control plane refused to delegate; does the gateway's principal \
+                         hold token.delegate on the tenant?"
+                    );
+                    return Err(Refused::Unavailable(anyhow::anyhow!(
+                        "the gateway cannot act for users"
+                    )));
+                }
+                Err(Delegation::Failed(err)) => return Err(Refused::Unavailable(err)),
+            }
+        }
+    }
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 /// The distinct actions and objects in `permissions`, which is how the
 /// exchange takes a narrowing.
 fn split(permissions: &[Permission]) -> (BTreeSet<&str>, BTreeSet<&str>) {
@@ -157,7 +375,9 @@ fn split(permissions: &[Permission]) -> (BTreeSet<&str>, BTreeSet<&str>) {
 struct Claims {
     #[serde(default)]
     sub: String,
+    #[serde(default)]
     perms: Vec<String>,
+    exp: Option<u64>,
 }
 
 /// A Felix token's claims. The token came straight from the control plane;
@@ -187,6 +407,11 @@ fn missing(claims: &Claims, permissions: &[Permission]) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use crate::scope::tests::lobby;
+    use axum::Json;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn token(perms: &[&str]) -> String {
         let claims = URL_SAFE_NO_PAD.encode(json!({ "sub": "ana", "perms": perms }).to_string());
@@ -242,5 +467,218 @@ mod tests {
             missing(&claims, &permissions),
             Some(vec!["input".to_string()])
         );
+    }
+
+    fn jwt(claims: Value) -> String {
+        format!("e30.{}.c2ln", URL_SAFE_NO_PAD.encode(claims.to_string()))
+    }
+
+    /// A stand-in control plane that records each call.
+    #[derive(Default)]
+    struct Fake {
+        /// Path, bearer and body of each call.
+        calls: Mutex<Vec<(String, Option<String>, Value)>>,
+        /// Statuses `/token/delegate` answers with before it succeeds.
+        refusals: Mutex<Vec<StatusCode>>,
+        exchanges: AtomicUsize,
+        /// `exp` of the gateway tokens the exchange mints.
+        gateway_exp: AtomicU64,
+    }
+
+    impl Fake {
+        fn record(&self, path: &str, headers: &HeaderMap, body: &Value) {
+            let bearer = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::to_string);
+            self.calls
+                .lock()
+                .unwrap()
+                .push((path.to_string(), bearer, body.clone()));
+        }
+
+        fn calls(&self, path: &str) -> Vec<(Option<String>, Value)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(called, _, _)| called == path)
+                .map(|(_, bearer, body)| (bearer.clone(), body.clone()))
+                .collect()
+        }
+    }
+
+    async fn serve(fake: Arc<Fake>) -> ControlPlane {
+        let router = axum::Router::new()
+            .route(
+                "/v1/tenants/t/token/exchange",
+                post(
+                    |State(fake): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                        fake.record("exchange", &headers, &body);
+                        let n = fake.exchanges.fetch_add(1, Ordering::SeqCst);
+                        let exp = fake.gateway_exp.load(Ordering::SeqCst);
+                        Json(json!({
+                            "felix_token": jwt(json!({ "sub": "gateway", "exp": exp, "n": n })),
+                            "refresh_token": "unused",
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1/tenants/t/token/refresh",
+                post(
+                    |State(fake): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                        fake.record("refresh", &headers, &body);
+                        Json(json!({
+                            "felix_token": jwt(json!({ "sub": "ana", "exp": now() + 900, "n": 2 })),
+                            "refresh_token": "r2",
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1/tenants/t/token/delegate",
+                post(
+                    |State(fake): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                        fake.record("delegate", &headers, &body);
+                        if let Some(status) = fake.refusals.lock().unwrap().pop() {
+                            return Err(status);
+                        }
+                        let subject = body["subject_token"].as_str().unwrap_or_default();
+                        Ok(Json(json!({
+                            "access_token": format!("delegated:{subject}"),
+                            "issued_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                            "token_type": "Bearer",
+                            "expires_in": 900,
+                        })))
+                    },
+                ),
+            )
+            .with_state(fake);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        ControlPlane::new(&format!("http://{addr}"), "t", "default")
+    }
+
+    /// A credential file holding `token`, unique to `test`.
+    fn credential(test: &str, token: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("felix-gateway-{test}-{}.token", std::process::id()));
+        std::fs::write(&path, format!("{token}\n")).unwrap();
+        path
+    }
+
+    async fn actor(test: &str, gateway_exp: u64) -> (Arc<Fake>, ControlPlane, Arc<Actor>, PathBuf) {
+        let fake = Arc::new(Fake::default());
+        fake.gateway_exp.store(gateway_exp, Ordering::SeqCst);
+        let control_plane = serve(Arc::clone(&fake)).await;
+        let file = credential(test, "gateway-id-token");
+        let actor = Arc::new(Actor::new(control_plane.clone(), file.clone()));
+        (fake, control_plane, actor, file)
+    }
+
+    #[tokio::test]
+    async fn a_scope_token_is_delegated_with_the_gateways_own_token() {
+        let (fake, _, actor, _) = actor("delegate", now() + 3600).await;
+        let delegated = actor.delegate("ana-scope-token").await.unwrap();
+        assert_eq!(delegated, "delegated:ana-scope-token");
+
+        let exchanges = fake.calls("exchange");
+        assert_eq!(exchanges.len(), 1);
+        let (bearer, body) = &exchanges[0];
+        assert_eq!(bearer.as_deref(), Some("gateway-id-token"));
+        assert_eq!(
+            body,
+            &json!({ "audience": "felix-controlplane", "requested": ["token.delegate"] })
+        );
+        let delegations = fake.calls("delegate");
+        let (bearer, body) = &delegations[0];
+        assert_eq!(claims(bearer.as_deref().unwrap()).unwrap().sub, "gateway");
+        assert_eq!(body["grant_type"], TOKEN_EXCHANGE_GRANT);
+        assert_eq!(body["subject_token"], "ana-scope-token");
+        assert!(body.get("permissions").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_delegates_the_refreshed_scope_token() {
+        let (fake, control_plane, actor, _) = actor("refresh", now() + 3600).await;
+        let grant = Grant {
+            felix_token: "ana-scope-token".into(),
+            refresh_token: "r1".into(),
+            principal: "ana".into(),
+            missing: vec![],
+        };
+        // Already expired, so the first use refreshes.
+        let initial = jwt(json!({ "sub": "ana", "iat": now() - 900, "exp": now() - 1 }));
+        let tokens = control_plane.delegated_tokens(grant, initial, actor);
+        let token = tokens.token().await.unwrap();
+
+        let refreshes = fake.calls("refresh");
+        assert_eq!(refreshes.len(), 1);
+        assert_eq!(refreshes[0].1, json!({ "refresh_token": "r1" }));
+        let delegations = fake.calls("delegate");
+        assert_eq!(delegations.len(), 1);
+        let refreshed = delegations[0].1["subject_token"].as_str().unwrap();
+        assert_eq!(claims(refreshed).unwrap().sub, "ana");
+        assert_eq!(token, format!("delegated:{refreshed}"));
+    }
+
+    #[tokio::test]
+    async fn the_gateway_token_is_kept_until_it_nears_expiry() {
+        let (fake, _, actor, _) = actor("kept", now() + 3600).await;
+        actor.delegate("one").await.unwrap();
+        actor.delegate("two").await.unwrap();
+        assert_eq!(fake.exchanges.load(Ordering::SeqCst), 1);
+
+        let (fake, _, actor, file) = actor_with_short_tokens().await;
+        actor.delegate("one").await.unwrap();
+        std::fs::write(&file, "rotated-id-token").unwrap();
+        actor.delegate("two").await.unwrap();
+        let bearers: Vec<Option<String>> = fake
+            .calls("exchange")
+            .into_iter()
+            .map(|(bearer, _)| bearer)
+            .collect();
+        assert_eq!(
+            bearers,
+            [
+                Some("gateway-id-token".into()),
+                Some("rotated-id-token".into())
+            ],
+            "a token about to expire is replaced, from the file as it is now"
+        );
+    }
+
+    async fn actor_with_short_tokens() -> (Arc<Fake>, ControlPlane, Arc<Actor>, PathBuf) {
+        actor("short", now() + RENEW_BEFORE.as_secs() / 2).await
+    }
+
+    #[tokio::test]
+    async fn a_rejected_gateway_token_is_replaced_once() {
+        let (fake, _, actor, _) = actor("rejected", now() + 3600).await;
+        fake.refusals.lock().unwrap().push(StatusCode::UNAUTHORIZED);
+        assert!(actor.delegate("ana").await.is_ok());
+        assert_eq!(fake.exchanges.load(Ordering::SeqCst), 2);
+
+        fake.refusals
+            .lock()
+            .unwrap()
+            .extend([StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED]);
+        assert!(matches!(
+            actor.delegate("ana").await,
+            Err(Refused::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_refused_delegation_is_the_gateways_problem_and_names_no_user() {
+        let (fake, _, actor, _) = actor("forbidden", now() + 3600).await;
+        fake.refusals.lock().unwrap().push(StatusCode::FORBIDDEN);
+        let Err(Refused::Unavailable(err)) = actor.delegate("ana-scope-token").await else {
+            panic!("a 403 from /token/delegate is unavailable");
+        };
+        assert_eq!(err.to_string(), "the gateway cannot act for users");
     }
 }

@@ -46,6 +46,10 @@ browser client.
   stream falls behind and catches up from the log instead of losing records.
 - A slow-link throttle for demonstrating slow-consumer behaviour, off unless
   the scope file allows it.
+- Shared connections: with a credential and a client certificate of its own,
+  the gateway carries every session over a few Felix connections, each session
+  acting as its own user with a token delegated to the gateway. The broker
+  limits each user separately on a shared connection.
 - Latency metrics for the browser leg and the Felix leg, apart.
 - `felix-gateway-client`, the browser client, with an in-memory fake for tests.
 
@@ -117,6 +121,15 @@ The gateway never creates resources or grants; set those up in Felix first.
 [docs/configuration.md](docs/configuration.md) lists every variable, every
 scope file key and the Felix permissions each action needs.
 
+Each session opens its own Felix connection by default. Setting
+`GATEWAY_FELIX_CREDENTIAL_FILE`, `GATEWAY_FELIX_CLIENT_CERT` and
+`GATEWAY_FELIX_CLIENT_KEY` turns on [shared
+connections](docs/configuration.md#shared-connections) instead. They need
+Felix 0.6.0-preview.4 or later and more setup in Felix: the gateway's principal
+needs `token.delegate` on the tenant, and its certificate must carry the URI
+`felix:principal:<id>`. Per-session connections stay the default for that
+reason.
+
 ## Protocol
 
 JSON text frames over one WebSocket at `/ws`: `join` and `hello`, `subscribe`,
@@ -130,13 +143,16 @@ is the reference.
 
 Pre-1.0. The protocol, the scope file format and the library API may change
 between minor versions; version 1 of the wire protocol is frozen, and later
-changes arrive as negotiated features. Tested against Felix 0.6.0-preview.2.
+changes arrive as negotiated features. Tested against Felix 0.6.0-preview.4,
+which shared connections require.
 
 Known limits, all on the Felix side:
 
-- Each session opens its own Felix client, and a broker accepts a bounded
-  number of connections, so very large audiences per gateway wait on Felix
-  connection multiplexing.
+- Without shared connections each session opens its own Felix client, and a
+  broker accepts a bounded number of connections.
+- A shared connection goes to one broker, because Felix's cluster client does
+  not carry identities yet. A subscription whose shard moves to another broker
+  ends and is subscribed again by the browser.
 - Felix events carry no publisher, which is why sender stamping lives in the
   gateway.
 

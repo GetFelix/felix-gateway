@@ -1,7 +1,7 @@
 // Seeds the development stack: bootstrap a tenant that trusts the stand-in
 // identity provider, create each room's streams, caches and counter as named
 // in dev/scope.toml, and give each room a role whose members may open it.
-// Writes the broker's credential to the state directory.
+// Writes the brokers' credential and the gateway's to the state directory.
 import { createHash } from "node:crypto";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 
@@ -93,6 +93,10 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
     ],
     initial_admin_principals: [principal("demo-admin")],
     policies: [
+      // Gateways act for users on shared connections. Their own broker token
+      // needs one grant to be minted at all; it is never used.
+      { subject: "role:gateway", object: `tenant:${TENANT}`, action: "token.delegate" },
+      { subject: "role:gateway", object: object("cache", "demo.gateway"), action: "cache.read" },
       { subject: "role:admin", object: object("stream", "*"), action: "stream.manage" },
       { subject: "role:admin", object: object("cache", "*"), action: "cache.manage" },
       { subject: "role:broker", object: "cluster:*", action: "node.view" },
@@ -101,6 +105,10 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
     groupings: [
       { user: principal("demo-admin"), role: "role:admin" },
       { user: principal("demo-broker"), role: "role:broker" },
+      // The second is for a test: a token delegated to it must not pass on
+      // the first's connection.
+      { user: principal("demo-gateway"), role: "role:gateway" },
+      { user: principal("demo-other-gateway"), role: "role:gateway" },
     ],
   },
 });
@@ -155,3 +163,9 @@ await chmod(STATE, 0o777).catch(() => {});
 const broker = await exchange("demo-broker", { audience: "felix-controlplane" });
 await writeFile(`${STATE}/node.token`, broker, { mode: 0o644 });
 console.log(`wrote node.token to ${STATE}`);
+// GATEWAY_FELIX_CREDENTIAL_FILE: the gateway's ID token, which it exchanges
+// itself. Its certificate, from dev/up.sh, names the same principal.
+const gatewaySignIn = `${IDP}/token?sub=demo-gateway&aud=${CLIENT_ID}`;
+const { id_token: gateway } = await request("GET", gatewaySignIn);
+await writeFile(`${STATE}/gateway.token`, gateway, { mode: 0o644 });
+console.log(`wrote gateway.token to ${STATE}`);

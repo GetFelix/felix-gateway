@@ -6,7 +6,7 @@
 |---|---|
 | `crates/felix-gateway/` | The Rust crate: the library and the `felix-gateway` binary. `tests/relay.rs` runs against a real Felix; `examples/viewers.rs` holds the viewers for fanout measurements |
 | `packages/gateway-client/` | The `felix-gateway-client` npm package: the browser client and its in-memory fake |
-| `dev/` | Felix for local runs and CI: Docker Compose with one broker, a stand-in IdP, the seed script, and the test scope file |
+| `dev/` | Felix for local runs and CI: Docker Compose with two brokers (the second requires client certificates), a stand-in IdP, the seed script, and the test scope file |
 | `docker/Dockerfile` | The image |
 | `docs/` | The protocol and configuration references |
 
@@ -22,6 +22,7 @@ export GATEWAY_FELIX_CA_FILE="$PWD/dev/state/broker-cert.pem"
 export GATEWAY_SCOPE_FILE="$PWD/dev/scope.toml"
 export GATEWAY_TENANT=demo GATEWAY_OIDC_CLIENT_ID=felix-gateway
 cargo test --locked --test relay -- --include-ignored
+# CI runs the suite again over shared connections; see .github/workflows/ci.yml.
 
 npm ci
 npm run format:check
