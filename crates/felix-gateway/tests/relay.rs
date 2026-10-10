@@ -885,6 +885,18 @@ async fn shared_users_on_one_connection_each_have_their_own_subscription_cap() {
 
 /// `subject`, a scope token, delegated to the gateway signed in as `actor`.
 async fn delegate_as(actor: &str, subject: &str) -> String {
+    let delegated: Value = request_delegation(actor, subject)
+        .await
+        .error_for_status()
+        .expect("the token is delegated")
+        .json()
+        .await
+        .unwrap();
+    delegated["access_token"].as_str().unwrap().to_string()
+}
+
+/// The control plane's answer to `actor` asking for `subject` delegated to it.
+async fn request_delegation(actor: &str, subject: &str) -> reqwest::Response {
     let config = config();
     let base = format!(
         "{}/v1/tenants/{}/token",
@@ -902,8 +914,7 @@ async fn delegate_as(actor: &str, subject: &str) -> String {
         .json()
         .await
         .unwrap();
-    let delegated: Value = http
-        .post(format!("{base}/delegate"))
+    http.post(format!("{base}/delegate"))
         .bearer_auth(exchanged["felix_token"].as_str().unwrap())
         .json(&json!({
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
@@ -911,12 +922,7 @@ async fn delegate_as(actor: &str, subject: &str) -> String {
         }))
         .send()
         .await
-        .and_then(reqwest::Response::error_for_status)
-        .expect("the token is delegated")
-        .json()
-        .await
-        .unwrap();
-    delegated["access_token"].as_str().unwrap().to_string()
+        .expect("the delegate request is answered")
 }
 
 #[tokio::test]
@@ -934,11 +940,13 @@ async fn shared_connections_refuse_a_token_not_delegated_to_the_gateway() {
         undelegated.is_err(),
         "a token without act passed on the gateway's certificate"
     );
-    let elsewhere = delegate_as("demo-other-gateway", &ana).await;
-    let elsewhere = gateway.attach_shared(Arc::new(Fixed(elsewhere))).await;
-    assert!(
-        elsewhere.is_err(),
-        "a token whose act is another principal passed on the gateway's certificate"
+    // The scope token was minted for this gateway (`may_act`), so the control
+    // plane will not delegate it to another one.
+    let elsewhere = request_delegation("demo-other-gateway", &ana).await;
+    assert_eq!(
+        elsewhere.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a token minted for this gateway was delegated to another"
     );
 
     let ours = delegate_as("demo-gateway", &ana).await;
