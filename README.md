@@ -131,9 +131,9 @@ Each session opens its own Felix connection by default. Setting
 `GATEWAY_FELIX_CREDENTIAL_FILE`, `GATEWAY_FELIX_CLIENT_CERT` and
 `GATEWAY_FELIX_CLIENT_KEY` turns on [shared
 connections](docs/configuration.md#shared-connections) instead. They need
-Felix 0.6.0-preview.4 or later and more setup in Felix: the gateway's principal
-needs `token.delegate` on the tenant, and its certificate must carry the URI
-`felix:principal:<id>`. Per-session connections stay the default for that
+Felix 0.6.0-preview.7 or later and more setup in Felix: the gateway's principal
+needs `token.delegate` on the tenant, and no broker grant, and its certificate
+must carry the URI `felix:principal:<id>`. Per-session connections stay the default for that
 reason.
 
 ## Protocol
@@ -149,8 +149,8 @@ is the reference.
 
 Pre-1.0. The protocol, the scope file format and the library API may change
 between minor versions; version 1 of the wire protocol is frozen, and later
-changes arrive as negotiated features. Tested against Felix 0.6.0-preview.5.
-Shared connections require 0.6.0-preview.4 or later.
+changes arrive as negotiated features. Tested against Felix 0.6.0-preview.7.
+Shared connections require 0.6.0-preview.7 or later.
 
 Known limits, all on the Felix side:
 

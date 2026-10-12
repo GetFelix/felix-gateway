@@ -65,6 +65,31 @@ const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
 /// delegation never goes out with one about to lapse.
 const RENEW_BEFORE: Duration = Duration::from_secs(60);
 
+/// Why the gateway's own exchange failed.
+#[derive(Debug)]
+enum OwnRefusal {
+    /// 403, with the body the control plane gave.
+    Forbidden(String),
+    Failed(anyhow::Error),
+}
+
+impl From<anyhow::Error> for OwnRefusal {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Failed(err)
+    }
+}
+
+impl From<OwnRefusal> for anyhow::Error {
+    fn from(refusal: OwnRefusal) -> Self {
+        match refusal {
+            OwnRefusal::Forbidden(body) => {
+                anyhow::anyhow!("the control plane refused the gateway's exchange: {body}")
+            }
+            OwnRefusal::Failed(err) => err,
+        }
+    }
+}
+
 /// Why `/token/delegate` refused.
 #[derive(Debug)]
 enum Delegation {
@@ -222,8 +247,8 @@ impl ControlPlane {
 impl ControlPlane {
     /// Exchange the gateway's own `credential` for a Felix token, asking with
     /// `request` for its audience and narrowing.
-    async fn own_token(&self, credential: &str, request: Value) -> Result<String> {
-        let answer: TokenResponse = self
+    async fn own_token(&self, credential: &str, request: Value) -> Result<String, OwnRefusal> {
+        let response = self
             .http
             .post(format!(
                 "{}/v1/tenants/{}/token/exchange",
@@ -233,7 +258,14 @@ impl ControlPlane {
             .json(&request)
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
+            .context("exchange the gateway's credential")?;
+        if response.status() == StatusCode::FORBIDDEN {
+            return Err(OwnRefusal::Forbidden(
+                response.text().await.unwrap_or_default(),
+            ));
+        }
+        let answer: TokenResponse = response
+            .error_for_status()
             .context("exchange the gateway's credential")?
             .json()
             .await
@@ -334,14 +366,29 @@ impl Actor {
         Ok(token.trim().to_string())
     }
 
-    /// A broker token for the gateway's own principal, which is what its
-    /// shared connections open with. It carries every broker grant the
-    /// principal has; the gateway sends no requests of its own on it.
+    /// A connection-only broker token for the gateway's own principal, which
+    /// is what its shared connections open with. It carries no permissions:
+    /// every request on those connections goes with a user's delegated token.
     pub(crate) async fn broker_token(&self) -> Result<String> {
         let credential = self.credential()?;
-        self.control_plane
-            .own_token(&credential, json!({ "audience": "felix-broker" }))
-            .await
+        let request = json!({ "audience": "felix-broker", "requested": [], "permissions": [] });
+        match self.control_plane.own_token(&credential, request).await {
+            Ok(token) => Ok(token),
+            // A control plane before Felix 0.6.0-preview.7 mints no token
+            // without a permission, and narrows this request to nothing.
+            Err(OwnRefusal::Forbidden(body)) => {
+                tracing::error!(
+                    %body,
+                    "the control plane refused the gateway a connection-only broker token; \
+                     shared connections need Felix 0.6.0-preview.7 or later and \
+                     token.delegate on the tenant for the gateway's principal"
+                );
+                Err(anyhow::anyhow!(
+                    "the control plane will not mint the gateway's connection-only broker token"
+                ))
+            }
+            Err(OwnRefusal::Failed(err)) => Err(err),
+        }
     }
 
     /// The `felix-controlplane` token to delegate with, narrowed to
@@ -535,6 +582,9 @@ mod tests {
         /// Statuses and error codes a user's exchange answers with before it
         /// succeeds.
         user_refusals: Mutex<Vec<(StatusCode, &'static str)>>,
+        /// Bodies the gateway's own exchanges answer 403 with before they
+        /// succeed.
+        gateway_refusals: Mutex<Vec<&'static str>>,
         exchanges: AtomicUsize,
         /// `exp` of the gateway tokens the exchange mints.
         gateway_exp: AtomicU64,
@@ -573,6 +623,12 @@ mod tests {
                         fake.record("exchange", &headers, &body);
                         if body.get("audience").is_none() {
                             return user_exchange(&fake, &body);
+                        }
+                        if let Some(message) = fake.gateway_refusals.lock().unwrap().pop() {
+                            return Err((
+                                StatusCode::FORBIDDEN,
+                                Json(json!({ "code": "forbidden", "message": message })),
+                            ));
                         }
                         let n = fake.exchanges.fetch_add(1, Ordering::SeqCst);
                         let exp = fake.gateway_exp.load(Ordering::SeqCst);
@@ -769,6 +825,32 @@ mod tests {
             panic!("a 403 from /token/delegate is unavailable");
         };
         assert_eq!(err.to_string(), "the gateway cannot act for users");
+    }
+
+    #[tokio::test]
+    async fn the_shared_connections_open_with_a_connection_only_token() {
+        let (fake, _, actor, _) = actor("broker-token", now() + 3600).await;
+        let token = actor.broker_token().await.unwrap();
+        assert_eq!(claims(&token).unwrap().sub, "gateway");
+
+        let exchanges = fake.calls("exchange");
+        let (bearer, body) = &exchanges[0];
+        assert_eq!(bearer.as_deref(), Some("gateway-id-token"));
+        assert_eq!(
+            body,
+            &json!({ "audience": "felix-broker", "requested": [], "permissions": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_without_connection_only_tokens_is_a_setup_error() {
+        let (fake, _, actor, _) = actor("broker-token-refused", now() + 3600).await;
+        fake.gateway_refusals.lock().unwrap().push("no permissions");
+        let err = actor.broker_token().await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the control plane will not mint the gateway's connection-only broker token"
+        );
     }
 
     fn user_exchanges(fake: &Fake) -> Vec<Value> {

@@ -94,9 +94,8 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
     initial_admin_principals: [principal("demo-admin")],
     policies: [
       // Gateways act for users on shared connections. Their own broker token
-      // needs one grant to be minted at all; it is never used.
+      // is connection-only, so they need no broker grant.
       { subject: "role:gateway", object: `tenant:${TENANT}`, action: "token.delegate" },
-      { subject: "role:gateway", object: object("cache", "demo.gateway"), action: "cache.read" },
       { subject: "role:admin", object: object("stream", "*"), action: "stream.manage" },
       { subject: "role:admin", object: object("cache", "*"), action: "cache.manage" },
       { subject: "role:broker", object: "cluster:*", action: "node.view" },

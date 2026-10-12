@@ -11,6 +11,19 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Changed
+
+- Shared connections open with a connection-only broker token: the gateway
+  exchanges for `{"audience": "felix-broker", "requested": [], "permissions":
+  []}`, which Felix 0.6.0-preview.7 mints with no permissions for a principal
+  holding `token.delegate`. The gateway's principal no longer needs a broker
+  grant, and `dev/seed.mjs` no longer grants a placeholder `cache.read`. A
+  control plane before preview.7 answers `403` `no permissions`; the gateway
+  logs that as a setup error naming the version it needs, and joins answer
+  `unavailable`. Upgrade Felix before the gateway, or keep the old grant
+  until then (it does no harm). Built against Felix 0.6.0-preview.7, and
+  `dev/` runs it.
+
 ## [0.3.2] - 2026-10-10
 
 Tested against Felix 0.6.0-preview.5. A browser session whose network drops
