@@ -60,12 +60,20 @@ gateway at startup, naming the ones missing.
 | `GATEWAY_FELIX_CLIENT_KEY` | unset | The PEM private key of that certificate |
 | `GATEWAY_FELIX_SHARED_CONNECTIONS` | `4` | How many connections sessions are spread over. Each session goes to the one with the fewest |
 
-They need Felix 0.6.0-preview.4 or later, on the control plane and the
-brokers. From 0.6.0-preview.5, Felix delegates only a scope token minted for
-the gateway that asks (step 2 below). Gateway 0.3.0 and earlier do not ask for
-one, so against Felix 0.6.0-preview.5 or later they need
-`FELIX_CONTROLPLANE_DELEGATE_UNBOUND_TOKENS=true` on the control plane. A join
-works like this:
+They need Felix 0.6.0-preview.7 or later, on the control plane and the
+brokers (gateway 0.3.2 and earlier: preview.4 or later). From
+0.6.0-preview.5, Felix delegates only a scope token minted for the gateway
+that asks (step 2 below). Gateway 0.3.0 and earlier do not ask for one, so
+against Felix 0.6.0-preview.5 or later they need
+`FELIX_CONTROLPLANE_DELEGATE_UNBOUND_TOKENS=true` on the control plane.
+
+Each shared connection opens with a broker token for the gateway's own
+principal, exchanged with `{"audience": "felix-broker", "requested": [],
+"permissions": []}`. Felix mints that as a connection-only token, with the
+gateway's `sub` and no permissions, for a principal holding `token.delegate`.
+It is fetched again before it expires. An older control plane answers `403`
+`no permissions`; the gateway logs that as a setup error and the join answers
+`unavailable`. A join works like this:
 
 1. The gateway exchanges its own credential for a `felix-controlplane` token
    narrowed to `token.delegate`, kept until a minute before it expires.
@@ -106,11 +114,8 @@ The Felix side needs:
   SHA-256 of `<issuer>|<subject>` in hex; that is the id the certificate and
   the grants below use.
 - `token.delegate` over `tenant:{tenant}` for that principal. `tenant.manage`
-  does not include it.
-- One broker grant for that principal, any grant, because the control plane
-  mints no token without a permission and the shared connections open with the
-  gateway's own broker token. The gateway sends no requests of its own;
-  `dev/seed.mjs` grants `cache.read` on a cache that does not exist.
+  does not include it. No broker grant: the shared connections open with a
+  connection-only broker token (below).
 - A client certificate whose subject alternative names include the URI
   `felix:principal:<id>`, from a CA the brokers trust (`FELIX_TLS_CLIENT_CA`).
   With `FELIX_TLS_CLIENT_CERT_BIND_SUBJECT=true` the brokers accept a token on
