@@ -11,6 +11,13 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-11
+
+Tested against Felix 0.6.0-preview.7. Shared connections open with a
+connection-only broker token, so the gateway's principal needs only
+`token.delegate` and no placeholder broker grant. Shared connections now need
+Felix 0.6.0-preview.7 or later; per-session connections are unaffected.
+
 ### Changed
 
 - Shared connections open with a connection-only broker token: the gateway
