@@ -11,6 +11,9 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Security
+- rustls 0.23.46, which fixes RUSTSEC-2026-0346 to 0349 (TLS secrets in `Debug` output, a ServerHello downgrade to classical key exchange, ECH rejection, and unbounded brotli certificate decompression).
+
 ## [0.3.3] - 2026-10-11
 
 Tested against Felix 0.6.0-preview.7. Shared connections open with a
