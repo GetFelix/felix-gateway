@@ -11,6 +11,14 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-16
+
+Tested against Felix 0.6.0-preview.7. Two optional protocol features for
+game-shaped traffic: `binary_events` sends events as binary frames that carry
+the gateway's receive and send times, and `slots` lets one connection hold
+several subscriptions on a stream. Sessions that do not ask for them see no
+change. A custom `BrowserConnection` must now implement `send_binary`.
+
 ### Added
 
 - The `binary_events` feature: events arrive as binary WebSocket frames, a 40-byte header with the subscription, offset and the gateway's receive and send times, then the payload as published. No base64, and no JSON parse per event (#23).
