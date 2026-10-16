@@ -1,4 +1,4 @@
-//! Latency of the gateway's two legs, kept apart so a slow request can be
+//! Latency of the gateway's legs, kept apart so a slow request can be
 //! blamed on the right hop, and counts of what the write limits refused.
 
 use std::collections::{BTreeMap, HashMap};
@@ -14,6 +14,8 @@ pub struct Metrics {
     browser_rtt: Mutex<Histogram<u64>>,
     /// Keyed by stream alias.
     felix_publish_ack: HashMap<String, Mutex<Histogram<u64>>>,
+    /// Keyed by stream alias.
+    event_relay: HashMap<String, Mutex<Histogram<u64>>>,
     /// Indexed by [`Refusal`].
     refused: [AtomicU64; Refusal::ALL.len()],
 }
@@ -68,6 +70,9 @@ pub struct Snapshot {
     pub browser_rtt: Summary,
     /// Gateway to Felix and back: an acknowledged publish, for each stream.
     pub felix_publish_ack: BTreeMap<String, Summary>,
+    /// Felix to browser through the gateway: an event's arrival from Felix to
+    /// its write to the WebSocket, for each stream.
+    pub event_relay: BTreeMap<String, Summary>,
     /// Writes and sessions refused by each limit since the gateway started.
     pub limits_refused: BTreeMap<String, u64>,
 }
@@ -78,14 +83,20 @@ fn histogram() -> Mutex<Histogram<u64>> {
 }
 
 impl Metrics {
-    /// Histograms for the browser leg and for publishes on each of `streams`.
+    /// Histograms for the browser leg, and for publishes and events on each
+    /// of `streams`.
     pub(crate) fn new<'a>(streams: impl IntoIterator<Item = &'a str>) -> Self {
+        let streams: Vec<&str> = streams.into_iter().collect();
+        let per_stream = || {
+            streams
+                .iter()
+                .map(|stream| (stream.to_string(), histogram()))
+                .collect()
+        };
         Self {
             browser_rtt: histogram(),
-            felix_publish_ack: streams
-                .into_iter()
-                .map(|stream| (stream.to_string(), histogram()))
-                .collect(),
+            felix_publish_ack: per_stream(),
+            event_relay: per_stream(),
             refused: Default::default(),
         }
     }
@@ -104,12 +115,23 @@ impl Metrics {
         }
     }
 
+    pub(crate) fn record_event_relay(&self, stream: &str, elapsed: Duration) {
+        if let Some(histogram) = self.event_relay.get(stream) {
+            record(histogram, elapsed);
+        }
+    }
+
     /// The percentiles recorded so far.
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             browser_rtt: summarize(&self.browser_rtt),
             felix_publish_ack: self
                 .felix_publish_ack
+                .iter()
+                .map(|(stream, histogram)| (stream.clone(), summarize(histogram)))
+                .collect(),
+            event_relay: self
+                .event_relay
                 .iter()
                 .map(|(stream, histogram)| (stream.clone(), summarize(histogram)))
                 .collect(),

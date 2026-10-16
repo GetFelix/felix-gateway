@@ -27,6 +27,10 @@ pub trait BrowserConnection: Send {
     /// Send one protocol message.
     fn send(&mut self, message: String) -> impl Future<Output = Result<()>> + Send;
 
+    /// Send one binary event frame, for sessions with the `binary_events`
+    /// feature.
+    fn send_binary(&mut self, frame: Vec<u8>) -> impl Future<Output = Result<()>> + Send;
+
     /// Start a round-trip measurement, answered later as [`Incoming::RoundTrip`].
     fn ping(&mut self) -> impl Future<Output = Result<()>> + Send;
 }

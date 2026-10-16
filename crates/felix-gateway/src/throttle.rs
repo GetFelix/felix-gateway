@@ -7,8 +7,6 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::protocol::ServerMessage;
-
 /// Paces how fast one connection reads its subscriptions, as if every event
 /// had to cross a link of a set speed. Felix keeps delivering at full rate, so
 /// the subscription's bounded queue fills and drops new events, which a
@@ -28,13 +26,14 @@ impl Throttle {
             .store(bits_per_second.unwrap_or(0), Ordering::Relaxed);
     }
 
-    /// Wait until the link is free to carry `message`.
-    pub(crate) async fn pass(&self, message: &ServerMessage) {
+    /// Wait until the link is free to carry a message of `bytes()` bytes.
+    /// `bytes` is only called while the throttle is on.
+    pub(crate) async fn pass(&self, bytes: impl FnOnce() -> usize) {
         let rate = self.bits_per_second.load(Ordering::Relaxed);
         if rate == 0 {
             return;
         }
-        let bytes = serde_json::to_string(message).map_or(0, |text| text.len());
+        let bytes = bytes();
         tokio::time::sleep_until(self.reserve(bytes, rate)).await;
     }
 
@@ -74,12 +73,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn passes_at_once_when_off() {
         let throttle = Throttle::default();
-        let message = ServerMessage::Counter { id: 1, value: 2 };
         throttle.set(Some(8));
         throttle.set(None);
         let start = Instant::now();
         for _ in 0..100 {
-            throttle.pass(&message).await;
+            throttle.pass(|| 500).await;
         }
         assert_eq!(Instant::now(), start);
     }

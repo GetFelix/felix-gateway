@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::body::Bytes;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use felix_client::{CacheChange, CacheWatchItem, CursorErrorReason, SubscribeCursorError};
@@ -20,8 +21,8 @@ use crate::felix::Felix;
 use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
-    CacheEntry, ClientMessage, ErrorCode, FEATURES, Join, PROTOCOL, RATE_LIMITED, ServerMessage,
-    StartAt,
+    BINARY_EVENTS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES, Join, PROTOCOL,
+    RATE_LIMITED, ServerMessage, StartAt,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -61,18 +62,62 @@ enum Write {
     },
 }
 
+/// What a session's subscriptions and watches queue for the browser.
+enum Outbound {
+    Message(ServerMessage),
+    Event(Relayed),
+}
+
+/// One event on its way to the browser, encoded only when it is sent so the
+/// frame's send time is the real one.
+struct Relayed {
+    stream: String,
+    slot: Option<String>,
+    /// The subscription's number, for a session with [`BINARY_EVENTS`].
+    sub: Option<u32>,
+    offset: Option<u64>,
+    skipped_before: u64,
+    payload: Bytes,
+    received: Instant,
+    received_us: u64,
+}
+
+impl Relayed {
+    fn json(&self) -> ServerMessage {
+        ServerMessage::Event {
+            stream: self.stream.clone(),
+            slot: self.slot.clone(),
+            offset: self.offset,
+            skipped_before: self.skipped_before,
+            payload: BASE64.encode(&self.payload),
+        }
+    }
+
+    /// The bytes it takes on the wire.
+    fn size(&self) -> usize {
+        match self.sub {
+            Some(_) => EventFrame::HEADER_LEN + self.payload.len(),
+            None => serde_json::to_string(&self.json()).map_or(0, |text| text.len()),
+        }
+    }
+}
+
 /// One joined connection's tasks and queues.
 struct Session {
     felix: Arc<Felix>,
     limits: SessionLimits,
     /// The session asked for [`RATE_LIMITED`].
     rate_limited: bool,
+    /// The session asked for [`BINARY_EVENTS`].
+    binary: bool,
+    /// The number the next subscription's frames carry.
+    next_sub: u32,
     throttle: Arc<Throttle>,
-    events: mpsc::Sender<ServerMessage>,
+    events: mpsc::Sender<Outbound>,
     replies: mpsc::UnboundedSender<ServerMessage>,
     writes: mpsc::Sender<Write>,
-    /// Keyed by stream alias.
-    subscriptions: HashMap<String, JoinHandle<()>>,
+    /// Keyed by stream alias and slot.
+    subscriptions: HashMap<(String, Option<String>), JoinHandle<()>>,
     /// Keyed by cache alias.
     watches: HashMap<String, JoinHandle<()>>,
 }
@@ -96,6 +141,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         hello,
         limits,
         rate_limited,
+        binary,
     }) = join(&mut conn, &gateway, client).await
     else {
         return;
@@ -117,6 +163,8 @@ pub(crate) async fn run<C: BrowserConnection>(
         felix,
         limits,
         rate_limited,
+        binary,
+        next_sub: 0,
         throttle: Arc::new(Throttle::default()),
         events: events_tx,
         replies: replies_tx,
@@ -133,7 +181,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         let step = tokio::select! {
             incoming = conn.recv() => Step::Incoming(incoming),
             Some(event) = events_rx.recv() => Step::Send(event),
-            Some(reply) = replies_rx.recv() => Step::Send(reply),
+            Some(reply) = replies_rx.recv() => Step::Send(Outbound::Message(reply)),
             beat = pulse.next() => match beat {
                 Beat::Ping => Step::Ping,
                 // The loop may have been busy past the deadline with a frame
@@ -159,7 +207,7 @@ pub(crate) async fn run<C: BrowserConnection>(
                     }
                     Some(Incoming::Message(text)) => match session.handle(&text).await {
                         Next::Continue => continue,
-                        Next::Reply(reply) => reply,
+                        Next::Reply(reply) => Outbound::Message(reply),
                         Next::Stop => break,
                     },
                 }
@@ -179,7 +227,7 @@ pub(crate) async fn run<C: BrowserConnection>(
             }
         };
         let sent = tokio::select! {
-            sent = send(&mut conn, &outbound) => sent.is_ok(),
+            sent = send_outbound(&mut conn, outbound, &gateway.metrics) => sent.is_ok(),
             () = pulse.silent() => false,
         };
         if !sent {
@@ -219,7 +267,7 @@ enum Beat {
 /// What the relay loop does next.
 enum Step {
     Incoming(Option<Incoming>),
-    Send(ServerMessage),
+    Send(Outbound),
     Ping,
 }
 
@@ -282,22 +330,41 @@ impl Session {
         let felix = Arc::clone(&self.felix);
         let scope = &felix.scope;
         match message {
-            ClientMessage::Subscribe { stream, from } => {
+            ClientMessage::Subscribe { stream, from, slot } => {
+                if let Some(slot) = &slot
+                    && !valid_name(slot)
+                {
+                    let mut refusal = stream_error(stream, ErrorCode::BadRequest, BAD_NAME);
+                    with_slot(&mut refusal, Some(slot));
+                    return Next::Reply(refusal);
+                }
                 let name = match scope.stream(&stream, StreamAction::Subscribe) {
                     Ok(bound) => bound.name,
                     Err(refusal) => {
-                        return Next::Reply(stream_error(stream, ErrorCode::BadRequest, refusal));
+                        let mut refusal = stream_error(stream, ErrorCode::BadRequest, refusal);
+                        with_slot(&mut refusal, slot.as_ref());
+                        return Next::Reply(refusal);
                     }
                 };
+                let sub = self.binary.then(|| {
+                    let sub = self.next_sub;
+                    self.next_sub = self.next_sub.wrapping_add(1);
+                    sub
+                });
+                let target = Target {
+                    stream: stream.clone(),
+                    slot: slot.clone(),
+                    sub,
+                };
                 let task = tokio::spawn(relay_subscription(
-                    stream.clone(),
+                    target,
                     name,
                     from,
                     Arc::clone(&self.felix),
                     Arc::clone(&self.throttle),
                     self.events.clone(),
                 ));
-                if let Some(previous) = self.subscriptions.insert(stream, task) {
+                if let Some(previous) = self.subscriptions.insert((stream, slot), task) {
                     previous.abort();
                 }
                 Next::Continue
@@ -588,6 +655,7 @@ struct Joined {
     hello: ServerMessage,
     limits: SessionLimits,
     rate_limited: bool,
+    binary: bool,
 }
 
 /// Wait for the browser's `join`, exchange its sign-in for a token that
@@ -665,8 +733,9 @@ async fn accept(
         protocol: PROTOCOL,
         features: join
             .features
-            .into_iter()
+            .iter()
             .filter(|feature| FEATURES.contains(&feature.as_str()))
+            .cloned()
             .collect(),
         namespace: gateway.brokers.namespace().to_string(),
         scope: BTreeMap::from([(field.clone(), felix.scope.value().to_string())]),
@@ -678,6 +747,7 @@ async fn accept(
         hello,
         limits: SessionLimits::new(principal, ip, std::time::Instant::now()),
         rate_limited,
+        binary: join.features.iter().any(|feature| feature == BINARY_EVENTS),
     })
 }
 
@@ -740,42 +810,97 @@ async fn send<C: BrowserConnection>(conn: &mut C, message: &ServerMessage) -> an
         .await
 }
 
-async fn relay_subscription(
+/// Send `outbound`, an event as a binary frame when the session asked for
+/// them, and time the event's way through the gateway.
+async fn send_outbound<C: BrowserConnection>(
+    conn: &mut C,
+    outbound: Outbound,
+    metrics: &Metrics,
+) -> anyhow::Result<()> {
+    let event = match outbound {
+        Outbound::Message(message) => return send(conn, &message).await,
+        Outbound::Event(event) => event,
+    };
+    match event.sub {
+        Some(sub) => {
+            let frame = EventFrame {
+                sub,
+                offset: event.offset,
+                skipped_before: event.skipped_before,
+                received_us: event.received_us,
+                sent_us: unix_micros(),
+            };
+            conn.send_binary(frame.encode(&event.payload)).await?;
+        }
+        None => send(conn, &event.json()).await?,
+    }
+    metrics.record_event_relay(&event.stream, event.received.elapsed());
+    Ok(())
+}
+
+/// Microseconds since the Unix epoch on this host's clock.
+fn unix_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Where one subscription's events go: the stream's alias and slot, and the
+/// number its binary frames carry.
+struct Target {
     stream: String,
+    slot: Option<String>,
+    sub: Option<u32>,
+}
+
+async fn relay_subscription(
+    target: Target,
     name: String,
     from: StartAt,
     felix: Arc<Felix>,
     throttle: Arc<Throttle>,
-    events: mpsc::Sender<ServerMessage>,
+    events: mpsc::Sender<Outbound>,
 ) {
+    let Target { stream, slot, sub } = target;
+    let ended = |code, err| {
+        let mut message = subscription_error(stream.clone(), code, err);
+        with_slot(&mut message, slot.as_ref());
+        Outbound::Message(message)
+    };
     let mut subscription = match felix.subscribe(&name, from).await {
         Ok(subscription) => subscription,
         Err(err) => {
-            let _ = events
-                .send(subscription_error(stream, ErrorCode::SubscribeFailed, err))
-                .await;
+            let _ = events.send(ended(ErrorCode::SubscribeFailed, err)).await;
             return;
         }
     };
     let subscribed = ServerMessage::Subscribed {
         stream: stream.clone(),
+        slot: slot.clone(),
+        sub,
         start_offset: subscription.start_offset(),
         live_offset: subscription.live_offset(),
     };
-    if events.send(subscribed).await.is_err() {
+    if events.send(Outbound::Message(subscribed)).await.is_err() {
         return;
     }
-    let ended = loop {
+    let err = loop {
         match subscription.next_event().await {
             Ok(Some(event)) => {
-                let message = ServerMessage::Event {
+                let relayed = Relayed {
                     stream: stream.clone(),
+                    slot: slot.clone(),
+                    sub,
                     offset: event.offset,
                     skipped_before: event.skipped_before,
-                    payload: BASE64.encode(&event.payload),
+                    payload: event.payload,
+                    received: Instant::now(),
+                    received_us: unix_micros(),
                 };
-                throttle.pass(&message).await;
-                if events.send(message).await.is_err() {
+                throttle.pass(|| relayed.size()).await;
+                if events.send(Outbound::Event(relayed)).await.is_err() {
                     return;
                 }
             }
@@ -783,13 +908,14 @@ async fn relay_subscription(
             Err(err) => break err,
         }
     };
-    let _ = events
-        .send(subscription_error(
-            stream,
-            ErrorCode::SubscriptionEnded,
-            ended,
-        ))
-        .await;
+    let _ = events.send(ended(ErrorCode::SubscriptionEnded, err)).await;
+}
+
+/// `message`, an error, naming the subscription's `slot` when it has one.
+fn with_slot(message: &mut ServerMessage, slot: Option<&String>) {
+    if let ServerMessage::Error { slot: about, .. } = message {
+        *about = slot.cloned();
+    }
 }
 
 /// `trimmed`, naming the oldest offset left, when retention has passed the
@@ -812,13 +938,17 @@ async fn relay_cache(
     cache: String,
     name: String,
     felix: Arc<Felix>,
-    events: mpsc::Sender<ServerMessage>,
+    events: mpsc::Sender<Outbound>,
 ) {
     let mut watch = match felix.watch_cache(&name).await {
         Ok(watch) => watch,
         Err(err) => {
             let _ = events
-                .send(cache_error(cache, ErrorCode::WatchFailed, err))
+                .send(Outbound::Message(cache_error(
+                    cache,
+                    ErrorCode::WatchFailed,
+                    err,
+                )))
                 .await;
             return;
         }
@@ -833,7 +963,7 @@ async fn relay_cache(
                 cache: cache.clone(),
                 entries,
             };
-            if events.send(entries).await.is_err() {
+            if events.send(Outbound::Message(entries)).await.is_err() {
                 return;
             }
         }
@@ -852,7 +982,7 @@ async fn relay_cache(
                             cache: cache.clone(),
                             entry,
                         };
-                        if events.send(change).await.is_err() {
+                        if events.send(Outbound::Message(change)).await.is_err() {
                             return;
                         }
                     }
@@ -865,16 +995,16 @@ async fn relay_cache(
         }
     };
     let _ = events
-        .send(cache_error(cache, ErrorCode::WatchFailed, ended))
+        .send(Outbound::Message(cache_error(
+            cache,
+            ErrorCode::WatchFailed,
+            ended,
+        )))
         .await;
 }
 
 fn cache_entry(change: CacheChange) -> CacheEntry {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-        });
+    let now = unix_micros() / 1000;
     CacheEntry {
         key: change.key,
         payload: change.value.map(|value| BASE64.encode(value)),
@@ -887,6 +1017,7 @@ fn error(code: ErrorCode, err: impl std::fmt::Display) -> ServerMessage {
     ServerMessage::Error {
         id: None,
         stream: None,
+        slot: None,
         cache: None,
         code,
         oldest: None,
