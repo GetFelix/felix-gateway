@@ -450,7 +450,15 @@ async fn binary_events_reach_two_slots_on_one_stream() {
         expected[3..],
         "the live slot sees only the new record"
     );
-    assert!(gateway.metrics().event_relay["ops"].count >= 5);
+    // The gateway records an event after its write, so the last may lag.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while gateway.metrics().event_relay["ops"].count < 5 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "event_relay not recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]

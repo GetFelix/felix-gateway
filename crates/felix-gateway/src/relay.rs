@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::body::Bytes;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use felix_client::{CacheChange, CacheWatchItem, CursorErrorReason, SubscribeCursorError};
+use felix_client::{CacheChange, CacheWatchItem, CursorErrorReason, Event, SubscribeCursorError};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, Sleep};
@@ -22,7 +22,7 @@ use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
     BINARY_EVENTS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES, Join, PROTOCOL,
-    RATE_LIMITED, ServerMessage, StartAt,
+    RATE_LIMITED, SLOTS, ServerMessage, StartAt,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -92,14 +92,21 @@ impl Relayed {
             payload: BASE64.encode(&self.payload),
         }
     }
+}
 
-    /// The bytes it takes on the wire.
-    fn size(&self) -> usize {
-        match self.sub {
-            Some(_) => EventFrame::HEADER_LEN + self.payload.len(),
-            None => serde_json::to_string(&self.json()).map_or(0, |text| text.len()),
-        }
+/// The bytes `event` takes on the wire.
+fn event_size(sub: Option<u32>, slot: Option<&str>, stream: &str, event: &Event) -> usize {
+    if sub.is_some() {
+        return EventFrame::HEADER_LEN + event.payload.len();
     }
+    let json = ServerMessage::Event {
+        stream: stream.to_string(),
+        slot: slot.map(str::to_string),
+        offset: event.offset,
+        skipped_before: event.skipped_before,
+        payload: BASE64.encode(&event.payload),
+    };
+    serde_json::to_string(&json).map_or(0, |text| text.len())
 }
 
 /// One joined connection's tasks and queues.
@@ -110,6 +117,8 @@ struct Session {
     rate_limited: bool,
     /// The session asked for [`BINARY_EVENTS`].
     binary: bool,
+    /// The session asked for [`SLOTS`].
+    slots: bool,
     /// The number the next subscription's frames carry.
     next_sub: u32,
     throttle: Arc<Throttle>,
@@ -142,6 +151,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         limits,
         rate_limited,
         binary,
+        slots,
     }) = join(&mut conn, &gateway, client).await
     else {
         return;
@@ -164,6 +174,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         limits,
         rate_limited,
         binary,
+        slots,
         next_sub: 0,
         throttle: Arc::new(Throttle::default()),
         events: events_tx,
@@ -332,9 +343,14 @@ impl Session {
         match message {
             ClientMessage::Subscribe { stream, from, slot } => {
                 if let Some(slot) = &slot
-                    && !valid_name(slot)
+                    && !(self.slots && valid_name(slot))
                 {
-                    let mut refusal = stream_error(stream, ErrorCode::BadRequest, BAD_NAME);
+                    let reason = if self.slots {
+                        BAD_NAME
+                    } else {
+                        "a slot needs the slots feature"
+                    };
+                    let mut refusal = stream_error(stream, ErrorCode::BadRequest, reason);
                     with_slot(&mut refusal, Some(slot));
                     return Next::Reply(refusal);
                 }
@@ -656,6 +672,7 @@ struct Joined {
     limits: SessionLimits,
     rate_limited: bool,
     binary: bool,
+    slots: bool,
 }
 
 /// Wait for the browser's `join`, exchange its sign-in for a token that
@@ -748,6 +765,7 @@ async fn accept(
         limits: SessionLimits::new(principal, ip, std::time::Instant::now()),
         rate_limited,
         binary: join.features.iter().any(|feature| feature == BINARY_EVENTS),
+        slots: join.features.iter().any(|feature| feature == SLOTS),
     })
 }
 
@@ -889,6 +907,11 @@ async fn relay_subscription(
     let err = loop {
         match subscription.next_event().await {
             Ok(Some(event)) => {
+                // The throttle stands in for the browser's link, so its wait
+                // is not the gateway's: the clock starts after it.
+                throttle
+                    .pass(|| event_size(sub, slot.as_deref(), &stream, &event))
+                    .await;
                 let relayed = Relayed {
                     stream: stream.clone(),
                     slot: slot.clone(),
@@ -899,7 +922,6 @@ async fn relay_subscription(
                     received: Instant::now(),
                     received_us: unix_micros(),
                 };
-                throttle.pass(|| relayed.size()).await;
                 if events.send(Outbound::Event(relayed)).await.is_err() {
                     return;
                 }

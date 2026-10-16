@@ -126,7 +126,7 @@ quiet, such as after a network drop. Both times are settings, in
 |---|---|
 | `stream` | A stream alias whose actions include `subscribe` |
 | `from` | `"live"` for only what is published from now on, or a log offset: the first record wanted, which is the last offset handled plus one |
-| `slot` | Optional, with the `slots` feature: a name for this subscription, following the rule for `counter_add` keys. Leaving it out names the stream's default slot |
+| `slot` | Only with the `slots` feature, optional: a name for this subscription, following the rule for `counter_add` keys. Leaving it out names the stream's default slot. Without the feature a `slot` is refused with `bad_request` |
 
 Subscribing to a stream and slot the connection is already subscribed to
 replaces the earlier subscription; other slots of the same stream keep theirs.
@@ -521,7 +521,7 @@ An in-memory stream has nothing to replay, so its dropped events are gone.
 |---|---|
 | `browser_rtt` | Browser to gateway and back: the WebSocket ping sent every `GATEWAY_PING_INTERVAL_S` (default 5 seconds) per connection, answered by the browser itself |
 | `felix_publish_ack` | Gateway to Felix and back, one histogram per stream alias in the scope file: from handing an acknowledged publish to Felix until its ack |
-| `event_relay` | Felix to browser through the gateway, one histogram per stream alias: from an event's arrival from Felix until it is written to the WebSocket. It includes time spent waiting for a slow or throttled browser |
+| `event_relay` | Felix to browser through the gateway, one histogram per stream alias: from an event's arrival from Felix until it is written to the WebSocket. It includes time spent waiting for a slow browser, but not a `throttle`'s wait, which stands in for the network |
 
 `limits_refused` counts refusals since the gateway started, by the limit that
 refused:
