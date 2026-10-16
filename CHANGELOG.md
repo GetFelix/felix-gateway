@@ -11,6 +11,11 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Added
+
+- The `state` feature: `state_get` reads a key of a stream's state, the keys a Felix atomic commit writes with its event, and answers its value, the offset of the commit that wrote it and the offset the answer is as of. It needs `subscribe` on the stream (#26).
+- `shared = true` on a scope file resource: its name has no `{scope}`, and every scope reaches the same stream, cache or counter (#26).
+
 ## [0.4.0] - 2026-10-16
 
 Tested against Felix 0.6.0-preview.7. Two optional protocol features for

@@ -178,7 +178,8 @@ max_payload_bytes = 65536
 | `allow_throttle` | Top level, default `false`. Whether `throttle` is allowed. It exists to demonstrate a slow browser, and it lets a browser hold its subscriptions' queues full, so keep it `false` on a public gateway |
 | `field` | 1 to 64 ASCII letters, digits, `-` or `_`, and not `type`, `token`, `protocol` or `features` |
 | `alias` | What messages call the resource. The same rule as `field`, unique within its kind |
-| `name` | The Felix name. `{scope}` is replaced by the scope's value, and must appear, or every scope would share the resource |
+| `name` | The Felix name. `{scope}` is replaced by the scope's value, and must appear, or every scope would share the resource. A `shared` resource has none |
+| `shared` | Default `false`. When `true`, the name has no `{scope}` and every scope reaches the same resource, such as a directory that lists every room. Each session's token then carries the resource's actions whatever scope it opened, so give a shared resource only actions every scope may have |
 | `actions` | What a session may do. Streams: `publish`, `subscribe`. Caches: `read` (`cache_get`), `write` (`cache_put`, `cache_delete`), `watch` (`cache_watch`). Counters: `add` |
 | `optional` | Default `false`. When `true`, a sign-in that does not reach this resource still joins, and `hello` lists the alias under `missing`. A spectator without publish rights on a player's input stream is the usual case |
 | `stamp_sender` | Streams only, default `false`. Each publish is prefixed with the publisher's Felix principal (the `sub` of its scope token) as a 2-byte big-endian length and the UTF-8 bytes, so a reader knows who sent it and a browser cannot speak for someone else |

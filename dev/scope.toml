@@ -32,6 +32,13 @@ name = "demo.members.{scope}"
 actions = ["read", "write", "watch"]
 ttl_s = 30
 
+# One cache for every room: its name has no {scope}.
+[[scope.caches]]
+alias = "directory"
+name = "demo.directory"
+actions = ["read", "watch"]
+shared = true
+
 [[scope.counters]]
 alias = "seq"
 name = "demo.seq.{scope}"

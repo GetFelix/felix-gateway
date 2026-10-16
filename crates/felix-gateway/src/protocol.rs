@@ -11,7 +11,7 @@ pub const PROTOCOL: u32 = 1;
 
 /// Optional capabilities a `join` may ask for in `features`; `hello` answers
 /// with the ones asked for that are listed here.
-pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS];
+pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS, STATE];
 
 /// The feature under which a write or join refused by a limit is answered
 /// with [`ErrorCode::RateLimited`] and `retry_after_ms`. Without it the
@@ -25,6 +25,10 @@ pub const BINARY_EVENTS: &str = "binary_events";
 /// The feature under which a `subscribe` may name a `slot`, so one stream can
 /// hold several subscriptions on one connection.
 pub const SLOTS: &str = "slots";
+
+/// The feature under which a session may read a stream's state with
+/// `state_get`: the keys an atomic commit writes alongside its event.
+pub const STATE: &str = "state";
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -97,6 +101,17 @@ pub enum ClientMessage {
     /// Read one cache entry. Answered with a [`ServerMessage::CacheValue`]
     /// carrying the same `id`.
     CacheGet { cache: String, key: String, id: u64 },
+    /// With [`STATE`]: read one key of a stream's state. Answered with a
+    /// [`ServerMessage::StateValue`] carrying the same `id`.
+    StateGet {
+        stream: String,
+        key: String,
+        /// Picks the shard, as a commit's entity key does. Leaving it out
+        /// means the empty key, which is enough for a stream of one shard.
+        #[serde(default)]
+        entity: String,
+        id: u64,
+    },
     /// Write one cache entry, expiring after the cache's TTL when it has one.
     CachePut {
         cache: String,
@@ -177,6 +192,17 @@ pub enum ServerMessage {
     /// The entry for the `cache_get` with this `id`, base64, or `null` when
     /// there is none.
     CacheValue { id: u64, payload: Option<String> },
+    /// The key for the `state_get` with this `id`.
+    StateValue {
+        id: u64,
+        /// The value, base64, or `null` when the key was never written or
+        /// was deleted.
+        payload: Option<String>,
+        /// The offset of the commit that wrote the value.
+        version: Option<u64>,
+        /// The offset of the last commit the answer reflects.
+        as_of: Option<u64>,
+    },
     /// Every entry in the cache when the watch started.
     CacheEntries {
         cache: String,
@@ -233,6 +259,8 @@ pub enum ErrorCode {
     CounterFailed,
     /// Felix refused or lost a cache read, write or delete.
     CacheFailed,
+    /// Felix refused or could not answer a state read.
+    StateFailed,
     /// The subscription asked for an offset the log no longer holds.
     Trimmed,
     /// The join carried no usable sign-in. Sign in again.
@@ -401,6 +429,40 @@ mod tests {
             ClientMessage::CacheWatch {
                 cache: "members".into()
             }
+        );
+    }
+
+    #[test]
+    fn parses_a_state_read_and_serializes_its_answer() {
+        assert_eq!(
+            parse(json!({"type": "state_get", "stream": "ops", "key": "match/3", "id": 6})),
+            ClientMessage::StateGet {
+                stream: "ops".into(),
+                key: "match/3".into(),
+                entity: String::new(),
+                id: 6
+            }
+        );
+        assert_eq!(
+            parse(
+                json!({"type": "state_get", "stream": "ops", "key": "k", "entity": "e", "id": 7})
+            ),
+            ClientMessage::StateGet {
+                stream: "ops".into(),
+                key: "k".into(),
+                entity: "e".into(),
+                id: 7
+            }
+        );
+        let value = ServerMessage::StateValue {
+            id: 6,
+            payload: Some("AQI=".into()),
+            version: Some(40),
+            as_of: Some(42),
+        };
+        assert_eq!(
+            serde_json::to_value(&value).unwrap(),
+            json!({"type": "state_value", "id": 6, "payload": "AQI=", "version": 40, "as_of": 42})
         );
     }
 
