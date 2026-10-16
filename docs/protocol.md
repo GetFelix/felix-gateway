@@ -207,7 +207,7 @@ Felix atomic commit writes together with its event (Felix's
 |---|---|
 | `stream` | A stream alias whose actions include `subscribe` |
 | `key` | 1 to 256 printable ASCII characters, without spaces. `/` is allowed |
-| `entity` | Optional: the entity key that picks the stream's shard, as the writer's commit named it. Leaving it out is the empty key, which is enough on a stream of one shard |
+| `entity` | Optional: the entity key that picks the stream's shard, as the writer's commit named it, under the same rule as `key`. A writer whose entity keys fall outside that rule cannot be read through the gateway. Leaving it out is the empty key, which is enough on a stream of one shard |
 | `id` | As for `publish`; it comes back on the `state_value` or `error` |
 
 The gateway answers with a `state_value` message. Its `version` is the offset
