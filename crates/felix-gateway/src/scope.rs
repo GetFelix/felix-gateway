@@ -58,6 +58,9 @@ pub(crate) struct Resource<A> {
     /// A session opens without it when its sign-in does not reach it.
     #[serde(default)]
     optional: bool,
+    /// One resource every scope reaches, so its name has no `{scope}`.
+    #[serde(default)]
+    shared: bool,
     /// Streams only: each publish is prefixed with the publisher's principal.
     #[serde(default)]
     pub(crate) stamp_sender: bool,
@@ -215,8 +218,12 @@ fn check<A: Action>(resources: &[Resource<A>]) -> Result<()> {
         ensure!(valid_name(alias), "{kind} {alias:?}: {BAD_NAME}");
         ensure!(aliases.insert(alias), "{kind} {alias:?} is declared twice");
         ensure!(
-            resource.name.contains(PLACEHOLDER),
-            "{kind} {alias:?}: the name must contain {PLACEHOLDER}, or every scope would share it"
+            resource.shared || resource.name.contains(PLACEHOLDER),
+            "{kind} {alias:?}: the name must contain {PLACEHOLDER}, or every scope would share it; say shared = true if that is meant"
+        );
+        ensure!(
+            !(resource.shared && resource.name.contains(PLACEHOLDER)),
+            "{kind} {alias:?}: a shared name cannot contain {PLACEHOLDER}"
         );
         ensure!(!resource.actions.is_empty(), "{kind} {alias:?}: no actions");
         for (i, action) in resource.actions.iter().enumerate() {
@@ -463,6 +470,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_shared_resource_is_the_same_in_every_scope() {
+        let text = format!(
+            "{EXAMPLE}\n[[scope.caches]]\nalias = \"directory\"\nname = \"app.directory\"\n\
+             actions = [\"read\"]\nshared = true\n"
+        );
+        let config = Arc::new(ScopeConfig::parse(&text).unwrap());
+        for value in ["lobby", "studio"] {
+            let scope = Scope::parse(&config, value).unwrap();
+            let bound = scope.cache("directory", CacheAction::Read).unwrap();
+            assert_eq!(bound.name, "app.directory");
+            assert!(
+                scope
+                    .permissions("t", "default")
+                    .iter()
+                    .any(|p| p.grant == "cache.read:cache:t/default/app.directory")
+            );
+        }
+    }
+
+    #[test]
     fn binds_an_alias_only_for_actions_it_allows() {
         let lobby = lobby();
         let ops = lobby.stream("ops", StreamAction::Subscribe).unwrap();
@@ -532,6 +559,8 @@ pub(crate) mod tests {
             )
         };
         assert!(ScopeConfig::parse(&stream("")).is_ok());
+        let shared = stream("shared = true").replace("{scope}", "all");
+        assert!(ScopeConfig::parse(&shared).is_ok(), "{shared}");
         for bad in [
             "[scope]\nfield = \"token\"".to_string(),
             "[scope]\nfield = \"a.b\"".to_string(),
@@ -539,6 +568,7 @@ pub(crate) mod tests {
             stream("ttl_s = 5"),
             stream("actions = []").replace("actions = [\"publish\"]\n", ""),
             stream("").replace("{scope}", "all"),
+            stream("shared = true"),
             stream("").replace("\"publish\"", "\"publish\", \"publish\""),
             stream("").replace("\"publish\"", "\"read\""),
             stream(

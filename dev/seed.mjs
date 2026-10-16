@@ -75,6 +75,8 @@ function roomPolicies(room) {
     grant("cache", `demo.snap.${room}`, "cache.read"),
     grant("cache", `demo.members.${room}`, "cache.read"),
     grant("cache", `demo.members.${room}`, "cache.write"),
+    // Shared by every room; see dev/scope.toml.
+    grant("cache", "demo.directory", "cache.read"),
   ];
 }
 
@@ -126,6 +128,18 @@ const stream = (name, durable) => ({
   consistency: "Leader",
   delivery: durable ? "AtLeastOnce" : "AtMostOnce",
   durable,
+});
+// The one cache every room shares.
+console.log("cache demo.directory");
+await request("POST", `${namespace}/caches`, {
+  token: admin,
+  body: {
+    cache: "demo.directory",
+    display_name: "demo.directory",
+    shards: 1,
+    replication_factor: 1,
+    consistency: "Leader",
+  },
 });
 for (const [room, members] of Object.entries(MEMBERS)) {
   for (const [name, durable] of [

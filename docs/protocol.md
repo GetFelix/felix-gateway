@@ -40,6 +40,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `rate_limited` | A write or join refused by one of the gateway's [limits](#limits) is answered with the code `rate_limited` and a `retry_after_ms`. Without it, the refusal uses the code the request already fails with |
   | `binary_events` | Events arrive as [binary frames](#binary-event-frames) instead of JSON `event` messages, and `subscribed` carries the number the frames name the subscription by |
   | `slots` | A `subscribe` may name a `slot`, so one stream can hold more than one subscription on a connection |
+  | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
@@ -191,6 +192,29 @@ counted.
 Reads one entry of a cache whose actions include `read`. `key` follows the
 rule for `counter_add`. The gateway answers with a `cache_value` message
 carrying the same `id`.
+
+### `state_get`
+
+```json
+{"type": "state_get", "stream": "ops", "key": "latest", "id": 10}
+```
+
+Only with the `state` feature. Reads one key of a stream's state: the keys a
+Felix atomic commit writes together with its event (Felix's
+`docs/atomic-commit.md`). It needs `subscribe` on the stream, as Felix does.
+
+| Field | Meaning |
+|---|---|
+| `stream` | A stream alias whose actions include `subscribe` |
+| `key` | 1 to 256 printable ASCII characters, without spaces. `/` is allowed |
+| `entity` | Optional: the entity key that picks the stream's shard, as the writer's commit named it. Leaving it out is the empty key, which is enough on a stream of one shard |
+| `id` | As for `publish`; it comes back on the `state_value` or `error` |
+
+The gateway answers with a `state_value` message. Its `version` is the offset
+of the commit that wrote the value, so a browser can subscribe from it and get
+that commit's event first. Without the feature, `state_get` is refused with
+`bad_request`. A read Felix refuses or cannot answer is an `error` with code
+`state_failed`.
 
 ### `cache_put`
 
@@ -402,6 +426,19 @@ The counter's sum after the `counter_add` with this `id`.
 The answer to `cache_get`: the entry's bytes in base64, or `null` when there
 is none.
 
+### `state_value`
+
+```json
+{"type": "state_value", "id": 10, "payload": "AQI=", "version": 5400, "as_of": 5412}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | The `state_get` it answers |
+| `payload` | The value in base64, or `null` when the key was never written or was deleted |
+| `version` | The offset of the commit that wrote the value, or `null` with no value |
+| `as_of` | The offset of the last commit the answer reflects. Every commit at or below it is reflected, and its event can be read from the stream |
+
 ### `cache_entries` and `cache_change`
 
 ```json
@@ -443,6 +480,7 @@ The connection stays open after any error except an answer to `join`.
 | `subscription_ended` | A subscription stopped delivering. Subscribe again from the last offset handled plus one |
 | `counter_failed` | Felix refused or lost a counter add. It may have been counted |
 | `cache_failed` | Felix refused or lost a cache read, write or delete |
+| `state_failed` | Felix refused or could not answer a `state_get` |
 | `trimmed` | The subscription asked for an offset retention has discarded. `oldest` is the oldest offset left |
 | `watch_failed` | A cache watch was refused or stopped. Send `cache_watch` again |
 | `rate_limited` | Only for a session that asked for the `rate_limited` feature. A gateway [limit](#limits) refused the write, or the `join`. Nothing reached Felix. `retry_after_ms`, when present, is how long until the write would fit |

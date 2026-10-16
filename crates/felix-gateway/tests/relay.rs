@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use felix_client::{CacheWatchFilter, TokenFuture, TokenProvider};
+use felix_client::{CacheWatchFilter, CommitOp, TokenFuture, TokenProvider};
 use felix_gateway::{Config, Gateway, Heartbeat, Refused, ScopeConfig, SharedConfig};
 use felix_wire::AckMode;
 use futures_util::{SinkExt, StreamExt};
@@ -691,6 +691,121 @@ async fn members_are_listed_watched_and_expire() {
         .send(json!({"type": "cache_put", "cache": "members", "key": "a:b", "payload": ""}))
         .await;
     assert_eq!(member.recv().await["code"], "bad_request");
+}
+
+/// Commit `ops` to `demo.ops.lobby` as ana, straight to Felix, the way an
+/// application's writer would, and answer the commit's offset. Over shared
+/// connections it goes as ana on the gateway's own connection, the one broker
+/// the browsers there reach.
+async fn commit_as_ana(gateway: &Gateway, ops: Vec<CommitOp>) -> u64 {
+    let config = config();
+    let (tenant, namespace) = (config.tenant.as_str(), config.namespace.as_str());
+    let token = gateway
+        .scope_token(&sign_in("ana").await, "lobby")
+        .await
+        .expect("ana may open the lobby");
+    let entity = b"demo.ops.lobby";
+    let receipt = if config.shared.is_some() {
+        let delegated = delegate_as("demo-gateway", &token).await;
+        let identity = gateway
+            .attach_shared(Arc::new(Fixed(delegated)))
+            .await
+            .expect("attach as ana");
+        identity
+            .client()
+            .commit(tenant, namespace, entity, ops)
+            .await
+    } else {
+        gateway
+            .connect_felix(Arc::new(Fixed(token)))
+            .await
+            .expect("connect to Felix")
+            .commit(tenant, namespace, entity, ops)
+            .await
+    };
+    receipt.expect("the commit lands").offset
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn state_get_reads_a_key_with_the_offset_of_the_commit_that_wrote_it() {
+    let (gateway, addr) = start_gateway().await;
+    let key = format!("latest/{}", run_tag("state"));
+    let offset = commit_as_ana(
+        &gateway,
+        vec![
+            CommitOp::publish("demo.ops.lobby", key.clone().into_bytes()),
+            CommitOp::put("demo.ops.lobby", key.as_str(), b"v1".to_vec()),
+        ],
+    )
+    .await;
+
+    let token = sign_in("ana").await;
+    let mut browser = Browser::connect_with(addr, "lobby", &token, json!(["state"])).await;
+    assert_eq!(browser.recv().await["features"], json!(["state"]));
+    browser
+        .send(json!({"type": "state_get", "stream": "ops", "key": key, "id": 1}))
+        .await;
+    let value = browser.recv_type("state_value").await;
+    assert_eq!(
+        (&value["id"], &value["payload"], value["version"].as_u64()),
+        (&json!(1), &json!(BASE64.encode("v1")), Some(offset)),
+        "{value}"
+    );
+    assert!(value["as_of"].as_u64() >= Some(offset), "{value}");
+
+    browser
+        .send(json!({"type": "state_get", "stream": "ops", "key": format!("{key}-never"), "id": 2}))
+        .await;
+    let none = browser.recv_type("state_value").await;
+    assert_eq!(
+        (&none["payload"], &none["version"]),
+        (&Value::Null, &Value::Null),
+        "{none}"
+    );
+    for (bad, id) in [
+        (
+            json!({"type": "state_get", "stream": "ops", "key": "a b", "id": 3}),
+            3,
+        ),
+        (
+            json!({"type": "state_get", "stream": "snap", "key": "k", "id": 4}),
+            4,
+        ),
+    ] {
+        browser.send(bad).await;
+        let refused = browser.recv().await;
+        assert_eq!(
+            (refused["code"].as_str(), refused["id"].as_u64()),
+            (Some("bad_request"), Some(id)),
+            "{refused}"
+        );
+    }
+
+    // Only a session that asked for the feature may read state.
+    let mut plain = Browser::open(addr).await;
+    plain
+        .send(json!({"type": "state_get", "stream": "ops", "key": key, "id": 5}))
+        .await;
+    assert_eq!(plain.recv().await["code"], "bad_request");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_shared_cache_is_the_same_cache_in_every_room() {
+    let (_gateway, addr) = start_gateway().await;
+    for room in ["lobby", "studio"] {
+        let mut browser = Browser::join(addr, "ana", room).await;
+        browser
+            .send(json!({"type": "cache_get", "cache": "directory", "key": "nothing", "id": 1}))
+            .await;
+        let reply = browser.recv().await;
+        assert_eq!(
+            reply,
+            json!({"type": "cache_value", "id": 1, "payload": null}),
+            "{room}"
+        );
+    }
 }
 
 /// A fixed token, so a test can hold a connection to exactly what one room

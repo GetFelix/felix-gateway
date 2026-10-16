@@ -22,7 +22,7 @@ use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
     BINARY_EVENTS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES, Join, PROTOCOL,
-    RATE_LIMITED, SLOTS, ServerMessage, StartAt,
+    RATE_LIMITED, SLOTS, STATE, ServerMessage, StartAt,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -41,6 +41,14 @@ const EVENT_QUEUE: usize = 1024;
 
 /// Writes waiting for Felix. A browser that outruns this stops being read.
 const WRITE_QUEUE: usize = 256;
+
+const BAD_STATE_KEY: &str = "a state key is 1 to 256 printable ASCII characters, without spaces";
+
+/// Felix state keys are free-form; this keeps them to text that cannot hide
+/// control characters in logs.
+fn valid_state_key(key: &str) -> bool {
+    (1..=256).contains(&key.len()) && key.bytes().all(|byte| byte.is_ascii_graphic())
+}
 
 /// A write that must reach Felix in the order the browser sent it. Aliases
 /// are for replies; names are Felix's.
@@ -119,6 +127,8 @@ struct Session {
     binary: bool,
     /// The session asked for [`SLOTS`].
     slots: bool,
+    /// The session asked for [`STATE`].
+    state: bool,
     /// The number the next subscription's frames carry.
     next_sub: u32,
     throttle: Arc<Throttle>,
@@ -152,6 +162,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         rate_limited,
         binary,
         slots,
+        state,
     }) = join(&mut conn, &gateway, client).await
     else {
         return;
@@ -175,6 +186,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         rate_limited,
         binary,
         slots,
+        state,
         next_sub: 0,
         throttle: Arc::new(Throttle::default()),
         events: events_tx,
@@ -490,6 +502,46 @@ impl Session {
                 });
                 Next::Continue
             }
+            ClientMessage::StateGet {
+                stream,
+                key,
+                entity,
+                id,
+            } => {
+                let refusal = if !self.state {
+                    Some("state_get needs the state feature".to_string())
+                } else if !valid_state_key(&key) || !(entity.is_empty() || valid_state_key(&entity))
+                {
+                    Some(BAD_STATE_KEY.to_string())
+                } else {
+                    None
+                };
+                // A state read is authorized as a subscribe to the stream.
+                let name = match (refusal, scope.stream(&stream, StreamAction::Subscribe)) {
+                    (None, Ok(bound)) => bound.name,
+                    (Some(refusal), _) | (None, Err(refusal)) => {
+                        return Next::Reply(with_id(
+                            id,
+                            stream_error(stream, ErrorCode::BadRequest, refusal),
+                        ));
+                    }
+                };
+                let felix = Arc::clone(&self.felix);
+                let replies = self.replies.clone();
+                tokio::spawn(async move {
+                    let reply = match felix.state_get(&name, &entity, &key).await {
+                        Ok(state) => ServerMessage::StateValue {
+                            id,
+                            payload: state.value.map(|bytes| BASE64.encode(bytes)),
+                            version: state.version,
+                            as_of: state.as_of,
+                        },
+                        Err(err) => with_id(id, stream_error(stream, ErrorCode::StateFailed, err)),
+                    };
+                    let _ = replies.send(reply);
+                });
+                Next::Continue
+            }
             ClientMessage::CachePut {
                 cache,
                 key,
@@ -673,6 +725,7 @@ struct Joined {
     rate_limited: bool,
     binary: bool,
     slots: bool,
+    state: bool,
 }
 
 /// Wait for the browser's `join`, exchange its sign-in for a token that
@@ -766,6 +819,7 @@ async fn accept(
         rate_limited,
         binary: join.features.iter().any(|feature| feature == BINARY_EVENTS),
         slots: join.features.iter().any(|feature| feature == SLOTS),
+        state: join.features.iter().any(|feature| feature == STATE),
     })
 }
 

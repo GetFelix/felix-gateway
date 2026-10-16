@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use felix_client::{
     CacheWatch, CacheWatchFilter, CacheWatchItem, ClientConfig, ClusterCacheWatch, ClusterClient,
-    ClusterSubscription, Event, StartPosition, TokenProvider,
+    ClusterSubscription, Event, StartPosition, StateValue, TokenProvider,
 };
 use felix_wire::AckMode;
 use rustls::RootCertStore;
@@ -325,6 +325,43 @@ impl Felix {
             }
         };
         Ok(value.map(|bytes| bytes.to_vec()))
+    }
+
+    /// `key` in the state of `stream`'s shard that `entity` routes to.
+    pub(crate) async fn state_get(
+        &self,
+        stream: &str,
+        entity: &str,
+        key: &str,
+    ) -> Result<StateValue> {
+        match &self.link {
+            Link::Own(client) => {
+                client
+                    .state_get(
+                        &self.tenant,
+                        &self.namespace,
+                        stream,
+                        entity.as_bytes(),
+                        key,
+                    )
+                    .await
+            }
+            Link::Shared(session) => {
+                self.on_identity(session, |identity| async move {
+                    identity
+                        .client
+                        .state_get(
+                            &self.tenant,
+                            &self.namespace,
+                            stream,
+                            entity.as_bytes(),
+                            key,
+                        )
+                        .await
+                })
+                .await
+            }
+        }
     }
 
     pub(crate) async fn cache_put(
