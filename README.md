@@ -142,8 +142,9 @@ JSON text frames over one WebSocket at `/ws`: `join` and `hello`, `subscribe`,
 `publish`, `counter_add`, `cache_get`, `cache_put`, `cache_delete`,
 `cache_watch` and `throttle`, answered by `subscribed`, `event`, `ack`,
 `counter`, `cache_value`, `cache_entries`, `cache_change` and `error`.
-Payloads are base64 and opaque to the gateway. [docs/protocol.md](docs/protocol.md)
-is the reference.
+Payloads are base64 and opaque to the gateway. A session can ask for events
+as binary frames instead, and for more than one subscription per stream.
+[docs/protocol.md](docs/protocol.md) is the reference.
 
 ## Status
 

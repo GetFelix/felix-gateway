@@ -11,12 +11,20 @@ pub const PROTOCOL: u32 = 1;
 
 /// Optional capabilities a `join` may ask for in `features`; `hello` answers
 /// with the ones asked for that are listed here.
-pub const FEATURES: &[&str] = &[RATE_LIMITED];
+pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS];
 
 /// The feature under which a write or join refused by a limit is answered
 /// with [`ErrorCode::RateLimited`] and `retry_after_ms`. Without it the
 /// refusal uses the request's own failure code.
 pub const RATE_LIMITED: &str = "rate_limited";
+
+/// The feature under which events arrive as binary WebSocket messages laid
+/// out as [`EventFrame`], instead of JSON `event` messages.
+pub const BINARY_EVENTS: &str = "binary_events";
+
+/// The feature under which a `subscribe` may name a `slot`, so one stream can
+/// hold several subscriptions on one connection.
+pub const SLOTS: &str = "slots";
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -62,8 +70,14 @@ pub enum ClientMessage {
     /// before the gateway closes.
     Join {},
     /// Start relaying a stream's events. Replaces any earlier subscription to
-    /// the same stream on this connection.
-    Subscribe { stream: String, from: StartAt },
+    /// the same stream and slot on this connection.
+    Subscribe {
+        stream: String,
+        from: StartAt,
+        /// Leaving it out names the stream's one default slot.
+        #[serde(default)]
+        slot: Option<String>,
+    },
     /// Publish one record. `payload` is base64. With `ack`, the gateway
     /// answers with an [`ServerMessage::Ack`] carrying the same `id`.
     Publish {
@@ -128,6 +142,12 @@ pub enum ServerMessage {
     /// from here on will be delivered.
     Subscribed {
         stream: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        slot: Option<String>,
+        /// With [`BINARY_EVENTS`]: the number this subscription's event
+        /// frames carry.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sub: Option<u32>,
         /// The first offset this subscription delivers, when the stream has a log.
         start_offset: Option<u64>,
         /// The stream's tail when the subscription was registered.
@@ -136,6 +156,8 @@ pub enum ServerMessage {
     /// One record, in the order the broker delivered it.
     Event {
         stream: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        slot: Option<String>,
         /// Log offset; `null` on a stream with no log.
         offset: Option<u64>,
         /// Offsets just before this one that hold no event. A gap in offsets
@@ -172,6 +194,10 @@ pub enum ServerMessage {
         id: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         stream: Option<String>,
+        /// The subscription's slot, on an error about a subscription that
+        /// named one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        slot: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache: Option<String>,
         code: ErrorCode,
@@ -237,6 +263,55 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+/// One event as a binary WebSocket message, for sessions with
+/// [`BINARY_EVENTS`]. Integers are little-endian:
+///
+/// | Bytes | Field |
+/// |---|---|
+/// | 0 | Frame kind, 1 for an event |
+/// | 1 | Header length, [`EventFrame::HEADER_LEN`]; the payload starts there |
+/// | 2..4 | Reserved, zero |
+/// | 4..8 | `sub`, from the subscription's `subscribed` |
+/// | 8..16 | Log offset, or `u64::MAX` on a stream with no log |
+/// | 16..20 | `skipped_before`, saturating |
+/// | 20..24 | Reserved, zero |
+/// | 24..32 | When the gateway received the event from Felix |
+/// | 32..40 | When the gateway handed the frame to the WebSocket |
+///
+/// Both times are microseconds since the Unix epoch on the gateway's clock.
+/// A reader must skip the header by its length byte, so later versions can
+/// append fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventFrame {
+    pub sub: u32,
+    pub offset: Option<u64>,
+    pub skipped_before: u64,
+    pub received_us: u64,
+    pub sent_us: u64,
+}
+
+impl EventFrame {
+    /// The frame kind of an event.
+    pub const KIND: u8 = 1;
+    /// The length of the header this gateway writes.
+    pub const HEADER_LEN: usize = 40;
+
+    /// The header followed by `payload`.
+    pub fn encode(&self, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(Self::HEADER_LEN + payload.len());
+        frame.extend_from_slice(&[Self::KIND, Self::HEADER_LEN as u8, 0, 0]);
+        frame.extend_from_slice(&self.sub.to_le_bytes());
+        frame.extend_from_slice(&self.offset.unwrap_or(u64::MAX).to_le_bytes());
+        let skipped = u32::try_from(self.skipped_before).unwrap_or(u32::MAX);
+        frame.extend_from_slice(&skipped.to_le_bytes());
+        frame.extend_from_slice(&[0; 4]);
+        frame.extend_from_slice(&self.received_us.to_le_bytes());
+        frame.extend_from_slice(&self.sent_us.to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,14 +327,24 @@ mod tests {
             parse(json!({"type": "subscribe", "stream": "ops", "from": 42})),
             ClientMessage::Subscribe {
                 stream: "ops".into(),
-                from: StartAt::Offset(42)
+                from: StartAt::Offset(42),
+                slot: None,
             }
         );
         assert_eq!(
             parse(json!({"type": "subscribe", "stream": "presence", "from": "live"})),
             ClientMessage::Subscribe {
                 stream: "presence".into(),
-                from: StartAt::Live(Live::Live)
+                from: StartAt::Live(Live::Live),
+                slot: None,
+            }
+        );
+        assert_eq!(
+            parse(json!({"type": "subscribe", "stream": "ops", "from": 7, "slot": "replay"})),
+            ClientMessage::Subscribe {
+                stream: "ops".into(),
+                from: StartAt::Offset(7),
+                slot: Some("replay".into()),
             }
         );
     }
@@ -402,6 +487,7 @@ mod tests {
         let refusal = ServerMessage::Error {
             id: Some(7),
             stream: Some("ops".into()),
+            slot: None,
             cache: None,
             code: ErrorCode::RateLimited,
             oldest: None,
@@ -421,6 +507,7 @@ mod tests {
     fn serializes_events_without_a_zero_skip_count() {
         let event = ServerMessage::Event {
             stream: "ops".into(),
+            slot: None,
             offset: Some(7),
             skipped_before: 0,
             payload: "AQI=".into(),
@@ -436,6 +523,55 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&ack).unwrap(),
             json!({"type": "ack", "id": 3, "offset": null})
+        );
+    }
+
+    #[test]
+    fn an_event_frame_is_its_header_then_the_payload() {
+        let frame = EventFrame {
+            sub: 3,
+            offset: Some(0x0102),
+            skipped_before: 1,
+            received_us: 10,
+            sent_us: 11,
+        }
+        .encode(b"tick");
+        assert_eq!(frame.len(), EventFrame::HEADER_LEN + 4);
+        assert_eq!(&frame[..4], [1, 40, 0, 0]);
+        assert_eq!(&frame[4..8], 3u32.to_le_bytes());
+        assert_eq!(&frame[8..16], 0x0102u64.to_le_bytes());
+        assert_eq!(&frame[16..20], 1u32.to_le_bytes());
+        assert_eq!(&frame[24..32], 10u64.to_le_bytes());
+        assert_eq!(&frame[32..40], 11u64.to_le_bytes());
+        assert_eq!(&frame[40..], b"tick");
+
+        let unlogged = EventFrame {
+            sub: 0,
+            offset: None,
+            skipped_before: u64::MAX,
+            received_us: 0,
+            sent_us: 0,
+        }
+        .encode(b"");
+        assert_eq!(&unlogged[8..16], u64::MAX.to_le_bytes());
+        assert_eq!(&unlogged[16..20], u32::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn a_subscription_in_a_slot_is_named_in_its_answers() {
+        let subscribed = ServerMessage::Subscribed {
+            stream: "ticks".into(),
+            slot: Some("replay".into()),
+            sub: Some(2),
+            start_offset: Some(5),
+            live_offset: Some(9),
+        };
+        assert_eq!(
+            serde_json::to_value(&subscribed).unwrap(),
+            json!({
+                "type": "subscribed", "stream": "ticks", "slot": "replay", "sub": 2,
+                "start_offset": 5, "live_offset": 9
+            })
         );
     }
 }

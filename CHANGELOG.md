@@ -11,6 +11,16 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Added
+
+- The `binary_events` feature: events arrive as binary WebSocket frames, a 40-byte header with the subscription, offset and the gateway's receive and send times, then the payload as published. No base64, and no JSON parse per event (#23).
+- The `slots` feature: `subscribe` takes an optional `slot`, so one connection can hold a live subscription and a replay of the same stream at once (#23).
+- `event_relay` in `GET /metrics`: per stream, the time from an event's arrival from Felix to its write to the WebSocket (#23).
+
+### Changed
+
+- `BrowserConnection` has a `send_binary` method for event frames. A custom transport must implement it (#23).
+
 ### Security
 - rustls 0.23.46, which fixes RUSTSEC-2026-0346 to 0349 (TLS secrets in `Debug` output, a ServerHello downgrade to classical key exchange, ECH rejection, and unbounded brotli certificate decompression).
 

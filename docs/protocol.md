@@ -1,7 +1,7 @@
 # Browser to gateway protocol
 
 A browser opens one WebSocket to the gateway at `/ws` and exchanges JSON text
-frames over it. The gateway relays each request to Felix and each Felix event
+frames over it, plus binary event frames for a session that asks for them. The gateway relays each request to Felix and each Felix event
 back, without decoding payloads. One gateway serves every scope: a connection
 names its scope and signs in with its first message, `join`,
 and from then on reaches that scope and nothing else.
@@ -33,10 +33,14 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
 - A `join` without `protocol` is version 1, and one without `features` asks
   for none. Version 1 is frozen: a change that an older browser would misread
   is a new feature or a new version, never an edit to version 1.
-- This gateway speaks version 1 and has one feature, `rate_limited`: a write
-  or join refused by one of the gateway's [limits](#limits) is answered with
-  the code `rate_limited` and a `retry_after_ms`. Without it, the refusal
-  uses the code the request already fails with.
+- This gateway speaks version 1 and has these features:
+
+  | Feature | What it turns on |
+  |---|---|
+  | `rate_limited` | A write or join refused by one of the gateway's [limits](#limits) is answered with the code `rate_limited` and a `retry_after_ms`. Without it, the refusal uses the code the request already fails with |
+  | `binary_events` | Events arrive as [binary frames](#binary-event-frames) instead of JSON `event` messages, and `subscribed` carries the number the frames name the subscription by |
+  | `slots` | A `subscribe` may name a `slot`, so one stream can hold more than one subscription on a connection |
+
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
   error, and the connection stays open.
@@ -122,9 +126,12 @@ quiet, such as after a network drop. Both times are settings, in
 |---|---|
 | `stream` | A stream alias whose actions include `subscribe` |
 | `from` | `"live"` for only what is published from now on, or a log offset: the first record wanted, which is the last offset handled plus one |
+| `slot` | Only with the `slots` feature, optional: a name for this subscription, following the rule for `counter_add` keys. Leaving it out names the stream's default slot. Without the feature a `slot` is refused with `bad_request` |
 
-Subscribing to a stream the connection is already subscribed to replaces the
-earlier subscription. That is the recovery path: after a gap or an ended
+Subscribing to a stream and slot the connection is already subscribed to
+replaces the earlier subscription; other slots of the same stream keep theirs.
+A game can keep a `live` slot on its tick stream while a `replay` slot reads
+an older stretch of it. That is the recovery path: after a gap or an ended
 subscription, subscribe again from the last offset handled plus one.
 
 An offset the log no longer holds is answered with a `trimmed` error naming the
@@ -240,7 +247,8 @@ fresh `cache_entries`.
 ```
 
 Reads this connection's subscriptions no faster than a link of
-`bits_per_second` would carry them, counting each event's JSON text. `null` or
+`bits_per_second` would carry them, counting each event's JSON text, or its
+binary frame with `binary_events`. `null` or
 0 lifts the limit. It stands in for a slow network: Felix keeps delivering at
 full speed and the subscription's bounded queue fills, so the browser falls
 behind (see [Slow browsers](#slow-browsers)). Other connections are not
@@ -301,6 +309,7 @@ The answer to `join`: the session is open on this scope.
 
 ```json
 {"type": "subscribed", "stream": "ops", "start_offset": 42, "live_offset": 57}
+{"type": "subscribed", "stream": "ops", "slot": "replay", "sub": 3, "start_offset": 42, "live_offset": 57}
 ```
 
 The subscription is registered with the broker. Anything published from this
@@ -309,13 +318,20 @@ subscription delivers and `live_offset` is the stream's tail when it was
 registered; both are `null` on a stream with no log, such as `presence`. From
 `"live"` the two are equal.
 
+`slot` is present when the `subscribe` named one. `sub` is present only with
+the `binary_events` feature: the number this subscription's frames carry. Each
+`subscribe` gets a new number, so frames still in flight from a subscription
+that was replaced can be told apart and dropped.
+
 ### `event`
 
 ```json
 {"type": "event", "stream": "ops", "offset": 42, "payload": "haNzaWTP..."}
 ```
 
-One record, in the order the broker delivered it. On a durable stream, events
+One record, in the order the broker delivered it. `slot` is present when the
+subscription named one. A session with `binary_events` gets
+[binary frames](#binary-event-frames) instead. On a durable stream, events
 arrive in increasing offset order. `skipped_before` appears only when it is not
 zero: it counts the offsets just before this one that hold no event (a new
 leader's generation-start record), so the number of records dropped before this
@@ -325,6 +341,33 @@ should stay zero; if it does not, subscribe again from the last offset handled
 plus one.
 
 Offsets are JSON numbers, exact in JavaScript up to 2^53.
+
+### Binary event frames
+
+With the `binary_events` feature, each event is one binary WebSocket message:
+a header, then the payload's bytes as published. Integers are little-endian.
+
+| Bytes | Field |
+|---|---|
+| 0 | Frame kind: 1 for an event |
+| 1 | Header length: 40 from this gateway. The payload starts at this byte |
+| 2 to 3 | Reserved, zero |
+| 4 to 7 | `sub`: the subscription, as its `subscribed` numbered it |
+| 8 to 15 | The log offset, or 2^64 - 1 on a stream with no log |
+| 16 to 19 | `skipped_before`, as for `event`, capped at 2^32 - 1 |
+| 20 to 23 | Reserved, zero |
+| 24 to 31 | When the gateway received the event from Felix |
+| 32 to 39 | When the gateway handed the frame to the WebSocket |
+
+The two times are microseconds since the Unix epoch on the gateway's clock.
+Their difference is the gateway's own hop. Comparing them with a time from
+another host, such as the publisher's or the browser's, measures the legs
+around the gateway only as well as the two clocks agree.
+
+A reader must find the payload by the header length, not by a fixed 40: a
+later gateway may add fields to the end of the header. Frames of a kind the
+reader does not know should be ignored. Everything else, including
+`subscribed` and errors, stays JSON text.
 
 ### `ack`
 
@@ -386,7 +429,8 @@ time keeps the browser's own clock out of it.
 ```
 
 `id` is present when the error answers one request, and `stream` or `cache`
-when it is about one stream or cache. `oldest` is present only on `trimmed`,
+when it is about one stream or cache. `slot` is present on an error about a
+subscription that named one. `oldest` is present only on `trimmed`,
 and `retry_after_ms` only on `rate_limited`.
 The connection stays open after any error except an answer to `join`.
 
@@ -453,7 +497,7 @@ An in-memory stream has nothing to replay, so its dropped events are gone.
 | `GET /metrics` | Latency and limit refusals, below |
 | anything else | A file of the web bundle in `GATEWAY_WEB_DIR`, when set |
 
-`GET /metrics` returns the two legs of the gateway separately, in microseconds:
+`GET /metrics` returns the gateway's legs separately, in microseconds:
 
 ```json
 {
@@ -461,6 +505,10 @@ An in-memory stream has nothing to replay, so its dropped events are gone.
   "felix_publish_ack": {
     "ops": {"count": 40, "p50_us": 650, "p90_us": 900, "p99_us": 1500, "max_us": 2100},
     "presence": {"count": 0, "p50_us": 0, "p90_us": 0, "p99_us": 0, "max_us": 0}
+  },
+  "event_relay": {
+    "ops": {"count": 300, "p50_us": 40, "p90_us": 70, "p99_us": 180, "max_us": 950},
+    "presence": {"count": 25, "p50_us": 35, "p90_us": 60, "p99_us": 90, "max_us": 120}
   },
   "limits_refused": {
     "alias_rate": 0, "ip_sessions": 0, "message_size": 1, "principal_rate": 0,
@@ -473,6 +521,7 @@ An in-memory stream has nothing to replay, so its dropped events are gone.
 |---|---|
 | `browser_rtt` | Browser to gateway and back: the WebSocket ping sent every `GATEWAY_PING_INTERVAL_S` (default 5 seconds) per connection, answered by the browser itself |
 | `felix_publish_ack` | Gateway to Felix and back, one histogram per stream alias in the scope file: from handing an acknowledged publish to Felix until its ack |
+| `event_relay` | Felix to browser through the gateway, one histogram per stream alias: from an event's arrival from Felix until it is written to the WebSocket. It includes time spent waiting for a slow browser, but not a `throttle`'s wait, which stands in for the network |
 
 `limits_refused` counts refusals since the gateway started, by the limit that
 refused:

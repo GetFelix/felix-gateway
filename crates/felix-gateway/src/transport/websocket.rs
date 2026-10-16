@@ -7,8 +7,8 @@ use axum::extract::ws::{Message, WebSocket};
 
 use super::{BrowserConnection, Incoming};
 
-/// A browser on a WebSocket. Text frames carry protocol messages; the
-/// round trip is measured with WebSocket pings, which browsers answer
+/// A browser on a WebSocket. Text frames carry protocol messages and binary
+/// frames carry events for sessions that asked for them; the round trip is measured with WebSocket pings, which browsers answer
 /// without any page code.
 pub struct WebSocketConnection {
     socket: WebSocket,
@@ -48,6 +48,11 @@ impl BrowserConnection for WebSocketConnection {
 
     async fn send(&mut self, message: String) -> Result<()> {
         self.socket.send(Message::Text(message.into())).await?;
+        Ok(())
+    }
+
+    async fn send_binary(&mut self, frame: Vec<u8>) -> Result<()> {
+        self.socket.send(Message::Binary(frame.into())).await?;
         Ok(())
     }
 

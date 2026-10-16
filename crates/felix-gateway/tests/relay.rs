@@ -338,6 +338,129 @@ async fn subscribing_from_an_offset_replays_the_log() {
     assert_eq!(events[0].0, first);
 }
 
+/// One binary event frame, split into the fields the tests check.
+struct Frame {
+    sub: u32,
+    offset: u64,
+    received_us: u64,
+    sent_us: u64,
+    payload: String,
+}
+
+impl Browser {
+    /// The next binary frame. Acks and `subscribed` answers met on the way
+    /// are skipped; any other text message fails the test.
+    async fn frame(&mut self) -> Frame {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let message = tokio::time::timeout_at(deadline, self.socket.next())
+                .await
+                .expect("timed out waiting for the gateway")
+                .expect("socket closed")
+                .unwrap();
+            match message {
+                Message::Binary(frame) => {
+                    let word =
+                        |at: usize| u64::from_le_bytes(frame[at..at + 8].try_into().unwrap());
+                    assert_eq!(frame[0], 1, "an event frame");
+                    let header = usize::from(frame[1]);
+                    return Frame {
+                        sub: u32::from_le_bytes(frame[4..8].try_into().unwrap()),
+                        offset: word(8),
+                        received_us: word(24),
+                        sent_us: word(32),
+                        payload: String::from_utf8(frame[header..].to_vec()).unwrap(),
+                    };
+                }
+                Message::Text(text) => {
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    assert!(
+                        matches!(message["type"].as_str(), Some("ack" | "subscribed")),
+                        "unexpected message: {message}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn binary_events_reach_two_slots_on_one_stream() {
+    let (gateway, addr) = start_gateway().await;
+    let tag = run_tag("slots");
+    let mut writer = Browser::open(addr).await;
+    let mut offsets = Vec::new();
+    for i in 0..3 {
+        writer.publish("ops", &format!("{tag}/{i}"), true).await;
+        let ack = writer.recv_type("ack").await;
+        offsets.push(ack["offset"].as_u64().expect("acks carry offsets"));
+    }
+
+    let features = json!(["binary_events", "slots"]);
+    let mut reader = Browser::connect_with(addr, "lobby", &sign_in("ana").await, features).await;
+    let hello = reader.recv_type("hello").await;
+    assert_eq!(hello["features"], json!(["binary_events", "slots"]));
+    reader
+        .send(json!({"type": "subscribe", "stream": "ops", "slot": "live", "from": "live"}))
+        .await;
+    let live = reader.recv_type("subscribed").await;
+    assert_eq!(live["slot"], "live");
+    reader
+        .send(json!({"type": "subscribe", "stream": "ops", "slot": "replay", "from": offsets[0]}))
+        .await;
+    let replay = reader.recv_type("subscribed").await;
+    assert_eq!(replay["slot"], "replay");
+    let (live, replay) = (
+        live["sub"].as_u64().unwrap(),
+        replay["sub"].as_u64().unwrap(),
+    );
+    assert_ne!(live, replay);
+
+    writer.publish("ops", &format!("{tag}/3"), true).await;
+    offsets.push(writer.recv_type("ack").await["offset"].as_u64().unwrap());
+
+    let mut seen_live = Vec::new();
+    let mut seen_replay = Vec::new();
+    while seen_live.is_empty() || seen_replay.len() < 4 {
+        let frame = reader.frame().await;
+        if !frame.payload.starts_with(&tag) {
+            continue;
+        }
+        assert!(frame.received_us > 0 && frame.received_us <= frame.sent_us);
+        let seen = match u64::from(frame.sub) {
+            sub if sub == live => &mut seen_live,
+            sub if sub == replay => &mut seen_replay,
+            sub => panic!("a frame for subscription {sub}"),
+        };
+        seen.push((frame.offset, frame.payload));
+    }
+    let expected: Vec<(u64, String)> = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, offset)| (*offset, format!("{tag}/{i}")))
+        .collect();
+    assert_eq!(
+        seen_replay, expected,
+        "the replay slot reads the log in order"
+    );
+    assert_eq!(
+        seen_live,
+        expected[3..],
+        "the live slot sees only the new record"
+    );
+    // The gateway records an event after its write, so the last may lag.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while gateway.metrics().event_relay["ops"].count < 5 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "event_relay not recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
 async fn presence_is_relayed_without_offsets() {
