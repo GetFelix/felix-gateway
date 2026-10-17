@@ -243,7 +243,9 @@ it reaches what is committed it comes back short or empty. Read the next page
 from its `next_offset`; the range is done once that reaches `end`. An offset
 retention has discarded is an `error` with code `trimmed` and the `oldest`
 offset left. Anything else Felix refuses, such as an offset past the tail or a
-stream with no log, is an `error` with code `read_failed`. Without the
+stream with no log, is an `error` with code `read_failed`. A session may
+have 4 reads waiting for their answer at once; a fifth is refused at once with
+`read_failed`. Without the
 feature, `read` is refused with `bad_request`.
 
 A game's replay of a few seconds of its log is one `read`: a fixed slice, with

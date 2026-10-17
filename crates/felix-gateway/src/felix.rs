@@ -218,7 +218,13 @@ impl Felix {
     {
         let identity = session.identity().await;
         let result = request(Arc::clone(&identity)).await;
-        if result.is_err() {
+        // A cursor out of range is an answer about the log, not a broken
+        // identity, so it is not worth a new connection.
+        let answered = result.as_ref().is_err_and(|err| {
+            err.chain()
+                .any(|cause| cause.is::<felix_client::SubscribeCursorError>())
+        });
+        if result.is_err() && !answered {
             session.renew(&identity).await;
         }
         result

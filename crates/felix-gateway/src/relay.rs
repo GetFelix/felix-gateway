@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -41,6 +42,9 @@ const EVENT_QUEUE: usize = 1024;
 
 /// Writes waiting for Felix. A browser that outruns this stops being read.
 const WRITE_QUEUE: usize = 256;
+/// Range reads a session may have waiting at once. Each answer is a page of
+/// the log held until the browser reads it, so they are not left unbounded.
+const READS_IN_FLIGHT: usize = 4;
 
 const BAD_STATE_KEY: &str = "a state key is 1 to 256 printable ASCII characters, without spaces";
 
@@ -131,6 +135,8 @@ struct Session {
     state: bool,
     /// The session asked for [`READ`].
     read: bool,
+    /// Range reads sent to Felix whose answer is not yet sent on.
+    reads: Arc<AtomicUsize>,
     /// The number the next subscription's frames carry.
     next_sub: u32,
     throttle: Arc<Throttle>,
@@ -191,6 +197,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         slots,
         state,
         read,
+        reads: Arc::default(),
         next_sub: 0,
         throttle: Arc::new(Throttle::default()),
         events: events_tx,
@@ -574,8 +581,20 @@ impl Session {
                         ));
                     }
                 };
+                if self.reads.fetch_add(1, Ordering::Relaxed) >= READS_IN_FLIGHT {
+                    self.reads.fetch_sub(1, Ordering::Relaxed);
+                    return Next::Reply(with_id(
+                        id,
+                        stream_error(
+                            stream,
+                            ErrorCode::ReadFailed,
+                            format!("at most {READS_IN_FLIGHT} reads may wait at once"),
+                        ),
+                    ));
+                }
                 let felix = Arc::clone(&self.felix);
                 let replies = self.replies.clone();
+                let reads = Arc::clone(&self.reads);
                 tokio::spawn(async move {
                     let reply = match felix.read(&name, shard, from, end, max).await {
                         Ok(page) => ServerMessage::Records {
@@ -595,6 +614,7 @@ impl Session {
                         }
                     };
                     let _ = replies.send(reply);
+                    reads.fetch_sub(1, Ordering::Relaxed);
                 });
                 Next::Continue
             }
