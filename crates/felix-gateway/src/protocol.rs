@@ -11,7 +11,7 @@ pub const PROTOCOL: u32 = 1;
 
 /// Optional capabilities a `join` may ask for in `features`; `hello` answers
 /// with the ones asked for that are listed here.
-pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS, STATE];
+pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS, STATE, READ];
 
 /// The feature under which a write or join refused by a limit is answered
 /// with [`ErrorCode::RateLimited`] and `retry_after_ms`. Without it the
@@ -29,6 +29,10 @@ pub const SLOTS: &str = "slots";
 /// The feature under which a session may read a stream's state with
 /// `state_get`: the keys an atomic commit writes alongside its event.
 pub const STATE: &str = "state";
+
+/// The feature under which a session may read a range of a durable stream
+/// with `read`, without subscribing.
+pub const READ: &str = "read";
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -110,6 +114,25 @@ pub enum ClientMessage {
         /// means the empty key, which is enough for a stream of one shard.
         #[serde(default)]
         entity: String,
+        id: u64,
+    },
+    /// With [`READ`]: one page of a durable stream's records from `from`,
+    /// stopping before `end`. Answered with a [`ServerMessage::Records`]
+    /// carrying the same `id`.
+    Read {
+        stream: String,
+        from: u64,
+        /// Leaving it out reads up to what is committed.
+        #[serde(default)]
+        end: Option<u64>,
+        /// The most records to answer with; leaving it out or 0 takes the
+        /// broker's cap.
+        #[serde(default)]
+        max: u32,
+        /// The shard whose offsets `from` and `end` are. Leaving it out means
+        /// shard 0, the only one of a stream of one shard.
+        #[serde(default)]
+        shard: u32,
         id: u64,
     },
     /// Write one cache entry, expiring after the cache's TTL when it has one.
@@ -203,6 +226,16 @@ pub enum ServerMessage {
         /// The offset of the last commit the answer reflects.
         as_of: Option<u64>,
     },
+    /// The page for the `read` with this `id`.
+    Records {
+        id: u64,
+        /// In offset order.
+        records: Vec<Record>,
+        /// Where the next page starts. At or past the request's `end` once
+        /// the range is done; not always the last offset plus one, since
+        /// offsets that hold no record are passed over.
+        next_offset: u64,
+    },
     /// Every entry in the cache when the watch started.
     CacheEntries {
         cache: String,
@@ -261,6 +294,8 @@ pub enum ErrorCode {
     CacheFailed,
     /// Felix refused or could not answer a state read.
     StateFailed,
+    /// Felix refused or could not answer a range read.
+    ReadFailed,
     /// The subscription asked for an offset the log no longer holds.
     Trimmed,
     /// The join carried no usable sign-in. Sign in again.
@@ -285,6 +320,14 @@ pub struct CacheEntry {
     /// Milliseconds until the entry expires, by the gateway's clock; `null`
     /// for an entry that never does.
     pub expires_in_ms: Option<u64>,
+}
+
+/// One record of a [`ServerMessage::Records`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Record {
+    pub offset: u64,
+    /// The record's bytes, base64.
+    pub payload: String,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -463,6 +506,46 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&value).unwrap(),
             json!({"type": "state_value", "id": 6, "payload": "AQI=", "version": 40, "as_of": 42})
+        );
+    }
+
+    #[test]
+    fn parses_a_range_read_and_serializes_its_answer() {
+        assert_eq!(
+            parse(json!({"type": "read", "stream": "ops", "from": 40, "id": 8})),
+            ClientMessage::Read {
+                stream: "ops".into(),
+                from: 40,
+                end: None,
+                max: 0,
+                shard: 0,
+                id: 8
+            }
+        );
+        assert_eq!(
+            parse(
+                json!({"type": "read", "stream": "ops", "from": 40, "end": 52, "max": 10, "shard": 1, "id": 9})
+            ),
+            ClientMessage::Read {
+                stream: "ops".into(),
+                from: 40,
+                end: Some(52),
+                max: 10,
+                shard: 1,
+                id: 9
+            }
+        );
+        let page = ServerMessage::Records {
+            id: 9,
+            records: vec![Record {
+                offset: 40,
+                payload: "AQI=".into(),
+            }],
+            next_offset: 41,
+        };
+        assert_eq!(
+            serde_json::to_value(&page).unwrap(),
+            json!({"type": "records", "id": 9, "records": [{"offset": 40, "payload": "AQI="}], "next_offset": 41})
         );
     }
 
