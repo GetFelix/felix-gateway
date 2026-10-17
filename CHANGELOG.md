@@ -11,6 +11,12 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
+Tested against Felix 0.6.0-preview.9. One opt-in addition: the `read` feature
+reads a range of a durable stream's log without subscribing. Sessions that do
+not ask for `read` see no change.
+
 ### Added
 
 - The `read` feature: `read` answers one page of a durable stream's records between two offsets, without subscribing, as a `records` message. It needs `subscribe` on the stream (#29).
