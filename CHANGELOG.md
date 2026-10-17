@@ -11,6 +11,10 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Changed
+
+- Built on and tested against Felix 0.6.0-preview.9.
+
 ## [0.5.0] - 2026-10-16
 
 Tested against Felix 0.6.0-preview.7. Two opt-in additions: the `state`
