@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use felix_client::{
     CacheWatch, CacheWatchFilter, CacheWatchItem, ClientConfig, ClusterCacheWatch, ClusterClient,
-    ClusterSubscription, Event, StartPosition, StateValue, TokenProvider,
+    ClusterSubscription, Event, StartPosition, StateValue, StreamPage, TokenProvider,
 };
 use felix_wire::AckMode;
 use rustls::RootCertStore;
@@ -357,6 +357,33 @@ impl Felix {
                             entity.as_bytes(),
                             key,
                         )
+                        .await
+                })
+                .await
+            }
+        }
+    }
+
+    /// One page of `stream`'s shard `shard` from `from`, stopping before `end`.
+    pub(crate) async fn read(
+        &self,
+        stream: &str,
+        shard: u32,
+        from: u64,
+        end: Option<u64>,
+        max: u32,
+    ) -> Result<StreamPage> {
+        match &self.link {
+            Link::Own(client) => {
+                client
+                    .read(&self.tenant, &self.namespace, stream, shard, from, end, max)
+                    .await
+            }
+            Link::Shared(session) => {
+                self.on_identity(session, |identity| async move {
+                    identity
+                        .client
+                        .read(&self.tenant, &self.namespace, stream, shard, from, end, max)
                         .await
                 })
                 .await

@@ -22,7 +22,7 @@ use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
     BINARY_EVENTS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES, Join, PROTOCOL,
-    RATE_LIMITED, SLOTS, STATE, ServerMessage, StartAt,
+    RATE_LIMITED, READ, Record, SLOTS, STATE, ServerMessage, StartAt,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -129,6 +129,8 @@ struct Session {
     slots: bool,
     /// The session asked for [`STATE`].
     state: bool,
+    /// The session asked for [`READ`].
+    read: bool,
     /// The number the next subscription's frames carry.
     next_sub: u32,
     throttle: Arc<Throttle>,
@@ -163,6 +165,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         binary,
         slots,
         state,
+        read,
     }) = join(&mut conn, &gateway, client).await
     else {
         return;
@@ -187,6 +190,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         binary,
         slots,
         state,
+        read,
         next_sub: 0,
         throttle: Arc::new(Throttle::default()),
         events: events_tx,
@@ -542,6 +546,58 @@ impl Session {
                 });
                 Next::Continue
             }
+            ClientMessage::Read {
+                stream,
+                from,
+                end,
+                max,
+                shard,
+                id,
+            } => {
+                // A range read is authorized as a subscribe to the stream.
+                let name = match scope.stream(&stream, StreamAction::Subscribe) {
+                    Ok(bound) if self.read => bound.name,
+                    Ok(_) => {
+                        return Next::Reply(with_id(
+                            id,
+                            stream_error(
+                                stream,
+                                ErrorCode::BadRequest,
+                                "read needs the read feature",
+                            ),
+                        ));
+                    }
+                    Err(refusal) => {
+                        return Next::Reply(with_id(
+                            id,
+                            stream_error(stream, ErrorCode::BadRequest, refusal),
+                        ));
+                    }
+                };
+                let felix = Arc::clone(&self.felix);
+                let replies = self.replies.clone();
+                tokio::spawn(async move {
+                    let reply = match felix.read(&name, shard, from, end, max).await {
+                        Ok(page) => ServerMessage::Records {
+                            id,
+                            records: page
+                                .records
+                                .into_iter()
+                                .map(|record| Record {
+                                    offset: record.offset,
+                                    payload: BASE64.encode(record.payload),
+                                })
+                                .collect(),
+                            next_offset: page.next_offset,
+                        },
+                        Err(err) => {
+                            with_id(id, subscription_error(stream, ErrorCode::ReadFailed, err))
+                        }
+                    };
+                    let _ = replies.send(reply);
+                });
+                Next::Continue
+            }
             ClientMessage::CachePut {
                 cache,
                 key,
@@ -726,6 +782,7 @@ struct Joined {
     binary: bool,
     slots: bool,
     state: bool,
+    read: bool,
 }
 
 /// Wait for the browser's `join`, exchange its sign-in for a token that
@@ -820,6 +877,7 @@ async fn accept(
         binary: join.features.iter().any(|feature| feature == BINARY_EVENTS),
         slots: join.features.iter().any(|feature| feature == SLOTS),
         state: join.features.iter().any(|feature| feature == STATE),
+        read: join.features.iter().any(|feature| feature == READ),
     })
 }
 
@@ -995,7 +1053,7 @@ fn with_slot(message: &mut ServerMessage, slot: Option<&String>) {
 }
 
 /// `trimmed`, naming the oldest offset left, when retention has passed the
-/// offset the subscription asked for; `code` otherwise.
+/// offset a subscription or read asked for; `code` otherwise.
 fn subscription_error(stream: String, code: ErrorCode, err: anyhow::Error) -> ServerMessage {
     let trimmed = err
         .chain()

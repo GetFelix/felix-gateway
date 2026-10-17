@@ -792,6 +792,97 @@ async fn state_get_reads_a_key_with_the_offset_of_the_commit_that_wrote_it() {
 
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
+async fn read_answers_a_range_of_the_log_without_subscribing() {
+    let (_gateway, addr) = start_gateway().await;
+    let token = sign_in("ana").await;
+    let mut browser = Browser::connect_with(addr, "lobby", &token, json!(["read"])).await;
+    assert_eq!(browser.recv().await["features"], json!(["read"]));
+    let tag = run_tag("read");
+    let mut offsets = Vec::new();
+    for i in 0..5 {
+        browser.publish("ops", &format!("{tag}-{i}"), true).await;
+        let ack = browser.recv_type("ack").await;
+        offsets.push(ack["offset"].as_u64().expect("acks carry offsets in dev"));
+    }
+    let (first, last) = (offsets[0], offsets[4]);
+    let read = |id: u64, from: u64, end: Option<u64>, max: u32| json!({"type": "read", "stream": "ops", "from": from, "end": end, "max": max, "id": id});
+    // Other tests publish to the same stream, so only this run's records count.
+    let mine = |page: &Value| -> Vec<(u64, String)> {
+        page["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|record| {
+                let payload = BASE64.decode(record["payload"].as_str().unwrap()).unwrap();
+                let payload = String::from_utf8(payload).ok()?;
+                payload
+                    .starts_with(&tag)
+                    .then(|| (record["offset"].as_u64().unwrap(), payload))
+            })
+            .collect()
+    };
+
+    browser.send(read(1, first, Some(last + 1), 0)).await;
+    let page = browser.recv_type("records").await;
+    assert_eq!(page["id"], 1);
+    assert_eq!(page["next_offset"].as_u64(), Some(last + 1), "{page}");
+    let expected: Vec<(u64, String)> = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, offset)| (*offset, format!("{tag}-{i}")))
+        .collect();
+    assert_eq!(mine(&page), expected);
+
+    browser.send(read(2, first, Some(last + 1), 1)).await;
+    let page = browser.recv_type("records").await;
+    assert_eq!(page["records"].as_array().unwrap().len(), 1, "{page}");
+    assert_eq!(page["next_offset"].as_u64(), Some(first + 1), "{page}");
+
+    browser.send(read(3, first, Some(first), 0)).await;
+    let page = browser.recv_type("records").await;
+    assert_eq!(
+        (
+            page["records"].as_array().unwrap().len(),
+            page["next_offset"].as_u64()
+        ),
+        (0, Some(first)),
+        "{page}"
+    );
+
+    // Past the tail, and a stream with no log, are refused by Felix.
+    for (message, id) in [
+        (read(4, last + 1_000_000, None, 0), 4),
+        (
+            json!({"type": "read", "stream": "presence", "from": 0, "id": 5}),
+            5,
+        ),
+    ] {
+        browser.send(message).await;
+        let refused = browser.recv().await;
+        assert_eq!(
+            (refused["code"].as_str(), refused["id"].as_u64()),
+            (Some("read_failed"), Some(id)),
+            "{refused}"
+        );
+    }
+    browser
+        .send(json!({"type": "read", "stream": "snap", "from": 0, "id": 6}))
+        .await;
+    assert_eq!(browser.recv().await["code"], "bad_request");
+
+    // Only a session that asked for the feature may read.
+    let mut plain = Browser::open(addr).await;
+    plain.send(read(7, first, None, 0)).await;
+    let refused = plain.recv().await;
+    assert_eq!(
+        (refused["code"].as_str(), refused["id"].as_u64()),
+        (Some("bad_request"), Some(7)),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
 async fn a_shared_cache_is_the_same_cache_in_every_room() {
     let (_gateway, addr) = start_gateway().await;
     for room in ["lobby", "studio"] {
