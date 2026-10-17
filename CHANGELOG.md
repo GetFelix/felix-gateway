@@ -13,7 +13,7 @@ release notes the Felix version it was tested against.
 
 ### Added
 
-- The `read` feature: `read` answers one page of a durable stream's records between two offsets, without subscribing, as a `records` message. It needs `subscribe` on the stream (#PR).
+- The `read` feature: `read` answers one page of a durable stream's records between two offsets, without subscribing, as a `records` message. It needs `subscribe` on the stream (#29).
 
 ### Changed
 
