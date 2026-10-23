@@ -51,8 +51,9 @@ jobs:
           export GATEWAY_SCOPE_FILE="$PWD/dev/scope.toml"
           cargo test --locked --test relay -- --include-ignored --nocapture
       # The same suite over shared connections, against the broker that binds
-      # tokens to client certificates. The skipped test connects without a
-      # certificate on purpose.
+      # tokens to client certificates. The skipped tests connect without a
+      # certificate on purpose, or need a stream of several shards, which only
+      # the first broker, a cluster of one, serves.
       - name: Integration tests over shared connections
         env:
           GATEWAY_TENANT: demo
@@ -65,7 +66,8 @@ jobs:
           export GATEWAY_FELIX_CLIENT_KEY="$PWD/dev/state/gateway-key.pem"
           export GATEWAY_SCOPE_FILE="$PWD/dev/scope.toml"
           cargo test --locked --test relay -- --include-ignored --nocapture \
-            --skip a_token_for_one_room_cannot_reach_another_at_the_broker
+            --skip a_token_for_one_room_cannot_reach_another_at_the_broker \
+            --skip subscribe_follows_the_shard_it_names
       - name: Felix logs
         if: failure()
         run: docker compose -f dev/docker-compose.yml logs

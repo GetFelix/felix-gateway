@@ -1382,7 +1382,7 @@ async fn http_get(addr: SocketAddr, path: &str) -> Value {
 }
 
 /// Publish `payload` to the lobby's four-shard stream as ana, routed by `key`,
-/// and return its offset.
+/// and return its offset. Over the direct connection only: see the CI skip.
 async fn publish_keyed_as_ana(gateway: &Gateway, key: &[u8], payload: String) -> u64 {
     let config = config();
     let (tenant, namespace) = (config.tenant.as_str(), config.namespace.as_str());
@@ -1391,38 +1391,19 @@ async fn publish_keyed_as_ana(gateway: &Gateway, key: &[u8], payload: String) ->
         .await
         .expect("ana may open the lobby");
     let key = key.to_vec().into();
-    let offset = if config.shared.is_some() {
-        let delegated = delegate_as("demo-gateway", &token).await;
-        let identity = gateway
-            .attach_shared(Arc::new(Fixed(delegated)))
-            .await
-            .expect("attach as ana");
-        let publisher = identity.client().publisher().await.expect("a publisher");
-        publisher
-            .publish_keyed(
-                tenant,
-                namespace,
-                "demo.shards.lobby",
-                key,
-                payload.into_bytes(),
-                AckMode::PerMessage,
-            )
-            .await
-    } else {
-        gateway
-            .connect_felix(Arc::new(Fixed(token)))
-            .await
-            .expect("connect to Felix")
-            .publish_keyed(
-                tenant,
-                namespace,
-                "demo.shards.lobby",
-                payload.into_bytes(),
-                key,
-                AckMode::PerMessage,
-            )
-            .await
-    };
+    let offset = gateway
+        .connect_felix(Arc::new(Fixed(token)))
+        .await
+        .expect("connect to Felix")
+        .publish_keyed(
+            tenant,
+            namespace,
+            "demo.shards.lobby",
+            payload.into_bytes(),
+            key,
+            AckMode::PerMessage,
+        )
+        .await;
     offset.expect("the publish lands").expect("an offset")
 }
 
