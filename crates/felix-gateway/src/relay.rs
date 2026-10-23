@@ -1051,16 +1051,19 @@ async fn relay_subscription(
         Outbound::Message(message)
     };
     if let Some(shard) = shard {
-        match felix.shard_count(&name).await {
-            Ok(count) if shard >= count => {
+        match felix.shard_exists(&name, shard).await {
+            Ok(Ok(())) => {}
+            Ok(Err(count)) => {
                 let err = anyhow::anyhow!(
                     "the stream has {count} shards, so shard {shard} does not exist"
                 );
                 let _ = events.send(ended(ErrorCode::BadRequest, err)).await;
                 return;
             }
-            Ok(_) => {}
             Err(err) => {
+                let err = err.context(format!(
+                    "cannot check that shard {shard} exists, the broker did not report the stream's shard count"
+                ));
                 let _ = events.send(ended(ErrorCode::SubscribeFailed, err)).await;
                 return;
             }

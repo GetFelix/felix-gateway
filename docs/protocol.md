@@ -130,7 +130,7 @@ quiet, such as after a network drop. Both times are settings, in
 | `stream` | A stream alias whose actions include `subscribe` |
 | `from` | `"live"` for only what is published from now on, or a log offset: the first record wanted, which is the last offset handled plus one |
 | `slot` | Only with the `slots` feature, optional: a name for this subscription, following the rule for `counter_add` keys. Leaving it out names the stream's default slot. Without the feature a `slot` is refused with `bad_request` |
-| `shard` | Only with the `shards` feature, optional: the shard of the stream to follow, and the shard `from` is an offset of. Leaving it out is shard 0, the only shard of a stream of one. Without the feature a `shard` is refused with `bad_request`, as is one past the stream's shard count |
+| `shard` | Only with the `shards` feature, optional: the shard of the stream to follow, and the shard `from` is an offset of. Leaving it out is shard 0, the only shard of a stream of one. Without the feature a `shard` is refused with `bad_request`, as is one past the stream's shard count. Shard 0 is always accepted. The count is looked up on Felix and kept for 30 seconds; for a shard past 0, a broker that does not report shard counts answers `subscribe_failed` |
 
 Subscribing to a stream and slot the connection is already subscribed to
 replaces the earlier subscription; other slots of the same stream keep theirs.
@@ -536,7 +536,7 @@ The connection stays open after any error except an answer to `join`.
 
 | Code | Meaning |
 |---|---|
-| `bad_request` | The message did not parse, its payload was not base64 or was larger than the alias allows, a key or scope was not allowed, or it named an alias the scope file does not have or an action that alias does not allow, or it named a `shard` the stream does not have or without the `shards` feature |
+| `bad_request` | The message did not parse, its payload was not base64 or was larger than the alias allows, a key or scope was not allowed, or it named an alias the scope file does not have or an action that alias does not allow, or it named a `shard` past the stream's shard count, or any `shard` without the `shards` feature |
 | `unsupported` | The message type is not one this gateway knows, a `join` asked for another protocol version, or `throttle` is not allowed |
 | `publish_failed` | Felix refused or lost the publish. It may have landed |
 | `subscribe_failed` | Felix refused the subscription, for instance because this person already holds as many subscriptions and cache watches as the broker allows one user on a connection |

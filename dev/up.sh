@@ -62,6 +62,18 @@ ready() {
   done
 }
 
+# The first broker is a cluster of one and refuses writes until the control
+# plane has granted it a lease on its shards.
+wait_for_lease() {
+  for _ in $(seq 1 30); do
+    curl -fsS http://127.0.0.1:8080/metrics 2>/dev/null |
+      grep -Eq '^felix_broker_lease_held(\{[^}]*\})? 1' && return 0
+    sleep 1
+  done
+  echo "the broker did not take its lease" >&2
+  return 1
+}
+
 # A cluster member refuses atomic commits until the fleet finalizes them, and
 # the control plane accepts that only once a broker is serving.
 finalize_atomic_commit() {
@@ -72,9 +84,17 @@ finalize_atomic_commit() {
     -d '{"audience":"felix-controlplane"}' \
     http://127.0.0.1:8443/v1/tenants/demo/token/exchange |
     sed -E 's/.*"felix_token": *"([^"]*)".*/\1/')
+  local code
   for _ in $(seq 1 30); do
-    curl -fsS -X POST -H "authorization: Bearer $token" \
-      http://127.0.0.1:8443/v1/fleet/features/atomic_commit/finalize >/dev/null 2>&1 && return 0
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "authorization: Bearer $token" \
+      http://127.0.0.1:8443/v1/fleet/features/atomic_commit/finalize 2>/dev/null || true)
+    case "$code" in
+      2??) return 0 ;;
+      401 | 403)
+        echo "the control plane refused to finalize atomic_commit (HTTP $code)" >&2
+        return 1
+        ;;
+    esac
     sleep 2
   done
   echo "the fleet did not finalize atomic_commit" >&2
@@ -84,9 +104,7 @@ finalize_atomic_commit() {
 for _ in $(seq 1 90); do
   if ready; then
     finalize_atomic_commit
-    # The first broker is a cluster of one and refuses writes until the control
-    # plane has granted it a lease on its shards.
-    sleep 5
+    wait_for_lease
     echo "Felix is ready. For the gateway:"
     echo "  export GATEWAY_FELIX_CA_FILE=dev/state/broker-cert.pem"
     echo "  export GATEWAY_SCOPE_FILE=dev/scope.toml"

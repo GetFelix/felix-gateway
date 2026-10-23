@@ -4,9 +4,10 @@
 
 mod shared;
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use felix_client::{
@@ -34,6 +35,50 @@ pub(crate) struct Brokers {
     namespace: String,
     /// Which broker the next connection tries first.
     next: AtomicUsize,
+    shards: Arc<ShardCounts>,
+}
+
+/// How long a stream's shard count is trusted. Looking one up opens a
+/// stream on the broker, and a browser following every shard asks once per
+/// shard.
+const SHARD_COUNT_TTL: Duration = Duration::from_secs(30);
+
+/// Shard counts by stream, shared by every session.
+#[derive(Default)]
+struct ShardCounts {
+    seen: Mutex<HashMap<String, (u32, Instant)>>,
+}
+
+impl ShardCounts {
+    fn fresh(&self, stream: &str) -> Option<u32> {
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.get(stream)
+            .filter(|(_, at)| at.elapsed() < SHARD_COUNT_TTL)
+            .map(|(count, _)| *count)
+    }
+
+    async fn lookup<F, Fut>(&self, stream: &str, fetch: F) -> Result<u32>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<u32>>,
+    {
+        if let Some(count) = self.fresh(stream) {
+            return Ok(count);
+        }
+        self.refresh(stream, fetch).await
+    }
+
+    async fn refresh<F, Fut>(&self, stream: &str, fetch: F) -> Result<u32>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<u32>>,
+    {
+        let count = fetch().await?;
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.retain(|_, (_, at)| at.elapsed() < SHARD_COUNT_TTL);
+        seen.insert(stream.to_owned(), (count, Instant::now()));
+        Ok(count)
+    }
 }
 
 impl Brokers {
@@ -57,6 +102,7 @@ impl Brokers {
             tenant: config.tenant.clone(),
             namespace: config.namespace.clone(),
             next: AtomicUsize::new(0),
+            shards: Arc::default(),
         })
     }
 
@@ -113,6 +159,7 @@ pub(crate) struct Felix {
     link: Link,
     tenant: String,
     namespace: String,
+    shards: Arc<ShardCounts>,
     pub(crate) scope: Scope,
     /// Who signed in, for streams that stamp the sender.
     pub(crate) principal: String,
@@ -202,6 +249,7 @@ impl Felix {
             link,
             tenant: brokers.tenant.clone(),
             namespace: brokers.namespace.clone(),
+            shards: Arc::clone(&brokers.shards),
             scope,
             principal,
         }
@@ -263,8 +311,28 @@ impl Felix {
         }
     }
 
-    /// How many shards `stream` has.
-    pub(crate) async fn shard_count(&self, stream: &str) -> Result<u32> {
+    /// Whether `stream` has a shard `shard`. A count from the last 30 seconds
+    /// is trusted unless it says no, which is checked again in case the
+    /// stream has grown. Shard 0 always exists and is not looked up.
+    pub(crate) async fn shard_exists(&self, stream: &str, shard: u32) -> Result<Result<(), u32>> {
+        if shard == 0 {
+            return Ok(Ok(()));
+        }
+        let count = self
+            .shards
+            .lookup(stream, || self.shard_count(stream))
+            .await?;
+        if shard < count {
+            return Ok(Ok(()));
+        }
+        let count = self
+            .shards
+            .refresh(stream, || self.shard_count(stream))
+            .await?;
+        Ok(if shard < count { Ok(()) } else { Err(count) })
+    }
+
+    async fn shard_count(&self, stream: &str) -> Result<u32> {
         match &self.link {
             Link::Own(client) => {
                 client
@@ -518,4 +586,38 @@ pub(crate) async fn attach_identity(
         .await?
         .identity()
         .await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    #[tokio::test]
+    async fn shard_count_is_looked_up_once_within_the_ttl() {
+        let counts = ShardCounts::default();
+        let calls = AtomicU32::new(0);
+        for _ in 0..4 {
+            let count = counts
+                .lookup("events", || async {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(4)
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, 4);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn shard_count_is_looked_up_again_after_the_ttl() {
+        let counts = ShardCounts::default();
+        counts.seen.lock().unwrap().insert(
+            "events".into(),
+            (2, Instant::now() - SHARD_COUNT_TTL - Duration::from_secs(1)),
+        );
+        let count = counts.lookup("events", || async { Ok(5) }).await.unwrap();
+        assert_eq!(count, 5);
+    }
 }
