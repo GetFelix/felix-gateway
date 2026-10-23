@@ -64,6 +64,9 @@ ready() {
 
 for _ in $(seq 1 90); do
   if ready; then
+    # The first broker is a cluster of one and refuses writes until the control
+    # plane has granted it a lease on its shards.
+    sleep 15
     echo "Felix is ready. For the gateway:"
     echo "  export GATEWAY_FELIX_CA_FILE=dev/state/broker-cert.pem"
     echo "  export GATEWAY_SCOPE_FILE=dev/scope.toml"
