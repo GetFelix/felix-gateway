@@ -263,7 +263,35 @@ impl Felix {
         }
     }
 
-    pub(crate) async fn subscribe(&self, stream: &str, from: StartAt) -> Result<Subscription> {
+    /// How many shards `stream` has.
+    pub(crate) async fn shard_count(&self, stream: &str) -> Result<u32> {
+        match &self.link {
+            Link::Own(client) => {
+                client
+                    .client()
+                    .await
+                    .stream_shards(&self.tenant, &self.namespace, stream)
+                    .await
+            }
+            Link::Shared(session) => {
+                self.on_identity(session, |identity| async move {
+                    identity
+                        .client
+                        .stream_shards(&self.tenant, &self.namespace, stream)
+                        .await
+                })
+                .await
+            }
+        }
+    }
+
+    /// Follow `stream`'s shard `shard`; `from` is an offset of that shard.
+    pub(crate) async fn subscribe(
+        &self,
+        stream: &str,
+        shard: u32,
+        from: StartAt,
+    ) -> Result<Subscription> {
         // `Latest` rather than no position: only then does the broker report
         // the tail it registered at, which a joining browser needs to know
         // what lies between its snapshot and the live events.
@@ -273,7 +301,7 @@ impl Felix {
         };
         match &self.link {
             Link::Own(client) => client
-                .subscribe_from(&self.tenant, &self.namespace, stream, Some(start))
+                .subscribe_shard(&self.tenant, &self.namespace, stream, shard, Some(start))
                 .await
                 .map(Subscription::Own),
             Link::Shared(session) => SharedSubscription::start(
@@ -281,6 +309,7 @@ impl Felix {
                 &self.tenant,
                 &self.namespace,
                 stream,
+                shard,
                 start,
             )
             .await

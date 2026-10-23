@@ -23,7 +23,7 @@ use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
     BINARY_EVENTS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES, Join, PROTOCOL,
-    RATE_LIMITED, READ, Record, SLOTS, STATE, ServerMessage, StartAt,
+    RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE, ServerMessage, StartAt,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -135,6 +135,8 @@ struct Session {
     state: bool,
     /// The session asked for [`READ`].
     read: bool,
+    /// The session asked for [`SHARDS`].
+    shards: bool,
     /// Range reads sent to Felix whose answer is not yet sent on.
     reads: Arc<AtomicUsize>,
     /// The number the next subscription's frames carry.
@@ -172,6 +174,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         slots,
         state,
         read,
+        shards,
     }) = join(&mut conn, &gateway, client).await
     else {
         return;
@@ -197,6 +200,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         slots,
         state,
         read,
+        shards,
         reads: Arc::default(),
         next_sub: 0,
         throttle: Arc::new(Throttle::default()),
@@ -364,7 +368,12 @@ impl Session {
         let felix = Arc::clone(&self.felix);
         let scope = &felix.scope;
         match message {
-            ClientMessage::Subscribe { stream, from, slot } => {
+            ClientMessage::Subscribe {
+                stream,
+                from,
+                slot,
+                shard,
+            } => {
                 if let Some(slot) = &slot
                     && !(self.slots && valid_name(slot))
                 {
@@ -375,6 +384,17 @@ impl Session {
                     };
                     let mut refusal = stream_error(stream, ErrorCode::BadRequest, reason);
                     with_slot(&mut refusal, Some(slot));
+                    with_shard(&mut refusal, shard);
+                    return Next::Reply(refusal);
+                }
+                if shard.is_some() && !self.shards {
+                    let mut refusal = stream_error(
+                        stream,
+                        ErrorCode::BadRequest,
+                        "a shard needs the shards feature",
+                    );
+                    with_slot(&mut refusal, slot.as_ref());
+                    with_shard(&mut refusal, shard);
                     return Next::Reply(refusal);
                 }
                 let name = match scope.stream(&stream, StreamAction::Subscribe) {
@@ -382,6 +402,7 @@ impl Session {
                     Err(refusal) => {
                         let mut refusal = stream_error(stream, ErrorCode::BadRequest, refusal);
                         with_slot(&mut refusal, slot.as_ref());
+                        with_shard(&mut refusal, shard);
                         return Next::Reply(refusal);
                     }
                 };
@@ -393,6 +414,7 @@ impl Session {
                 let target = Target {
                     stream: stream.clone(),
                     slot: slot.clone(),
+                    shard,
                     sub,
                 };
                 let task = tokio::spawn(relay_subscription(
@@ -803,6 +825,7 @@ struct Joined {
     slots: bool,
     state: bool,
     read: bool,
+    shards: bool,
 }
 
 /// Wait for the browser's `join`, exchange its sign-in for a token that
@@ -898,6 +921,7 @@ async fn accept(
         slots: join.features.iter().any(|feature| feature == SLOTS),
         state: join.features.iter().any(|feature| feature == STATE),
         read: join.features.iter().any(|feature| feature == READ),
+        shards: join.features.iter().any(|feature| feature == SHARDS),
     })
 }
 
@@ -997,11 +1021,12 @@ fn unix_micros() -> u64 {
         })
 }
 
-/// Where one subscription's events go: the stream's alias and slot, and the
-/// number its binary frames carry.
+/// Where one subscription's events go: the stream's alias, slot and shard (as
+/// the browser named them), and the number its binary frames carry.
 struct Target {
     stream: String,
     slot: Option<String>,
+    shard: Option<u32>,
     sub: Option<u32>,
 }
 
@@ -1013,13 +1038,35 @@ async fn relay_subscription(
     throttle: Arc<Throttle>,
     events: mpsc::Sender<Outbound>,
 ) {
-    let Target { stream, slot, sub } = target;
+    let Target {
+        stream,
+        slot,
+        shard,
+        sub,
+    } = target;
     let ended = |code, err| {
         let mut message = subscription_error(stream.clone(), code, err);
         with_slot(&mut message, slot.as_ref());
+        with_shard(&mut message, shard);
         Outbound::Message(message)
     };
-    let mut subscription = match felix.subscribe(&name, from).await {
+    if let Some(shard) = shard {
+        match felix.shard_count(&name).await {
+            Ok(count) if shard >= count => {
+                let err = anyhow::anyhow!(
+                    "the stream has {count} shards, so shard {shard} does not exist"
+                );
+                let _ = events.send(ended(ErrorCode::BadRequest, err)).await;
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                let _ = events.send(ended(ErrorCode::SubscribeFailed, err)).await;
+                return;
+            }
+        }
+    }
+    let mut subscription = match felix.subscribe(&name, shard.unwrap_or(0), from).await {
         Ok(subscription) => subscription,
         Err(err) => {
             let _ = events.send(ended(ErrorCode::SubscribeFailed, err)).await;
@@ -1029,6 +1076,7 @@ async fn relay_subscription(
     let subscribed = ServerMessage::Subscribed {
         stream: stream.clone(),
         slot: slot.clone(),
+        shard,
         sub,
         start_offset: subscription.start_offset(),
         live_offset: subscription.live_offset(),
@@ -1069,6 +1117,13 @@ async fn relay_subscription(
 fn with_slot(message: &mut ServerMessage, slot: Option<&String>) {
     if let ServerMessage::Error { slot: about, .. } = message {
         *about = slot.cloned();
+    }
+}
+
+/// `message`, an error, naming the subscription's `shard` when it named one.
+fn with_shard(message: &mut ServerMessage, shard: Option<u32>) {
+    if let ServerMessage::Error { shard: about, .. } = message {
+        *about = shard;
     }
 }
 
@@ -1172,6 +1227,7 @@ fn error(code: ErrorCode, err: impl std::fmt::Display) -> ServerMessage {
         id: None,
         stream: None,
         slot: None,
+        shard: None,
         cache: None,
         code,
         oldest: None,

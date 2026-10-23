@@ -698,13 +698,17 @@ async fn members_are_listed_watched_and_expire() {
 /// connections it goes as ana on the gateway's own connection, the one broker
 /// the browsers there reach.
 async fn commit_as_ana(gateway: &Gateway, ops: Vec<CommitOp>) -> u64 {
+    commit_as_ana_to(gateway, b"demo.ops.lobby", ops).await
+}
+
+/// As [`commit_as_ana`], with the commit routed by `entity`.
+async fn commit_as_ana_to(gateway: &Gateway, entity: &[u8], ops: Vec<CommitOp>) -> u64 {
     let config = config();
     let (tenant, namespace) = (config.tenant.as_str(), config.namespace.as_str());
     let token = gateway
         .scope_token(&sign_in("ana").await, "lobby")
         .await
         .expect("ana may open the lobby");
-    let entity = b"demo.ops.lobby";
     let receipt = if config.shared.is_some() {
         let delegated = delegate_as("demo-gateway", &token).await;
         let identity = gateway
@@ -1379,4 +1383,145 @@ async fn http_get(addr: SocketAddr, path: &str) -> Value {
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     serde_json::from_str(body).unwrap()
+}
+
+/// An entity key the four-shard stream routes to `shard`.
+fn entity_on(shard: u32) -> Vec<u8> {
+    (0..)
+        .map(|i| format!("d{i:02}").into_bytes())
+        .find(|entity| felix_wire::routing::shard_for(4, Some(entity)) == shard)
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn subscribe_follows_the_shard_it_names() {
+    let (gateway, addr) = start_gateway().await;
+    let tag = run_tag("shards");
+    let token = sign_in("ana").await;
+    let features = json!(["slots", "shards"]);
+    let mut reader = Browser::connect_with(addr, "lobby", &token, features).await;
+    assert_eq!(reader.recv().await["features"], json!(["slots", "shards"]));
+    for shard in [1, 3] {
+        reader
+            .send(json!({
+                "type": "subscribe", "stream": "sharded", "from": "live",
+                "slot": format!("d{shard}"), "shard": shard
+            }))
+            .await;
+        let subscribed = reader.recv_type("subscribed").await;
+        assert_eq!(subscribed["shard"], shard, "{subscribed}");
+        assert_eq!(subscribed["slot"], format!("d{shard}"));
+    }
+
+    let mut offsets = Vec::new();
+    for shard in [1, 3, 1] {
+        let payload = format!("{tag}/{shard}/{}", offsets.len());
+        let offset = commit_as_ana_to(
+            &gateway,
+            &entity_on(shard),
+            vec![CommitOp::publish("demo.shards.lobby", payload.into_bytes())],
+        )
+        .await;
+        offsets.push((shard, offset));
+    }
+
+    let mut seen: std::collections::BTreeMap<u32, Vec<(u64, String)>> = Default::default();
+    while seen.values().map(Vec::len).sum::<usize>() < 3 {
+        let event = reader.recv_type("event").await;
+        let payload =
+            String::from_utf8(BASE64.decode(event["payload"].as_str().unwrap()).unwrap()).unwrap();
+        if !payload.starts_with(&tag) {
+            continue;
+        }
+        let slot = event["slot"].as_str().unwrap().trim_start_matches('d');
+        seen.entry(slot.parse().unwrap())
+            .or_default()
+            .push((event["offset"].as_u64().unwrap(), payload));
+    }
+    for shard in [1, 3] {
+        let expected: Vec<u64> = offsets
+            .iter()
+            .filter(|(of, _)| *of == shard)
+            .map(|(_, offset)| *offset)
+            .collect();
+        let got: Vec<u64> = seen[&shard].iter().map(|(offset, _)| *offset).collect();
+        assert_eq!(got, expected, "shard {shard}");
+        assert!(
+            seen[&shard]
+                .iter()
+                .all(|(_, payload)| payload.starts_with(&format!("{tag}/{shard}/"))),
+            "shard {shard} got another shard's record: {:?}",
+            seen[&shard]
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_subscribe_without_a_shard_follows_shard_zero_and_answers_unchanged() {
+    let (_gateway, addr) = start_gateway().await;
+    let token = sign_in("ana").await;
+    let mut browser = Browser::connect_with(addr, "lobby", &token, json!(["shards"])).await;
+    browser.recv_type("hello").await;
+    let subscribed = browser.subscribe("sharded", json!("live")).await;
+    assert!(subscribed.get("shard").is_none(), "{subscribed}");
+    let mut named = Browser::connect_with(addr, "lobby", &token, json!(["shards"])).await;
+    named.recv_type("hello").await;
+    named
+        .send(json!({"type": "subscribe", "stream": "sharded", "from": "live", "shard": 0}))
+        .await;
+    let zero = named.recv_type("subscribed").await;
+    assert_eq!(zero["shard"], 0);
+    assert_eq!(zero["live_offset"], subscribed["live_offset"]);
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_shard_past_the_streams_count_is_a_bad_request() {
+    let (_gateway, addr) = start_gateway().await;
+    let token = sign_in("ana").await;
+    let mut browser =
+        Browser::connect_with(addr, "lobby", &token, json!(["slots", "shards"])).await;
+    browser.recv_type("hello").await;
+    browser
+        .send(json!({
+            "type": "subscribe", "stream": "sharded", "from": "live",
+            "slot": "far", "shard": 4
+        }))
+        .await;
+    let refused = browser.recv().await;
+    assert_eq!(
+        (
+            refused["type"].as_str(),
+            refused["code"].as_str(),
+            refused["stream"].as_str(),
+            refused["slot"].as_str(),
+            refused["shard"].as_u64()
+        ),
+        (
+            Some("error"),
+            Some("bad_request"),
+            Some("sharded"),
+            Some("far"),
+            Some(4)
+        ),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_shard_needs_the_shards_feature() {
+    let (_gateway, addr) = start_gateway().await;
+    let mut browser = Browser::open(addr).await;
+    browser
+        .send(json!({"type": "subscribe", "stream": "sharded", "from": "live", "shard": 1}))
+        .await;
+    let refused = browser.recv().await;
+    assert_eq!(
+        (refused["code"].as_str(), refused["shard"].as_u64()),
+        (Some("bad_request"), Some(1)),
+        "{refused}"
+    );
 }

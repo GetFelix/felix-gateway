@@ -19,6 +19,12 @@ alias = "presence"
 name = "demo.presence.{scope}"
 actions = ["publish", "subscribe"]
 
+# A durable log of four shards.
+[[scope.streams]]
+alias = "sharded"
+name = "demo.shards.{scope}"
+actions = ["publish", "subscribe"]
+
 # Read only: something other than a browser writes it.
 [[scope.caches]]
 alias = "snap"

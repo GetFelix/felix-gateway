@@ -204,6 +204,7 @@ pub(crate) struct SharedSubscription {
     tenant: String,
     namespace: String,
     stream: String,
+    shard: u32,
     subscription: felix_client::Subscription,
 }
 
@@ -213,17 +214,19 @@ impl SharedSubscription {
         tenant: &str,
         namespace: &str,
         stream: &str,
+        shard: u32,
         start: StartPosition,
     ) -> Result<Self> {
         let subscription = identity
             .client
-            .subscribe_from(tenant, namespace, stream, Some(start))
+            .subscribe_shard(tenant, namespace, stream, shard, Some(start))
             .await?;
         Ok(Self {
             identity,
             tenant: tenant.to_string(),
             namespace: namespace.to_string(),
             stream: stream.to_string(),
+            shard,
             subscription,
         })
     }
@@ -248,10 +251,11 @@ impl SharedSubscription {
             self.subscription = self
                 .identity
                 .client
-                .subscribe_from(
+                .subscribe_shard(
                     &self.tenant,
                     &self.namespace,
                     &self.stream,
+                    self.shard,
                     Some(StartPosition::Offset(resume_from)),
                 )
                 .await
