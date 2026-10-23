@@ -11,7 +11,7 @@ pub const PROTOCOL: u32 = 1;
 
 /// Optional capabilities a `join` may ask for in `features`; `hello` answers
 /// with the ones asked for that are listed here.
-pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS, STATE, READ];
+pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS, STATE, READ, SHARDS];
 
 /// The feature under which a write or join refused by a limit is answered
 /// with [`ErrorCode::RateLimited`] and `retry_after_ms`. Without it the
@@ -33,6 +33,10 @@ pub const STATE: &str = "state";
 /// The feature under which a session may read a range of a durable stream
 /// with `read`, without subscribing.
 pub const READ: &str = "read";
+
+/// The feature under which a `subscribe` may name the `shard` of a stream to
+/// follow.
+pub const SHARDS: &str = "shards";
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -85,6 +89,10 @@ pub enum ClientMessage {
         /// Leaving it out names the stream's one default slot.
         #[serde(default)]
         slot: Option<String>,
+        /// With [`SHARDS`]: the shard whose offsets `from` is. Leaving it out
+        /// means shard 0.
+        #[serde(default)]
+        shard: Option<u32>,
     },
     /// Publish one record. `payload` is base64. With `ack`, the gateway
     /// answers with an [`ServerMessage::Ack`] carrying the same `id`.
@@ -182,6 +190,9 @@ pub enum ServerMessage {
         stream: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         slot: Option<String>,
+        /// The shard, when the `subscribe` named one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shard: Option<u32>,
         /// With [`BINARY_EVENTS`]: the number this subscription's event
         /// frames carry.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +268,10 @@ pub enum ServerMessage {
         /// named one.
         #[serde(skip_serializing_if = "Option::is_none")]
         slot: Option<String>,
+        /// The subscription's shard, on an error about a subscription that
+        /// named one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shard: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache: Option<String>,
         code: ErrorCode,
@@ -400,6 +415,7 @@ mod tests {
                 stream: "ops".into(),
                 from: StartAt::Offset(42),
                 slot: None,
+                shard: None,
             }
         );
         assert_eq!(
@@ -408,6 +424,7 @@ mod tests {
                 stream: "presence".into(),
                 from: StartAt::Live(Live::Live),
                 slot: None,
+                shard: None,
             }
         );
         assert_eq!(
@@ -416,6 +433,7 @@ mod tests {
                 stream: "ops".into(),
                 from: StartAt::Offset(7),
                 slot: Some("replay".into()),
+                shard: None,
             }
         );
     }
@@ -633,6 +651,7 @@ mod tests {
             id: Some(7),
             stream: Some("ops".into()),
             slot: None,
+            shard: None,
             cache: None,
             code: ErrorCode::RateLimited,
             oldest: None,
@@ -707,6 +726,7 @@ mod tests {
         let subscribed = ServerMessage::Subscribed {
             stream: "ticks".into(),
             slot: Some("replay".into()),
+            shard: None,
             sub: Some(2),
             start_offset: Some(5),
             live_offset: Some(9),
@@ -717,6 +737,34 @@ mod tests {
                 "type": "subscribed", "stream": "ticks", "slot": "replay", "sub": 2,
                 "start_offset": 5, "live_offset": 9
             })
+        );
+    }
+
+    #[test]
+    fn a_subscribe_names_its_shard_only_when_the_browser_does() {
+        let named = parse(json!({"type": "subscribe", "stream": "ops", "from": 3, "shard": 2}));
+        assert!(matches!(
+            named,
+            ClientMessage::Subscribe { shard: Some(2), .. }
+        ));
+        let subscribed = |shard| ServerMessage::Subscribed {
+            stream: "ops".into(),
+            slot: None,
+            shard,
+            sub: None,
+            start_offset: Some(3),
+            live_offset: Some(9),
+        };
+        assert_eq!(
+            serde_json::to_value(subscribed(Some(2))).unwrap(),
+            json!({
+                "type": "subscribed", "stream": "ops", "shard": 2,
+                "start_offset": 3, "live_offset": 9
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(subscribed(None)).unwrap(),
+            json!({"type": "subscribed", "stream": "ops", "start_offset": 3, "live_offset": 9})
         );
     }
 }

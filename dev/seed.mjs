@@ -66,7 +66,7 @@ function roomPolicies(room) {
   const role = `role:room-${room}`;
   const grant = (kind, name, action) => ({ subject: role, object: object(kind, name), action });
   return [
-    ...[`demo.ops.${room}`, `demo.presence.${room}`].flatMap((stream) => [
+    ...[`demo.ops.${room}`, `demo.presence.${room}`, `demo.shards.${room}`].flatMap((stream) => [
       grant("stream", stream, "stream.publish"),
       grant("stream", stream, "stream.subscribe"),
     ]),
@@ -100,6 +100,8 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
       { subject: "role:gateway", object: `tenant:${TENANT}`, action: "token.delegate" },
       { subject: "role:admin", object: object("stream", "*"), action: "stream.manage" },
       { subject: "role:admin", object: object("cache", "*"), action: "cache.manage" },
+      // The admin finalizes the fleet features the first broker's cluster needs.
+      { subject: "role:admin", object: "cluster:*", action: "node.manage" },
       { subject: "role:broker", object: "cluster:*", action: "node.view" },
       { subject: "role:broker", object: "cluster:*", action: "node.manage" },
     ],
@@ -119,10 +121,10 @@ await request("POST", `${tenant}/namespaces`, {
   token: admin,
   body: { namespace: NAMESPACE, display_name: NAMESPACE },
 });
-const stream = (name, durable) => ({
+const stream = (name, durable, shards = 1) => ({
   stream: name,
   kind: "Stream",
-  shards: 1,
+  shards,
   replication_factor: 1,
   retention: { max_age_seconds: durable ? 24 * 60 * 60 : null, max_size_bytes: null },
   consistency: "Leader",
@@ -142,12 +144,17 @@ await request("POST", `${namespace}/caches`, {
   },
 });
 for (const [room, members] of Object.entries(MEMBERS)) {
-  for (const [name, durable] of [
-    [`demo.ops.${room}`, true],
-    [`demo.presence.${room}`, false],
+  for (const [name, durable, shards] of [
+    [`demo.ops.${room}`, true, 1],
+    [`demo.presence.${room}`, false, 1],
+    // Four shards, for the tests that follow one shard of a stream.
+    [`demo.shards.${room}`, true, 4],
   ]) {
     console.log(`stream ${name}`);
-    await request("POST", `${namespace}/streams`, { token: admin, body: stream(name, durable) });
+    await request("POST", `${namespace}/streams`, {
+      token: admin,
+      body: stream(name, durable, shards),
+    });
   }
   // Caches per room, because Felix grants a cache as a whole. One shard each:
   // a prefix watch reads a single shard.

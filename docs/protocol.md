@@ -42,6 +42,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `slots` | A `subscribe` may name a `slot`, so one stream can hold more than one subscription on a connection |
   | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
   | `read` | [`read`](#read) reads a range of a durable stream's log without subscribing |
+  | `shards` | A `subscribe` may name the `shard` of a stream to follow, instead of shard 0 |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
@@ -129,6 +130,7 @@ quiet, such as after a network drop. Both times are settings, in
 | `stream` | A stream alias whose actions include `subscribe` |
 | `from` | `"live"` for only what is published from now on, or a log offset: the first record wanted, which is the last offset handled plus one |
 | `slot` | Only with the `slots` feature, optional: a name for this subscription, following the rule for `counter_add` keys. Leaving it out names the stream's default slot. Without the feature a `slot` is refused with `bad_request` |
+| `shard` | Only with the `shards` feature, optional: the shard of the stream to follow, and the shard `from` is an offset of. Leaving it out is shard 0, the only shard of a stream of one. Without the feature a `shard` is refused with `bad_request`, as is one past the stream's shard count. Shard 0 is always accepted. The count is looked up on Felix and kept for 30 seconds; for a shard past 0, a broker that does not report shard counts answers `subscribe_failed` |
 
 Subscribing to a stream and slot the connection is already subscribed to
 replaces the earlier subscription; other slots of the same stream keep theirs.
@@ -137,7 +139,17 @@ an older stretch of it. That is the recovery path: after a gap or an ended
 subscription, subscribe again from the last offset handled plus one.
 
 An offset the log no longer holds is answered with a `trimmed` error naming the
-oldest offset left.
+oldest offset left of the shard followed.
+
+A subscription follows one shard. To follow several shards of a stream, send
+one `subscribe` per shard, each on a slot of its own, since the replace rule
+above still keys on stream and slot alone. A `shard` itself does not need
+`slots`; following more than one shard at a time does. Events carry the
+`slot`, which tells the shards apart.
+
+```json
+{"type": "subscribe", "stream": "events", "from": 120, "shard": 3, "slot": "d03"}
+```
 
 ### `publish`
 
@@ -369,6 +381,7 @@ The answer to `join`: the session is open on this scope.
 ```json
 {"type": "subscribed", "stream": "ops", "start_offset": 42, "live_offset": 57}
 {"type": "subscribed", "stream": "ops", "slot": "replay", "sub": 3, "start_offset": 42, "live_offset": 57}
+{"type": "subscribed", "stream": "events", "slot": "d03", "shard": 3, "start_offset": 120, "live_offset": 131}
 ```
 
 The subscription is registered with the broker. Anything published from this
@@ -377,7 +390,9 @@ subscription delivers and `live_offset` is the stream's tail when it was
 registered; both are `null` on a stream with no log, such as `presence`. From
 `"live"` the two are equal.
 
-`slot` is present when the `subscribe` named one. `sub` is present only with
+`slot` and `shard` are present when the `subscribe` named them; a
+`subscribe` without a `shard` is answered exactly as before. `start_offset`
+and `live_offset` are offsets of that shard. `sub` is present only with
 the `binary_events` feature: the number this subscription's frames carry. Each
 `subscribe` gets a new number, so frames still in flight from a subscription
 that was replaced can be told apart and dropped.
@@ -514,13 +529,14 @@ time keeps the browser's own clock out of it.
 
 `id` is present when the error answers one request, and `stream` or `cache`
 when it is about one stream or cache. `slot` is present on an error about a
-subscription that named one. `oldest` is present only on `trimmed`,
+subscription that named one, and `shard` on one that named a shard.
+`oldest` is present only on `trimmed`,
 and `retry_after_ms` only on `rate_limited`.
 The connection stays open after any error except an answer to `join`.
 
 | Code | Meaning |
 |---|---|
-| `bad_request` | The message did not parse, its payload was not base64 or was larger than the alias allows, a key or scope was not allowed, or it named an alias the scope file does not have or an action that alias does not allow |
+| `bad_request` | The message did not parse, its payload was not base64 or was larger than the alias allows, a key or scope was not allowed, or it named an alias the scope file does not have or an action that alias does not allow, or it named a `shard` past the stream's shard count, or any `shard` without the `shards` feature |
 | `unsupported` | The message type is not one this gateway knows, a `join` asked for another protocol version, or `throttle` is not allowed |
 | `publish_failed` | Felix refused or lost the publish. It may have landed |
 | `subscribe_failed` | Felix refused the subscription, for instance because this person already holds as many subscriptions and cache watches as the broker allows one user on a connection |
