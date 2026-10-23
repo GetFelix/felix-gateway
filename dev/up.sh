@@ -62,11 +62,31 @@ ready() {
   done
 }
 
+# A cluster member refuses atomic commits until the fleet finalizes them, and
+# the control plane accepts that only once a broker is serving.
+finalize_atomic_commit() {
+  local id token
+  id=$(curl -fsS "http://127.0.0.1:9400/token?sub=demo-admin&aud=felix-gateway" |
+    sed -E 's/.*"id_token": *"([^"]*)".*/\1/')
+  token=$(curl -fsS -X POST -H "authorization: Bearer $id" -H 'content-type: application/json' \
+    -d '{"audience":"felix-controlplane"}' \
+    http://127.0.0.1:8443/v1/tenants/demo/token/exchange |
+    sed -E 's/.*"felix_token": *"([^"]*)".*/\1/')
+  for _ in $(seq 1 30); do
+    curl -fsS -X POST -H "authorization: Bearer $token" \
+      http://127.0.0.1:8443/v1/fleet/features/atomic_commit/finalize >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  echo "the fleet did not finalize atomic_commit" >&2
+  return 1
+}
+
 for _ in $(seq 1 90); do
   if ready; then
+    finalize_atomic_commit
     # The first broker is a cluster of one and refuses writes until the control
     # plane has granted it a lease on its shards.
-    sleep 15
+    sleep 5
     echo "Felix is ready. For the gateway:"
     echo "  export GATEWAY_FELIX_CA_FILE=dev/state/broker-cert.pem"
     echo "  export GATEWAY_SCOPE_FILE=dev/scope.toml"

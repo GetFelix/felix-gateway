@@ -698,17 +698,13 @@ async fn members_are_listed_watched_and_expire() {
 /// connections it goes as ana on the gateway's own connection, the one broker
 /// the browsers there reach.
 async fn commit_as_ana(gateway: &Gateway, ops: Vec<CommitOp>) -> u64 {
-    commit_as_ana_to(gateway, b"demo.ops.lobby", ops).await
-}
-
-/// As [`commit_as_ana`], with the commit routed by `entity`.
-async fn commit_as_ana_to(gateway: &Gateway, entity: &[u8], ops: Vec<CommitOp>) -> u64 {
     let config = config();
     let (tenant, namespace) = (config.tenant.as_str(), config.namespace.as_str());
     let token = gateway
         .scope_token(&sign_in("ana").await, "lobby")
         .await
         .expect("ana may open the lobby");
+    let entity = b"demo.ops.lobby";
     let receipt = if config.shared.is_some() {
         let delegated = delegate_as("demo-gateway", &token).await;
         let identity = gateway
@@ -1385,6 +1381,51 @@ async fn http_get(addr: SocketAddr, path: &str) -> Value {
     serde_json::from_str(body).unwrap()
 }
 
+/// Publish `payload` to the lobby's four-shard stream as ana, routed by `key`,
+/// and return its offset.
+async fn publish_keyed_as_ana(gateway: &Gateway, key: &[u8], payload: String) -> u64 {
+    let config = config();
+    let (tenant, namespace) = (config.tenant.as_str(), config.namespace.as_str());
+    let token = gateway
+        .scope_token(&sign_in("ana").await, "lobby")
+        .await
+        .expect("ana may open the lobby");
+    let key = key.to_vec().into();
+    let offset = if config.shared.is_some() {
+        let delegated = delegate_as("demo-gateway", &token).await;
+        let identity = gateway
+            .attach_shared(Arc::new(Fixed(delegated)))
+            .await
+            .expect("attach as ana");
+        let publisher = identity.client().publisher().await.expect("a publisher");
+        publisher
+            .publish_keyed(
+                tenant,
+                namespace,
+                "demo.shards.lobby",
+                key,
+                payload.into_bytes(),
+                AckMode::PerMessage,
+            )
+            .await
+    } else {
+        gateway
+            .connect_felix(Arc::new(Fixed(token)))
+            .await
+            .expect("connect to Felix")
+            .publish_keyed(
+                tenant,
+                namespace,
+                "demo.shards.lobby",
+                payload.into_bytes(),
+                key,
+                AckMode::PerMessage,
+            )
+            .await
+    };
+    offset.expect("the publish lands").expect("an offset")
+}
+
 /// An entity key the four-shard stream routes to `shard`.
 fn entity_on(shard: u32) -> Vec<u8> {
     (0..)
@@ -1417,12 +1458,7 @@ async fn subscribe_follows_the_shard_it_names() {
     let mut offsets = Vec::new();
     for shard in [1, 3, 1] {
         let payload = format!("{tag}/{shard}/{}", offsets.len());
-        let offset = commit_as_ana_to(
-            &gateway,
-            &entity_on(shard),
-            vec![CommitOp::publish("demo.shards.lobby", payload.into_bytes())],
-        )
-        .await;
+        let offset = publish_keyed_as_ana(&gateway, &entity_on(shard), payload).await;
         offsets.push((shard, offset));
     }
 

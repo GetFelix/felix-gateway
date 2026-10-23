@@ -100,6 +100,8 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
       { subject: "role:gateway", object: `tenant:${TENANT}`, action: "token.delegate" },
       { subject: "role:admin", object: object("stream", "*"), action: "stream.manage" },
       { subject: "role:admin", object: object("cache", "*"), action: "cache.manage" },
+      // The admin finalizes the fleet features the first broker's cluster needs.
+      { subject: "role:admin", object: "cluster:*", action: "node.manage" },
       { subject: "role:broker", object: "cluster:*", action: "node.view" },
       { subject: "role:broker", object: "cluster:*", action: "node.manage" },
     ],
