@@ -11,6 +11,12 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-23
+
+Tested against Felix 0.6.0-preview.9. One opt-in addition: the `shards` feature
+lets `subscribe` follow any shard of a stream. Sessions that do not ask for
+`shards` see no change.
+
 ### Added
 
 - The `shards` feature: `subscribe` takes an optional `shard`, so a browser can follow any shard of a stream, one slot per shard. `subscribed` and errors about the subscription echo it when named. A `subscribe` without it follows shard 0 as before (#34).
