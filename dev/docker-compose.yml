@@ -63,7 +63,7 @@ services:
       # A cluster of one: only a cluster member serves the shards past 0 of a
       # stream, and reports how many a stream has.
       FELIX_NODE_ID: broker
-      FELIX_NODE_ADVERTISE_ADDR: broker:5001
+      FELIX_NODE_ADVERTISE_ADDR: 127.0.0.1:5001
       FELIX_INTERNAL_ALLOW_UNAUTHENTICATED: "true"
       FELIX_DURABLE_STORAGE_DIR: /var/lib/felix
       FELIX_TLS_CERT_EXPORT: /state/broker-cert.pem
