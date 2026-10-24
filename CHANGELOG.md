@@ -11,6 +11,10 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Changed
+
+- Built on and tested against Felix 0.6.0.
+
 ## [0.7.0] - 2026-10-23
 
 Tested against Felix 0.6.0-preview.9. One opt-in addition: the `shards` feature
