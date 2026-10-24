@@ -174,6 +174,13 @@ Known limits, all on the Felix side:
   how the gateway fits next to the other Felix clients.
 - [CHANGELOG.md](CHANGELOG.md): what changed in each release.
 
+## Felix version
+
+The Felix release this repo builds on is in [`.felix-version`](.felix-version).
+When Felix publishes a release, a bot opens a "chore: use Felix <version>" PR
+that moves every pin listed in [`.github/felix-bump.sh`](.github/felix-bump.sh)
+and the lockfiles, and merges it once CI passes. Prereleases are skipped.
+
 ## Contributing
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers the layout, how to run the tests and
