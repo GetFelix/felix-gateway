@@ -9,3 +9,4 @@ cargo_crates=felix-client felix-wire felix-transport
 npm_dirs=
 # Also open bump PRs for prereleases such as 0.7.0-preview.1.
 prerelease=false
+# felix bump bot test run 40124398363
