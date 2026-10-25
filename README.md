@@ -150,7 +150,7 @@ as binary frames instead, and for more than one subscription per stream.
 
 Pre-1.0. The protocol, the scope file format and the library API may change
 between minor versions; version 1 of the wire protocol is frozen, and later
-changes arrive as negotiated features. Tested against Felix 0.6.1.
+changes arrive as negotiated features. Tested against Felix 0.6.2.
 Shared connections require 0.6.0-preview.7 or later.
 
 Known limits, all on the Felix side:
