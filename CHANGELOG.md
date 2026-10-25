@@ -13,7 +13,7 @@ release notes the Felix version it was tested against.
 
 ### Changed
 
-- Built on and tested against Felix 0.6.1: felix-client and felix-wire 0.6.1, and the dev stack runs the 0.6.1 images.
+- Built on and tested against Felix 0.6.2: felix-client and felix-wire 0.6.2, and the dev stack runs the 0.6.2 images.
 
 ## [0.7.0] - 2026-10-23
 
