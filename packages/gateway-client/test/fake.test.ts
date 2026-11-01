@@ -19,6 +19,34 @@ function watch(gateway: FakeGateway): GatewayEvent[] {
   return events;
 }
 
+// The same function as in docs/protocol.md, "cache_put_if".
+async function update(
+  client: Gateway,
+  cache: string,
+  key: string,
+  edit: (current: Uint8Array | null) => Uint8Array,
+): Promise<void> {
+  for (;;) {
+    const entry = await client.cacheGetVersioned(cache, key);
+    const result = await client.cachePutIf(
+      cache,
+      key,
+      edit(entry?.payload ?? null),
+      entry ? { version: entry.version } : "absent",
+    );
+    if (result.applied) return;
+  }
+}
+
+describe("the read, edit, write loop", () => {
+  it("keeps every one of several concurrent edits", async () => {
+    const scope = new FakeScope();
+    const count = (current: Uint8Array | null) => bytes((current?.[0] ?? 0) + 1);
+    await Promise.all([1, 2, 3].map(() => update(new FakeGateway(scope), "world", "chunk", count)));
+    expect(scope.readCache("world", "chunk")).toEqual(bytes(3));
+  });
+});
+
 // The same function as in docs/protocol.md, "Subscribe before reading".
 function catchUp(
   client: Gateway,
@@ -149,6 +177,40 @@ describe("FakeGateway", () => {
     await expect(b.cacheGet("members", "a")).resolves.toBeNull();
     await a.counterAdd("seq", "next", 2);
     await expect(b.counterAdd("seq", "next", 1)).resolves.toBe(3);
+  });
+
+  it("lets exactly one of two conditional writes at one version apply", async () => {
+    const scope = new FakeScope();
+    const a = new FakeGateway(scope);
+    const b = new FakeGateway(scope);
+    const first = await Promise.all([
+      a.cachePutIf("world", "c", bytes(1), "absent"),
+      b.cachePutIf("world", "c", bytes(2), "absent"),
+    ]);
+    const winner = first.find((result) => result.applied)!;
+    const loser = first.find((result) => !result.applied)!;
+    expect(first.filter((result) => result.applied)).toHaveLength(1);
+    expect(loser).toEqual({ applied: false, version: winner.version });
+
+    const read = await b.cacheGetVersioned("world", "c");
+    expect(read?.version).toBe(winner.version);
+    const second = await Promise.all([
+      a.cachePutIf("world", "c", bytes(3), { version: read!.version }),
+      b.cachePutIf("world", "c", bytes(4), { version: read!.version }),
+    ]);
+    expect(second.filter((result) => result.applied)).toHaveLength(1);
+    const next = second.find((result) => result.applied)!.version;
+    expect(next).toBeGreaterThan(read!.version);
+
+    await expect(a.cacheDeleteIf("world", "c", read!.version)).resolves.toEqual({
+      applied: false,
+      version: next,
+    });
+    await expect(a.cacheDeleteIf("world", "c", next!)).resolves.toEqual({
+      applied: true,
+      version: null,
+    });
+    await expect(a.cacheGetVersioned("world", "c")).resolves.toBeNull();
   });
 
   it("stops delivering once closed", async () => {
