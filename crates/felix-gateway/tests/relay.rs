@@ -610,6 +610,46 @@ async fn an_op_published_while_the_snapshot_is_read_reaches_a_browser_that_subsc
 
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
+async fn a_live_subscribe_and_a_replay_agree_where_the_events_end() {
+    // Nothing else writes the studio's ops, so on a fresh stack its log is
+    // empty or holds only a new leader's generation-start record, which a
+    // subscriber never receives. A Felix 0.6.0 broker reports that record's
+    // place as the live tail; a browser waiting for it would wait forever.
+    let (_gateway, addr) = start_gateway().await;
+    let mut browser = Browser::join(addr, "ana", "studio").await;
+    let live = browser.subscribe("ops", json!("live")).await;
+    let replay = browser.subscribe("ops", json!(0)).await;
+    assert_eq!(
+        live["live_offset"], replay["live_offset"],
+        "live {live}, replay {replay}"
+    );
+
+    let tag = run_tag("catch-up");
+    let mut writer = Browser::join(addr, "ana", "studio").await;
+    let mut last = None;
+    for i in 0..3 {
+        writer.publish("ops", &format!("{tag}/{i}"), true).await;
+        last = writer.recv_type("ack").await["offset"].as_u64();
+    }
+    let last = last.expect("acks carry offsets");
+
+    // The join path: the target comes from the replay's `subscribed`, and the
+    // event just below it arrives.
+    let mut joiner = Browser::join(addr, "ana", "studio").await;
+    let live = joiner.subscribe("ops", json!("live")).await;
+    assert_eq!(live["live_offset"].as_u64(), Some(last + 1), "{live}");
+    let replay = joiner.subscribe("ops", json!(0)).await;
+    assert_eq!(replay["live_offset"].as_u64(), Some(last + 1), "{replay}");
+    loop {
+        let event = joiner.recv_type("event").await;
+        if event["offset"].as_u64() == Some(last) {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
 async fn a_room_without_a_snapshot_answers_null() {
     // Nothing writes a snapshot of the studio during the tests.
     let (_gateway, addr) = start_gateway().await;

@@ -341,6 +341,12 @@ read it after subscribing, never before:
 2. `cache_get` the fold. Say it covers the stream through offset `N`.
 3. Drop buffered events at or below `N`. If `N + 1 < L`, `subscribe` again
    from `N + 1` to read the records in between. With no fold, subscribe from 0.
+4. That `subscribed` has a `live_offset` of its own, `L2`. The records in
+   between are all read once the event at `L2 - 1` has been handled; if `L2`
+   is no higher than `N + 1` there is nothing to wait for. Take this target
+   from the second `subscribed`, never from the first: against a Felix 0.6.0
+   broker, `L` can sit past a record that holds no event, and nothing arrives
+   at `L - 1`.
 
 Reading first would lose the records published between the read and the
 subscribe.
@@ -386,9 +392,21 @@ The answer to `join`: the session is open on this scope.
 
 The subscription is registered with the broker. Anything published from this
 point on will be delivered. `start_offset` is the first offset this
-subscription delivers and `live_offset` is the stream's tail when it was
-registered; both are `null` on a stream with no log, such as `presence`. From
-`"live"` the two are equal.
+subscription delivers and `live_offset` is where the records written before it
+registered end: the subscription delivers the events from `start_offset` up to
+it, then every record as it is written. Both are `null` on a stream with no
+log, such as `presence`. From `"live"` the two are equal.
+
+When `live_offset` is above `start_offset`, the offset `live_offset - 1` holds
+an event, so a browser catching up is done once it has handled that offset. A
+record that holds no event, such as a new leader's generation-start record, can
+sit in the middle of the range, where `skipped_before` counts it, but not at
+its end. The exception is a `"live"` subscribe to a Felix 0.6.0 broker: it
+reports the raw tail, which can sit past such a record, so nothing ever arrives
+at `live_offset - 1`. Felix 0.6.1 and later stop short of it, and a subscribe
+from an offset does on every version. A browser that must work against 0.6.0
+takes its target from a subscribe from an offset, as [Subscribe before
+reading](#subscribe-before-reading) does.
 
 `slot` and `shard` are present when the `subscribe` named them; a
 `subscribe` without a `shard` is answered exactly as before. `start_offset`
