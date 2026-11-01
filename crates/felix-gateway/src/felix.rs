@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use felix_client::{
-    CacheWatch, CacheWatchFilter, CacheWatchItem, ClientConfig, ClusterCacheWatch, ClusterClient,
-    ClusterSubscription, Event, StartPosition, StateValue, StreamPage, TokenProvider,
+    CacheConditionResult, CacheWatch, CacheWatchFilter, CacheWatchItem, ClientConfig,
+    ClusterCacheWatch, ClusterClient, ClusterSubscription, Event, StartPosition, StateValue,
+    StreamPage, TokenProvider, VersionedValue,
 };
-use felix_wire::AckMode;
+use felix_wire::{AckMode, CacheCondition};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
@@ -428,6 +429,107 @@ impl Felix {
             }
         };
         Ok(value.map(|bytes| bytes.to_vec()))
+    }
+
+    /// `key` of `cache` with the version a conditional write compares against.
+    pub(crate) async fn cache_get_versioned(
+        &self,
+        cache: &str,
+        key: &str,
+    ) -> Result<Option<VersionedValue>> {
+        match &self.link {
+            Link::Own(client) => {
+                client
+                    .client()
+                    .await
+                    .cache_get_versioned(&self.tenant, &self.namespace, cache, key)
+                    .await
+            }
+            Link::Shared(session) => {
+                self.on_identity(session, |identity| async move {
+                    identity
+                        .client
+                        .cache_get_versioned(&self.tenant, &self.namespace, cache, key)
+                        .await
+                })
+                .await
+            }
+        }
+    }
+
+    /// Write `key` of `cache` only if its entry meets `condition`. Sent once,
+    /// like a plain put: a retry of one that applied would be refused by the
+    /// version it wrote.
+    pub(crate) async fn cache_put_if(
+        &self,
+        cache: &str,
+        key: &str,
+        payload: Vec<u8>,
+        ttl: Option<Duration>,
+        condition: CacheCondition,
+    ) -> Result<CacheConditionResult> {
+        let ttl = ttl.map(|ttl| u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
+        match &self.link {
+            Link::Own(client) => {
+                client
+                    .client()
+                    .await
+                    .cache_put_if(
+                        &self.tenant,
+                        &self.namespace,
+                        cache,
+                        key,
+                        payload.into(),
+                        ttl,
+                        condition,
+                    )
+                    .await
+            }
+            Link::Shared(session) => {
+                self.on_identity(session, |identity| async move {
+                    identity
+                        .client
+                        .cache_put_if(
+                            &self.tenant,
+                            &self.namespace,
+                            cache,
+                            key,
+                            payload.into(),
+                            ttl,
+                            condition,
+                        )
+                        .await
+                })
+                .await
+            }
+        }
+    }
+
+    /// Delete `key` of `cache` only if its entry is at `version`.
+    pub(crate) async fn cache_delete_if(
+        &self,
+        cache: &str,
+        key: &str,
+        version: u64,
+    ) -> Result<CacheConditionResult> {
+        match &self.link {
+            Link::Own(client) => {
+                client
+                    .client()
+                    .await
+                    .cache_delete_if(&self.tenant, &self.namespace, cache, key, version)
+                    .await
+            }
+            Link::Shared(session) => {
+                self.on_identity(session, |identity| async move {
+                    identity
+                        .client
+                        .cache_delete_if(&self.tenant, &self.namespace, cache, key, version)
+                        .await
+                })
+                .await
+            }
+        }
     }
 
     /// `key` in the state of `stream`'s shard that `entity` routes to.

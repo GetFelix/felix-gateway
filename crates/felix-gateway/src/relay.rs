@@ -13,6 +13,7 @@ use axum::body::Bytes;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use felix_client::{CacheChange, CacheWatchItem, CursorErrorReason, Event, SubscribeCursorError};
+use felix_wire::CacheCondition;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, Sleep};
@@ -22,8 +23,9 @@ use crate::felix::Felix;
 use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
-    BINARY_EVENTS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES, Join, PAST_END,
-    PROTOCOL, RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE, ServerMessage, StartAt,
+    BINARY_EVENTS, CACHE_VERSIONS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES,
+    Join, PAST_END, PROTOCOL, RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE, ServerMessage,
+    StartAt,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -71,6 +73,24 @@ enum Write {
         key: String,
         payload: Option<Vec<u8>>,
         ttl: Option<Duration>,
+    },
+    /// Put a cache entry only if it meets `condition`.
+    CachePutIf {
+        cache: String,
+        name: String,
+        key: String,
+        payload: Vec<u8>,
+        ttl: Option<Duration>,
+        condition: CacheCondition,
+        id: u64,
+    },
+    /// Delete a cache entry only if it is at `version`.
+    CacheDeleteIf {
+        cache: String,
+        name: String,
+        key: String,
+        version: u64,
+        id: u64,
     },
 }
 
@@ -139,6 +159,8 @@ struct Session {
     shards: bool,
     /// The session asked for [`PAST_END`].
     past_end: bool,
+    /// The session asked for [`CACHE_VERSIONS`].
+    cache_versions: bool,
     /// Range reads sent to Felix whose answer is not yet sent on.
     reads: Arc<AtomicUsize>,
     /// The number the next subscription's frames carry.
@@ -178,6 +200,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         read,
         shards,
         past_end,
+        cache_versions,
     }) = join(&mut conn, &gateway, client).await
     else {
         return;
@@ -205,6 +228,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         read,
         shards,
         past_end,
+        cache_versions,
         reads: Arc::default(),
         next_sub: 0,
         throttle: Arc::new(Throttle::default()),
@@ -528,11 +552,24 @@ impl Session {
                 };
                 let felix = Arc::clone(&self.felix);
                 let replies = self.replies.clone();
+                let versioned = self.cache_versions;
                 tokio::spawn(async move {
-                    let reply = match felix.cache_get(&name, &key).await {
-                        Ok(payload) => ServerMessage::CacheValue {
+                    let read = if versioned {
+                        felix.cache_get_versioned(&name, &key).await.map(|entry| {
+                            let version = entry.as_ref().map(|entry| entry.version);
+                            (entry.map(|entry| entry.value.to_vec()), Some(version))
+                        })
+                    } else {
+                        felix
+                            .cache_get(&name, &key)
+                            .await
+                            .map(|value| (value, None))
+                    };
+                    let reply = match read {
+                        Ok((payload, version)) => ServerMessage::CacheValue {
                             id,
                             payload: payload.map(|bytes| BASE64.encode(bytes)),
+                            version,
                         },
                         Err(err) => with_id(id, cache_error(cache, ErrorCode::CacheFailed, err)),
                     };
@@ -679,6 +716,56 @@ impl Session {
                 Err(err) => Next::Reply(cache_error(cache, ErrorCode::BadRequest, err)),
             },
             ClientMessage::CacheDelete { cache, key } => self.write_cache(cache, key, None).await,
+            ClientMessage::CachePutIf {
+                cache,
+                key,
+                payload,
+                condition,
+                id,
+            } => {
+                let payload = match BASE64.decode(payload) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        return Next::Reply(with_id(
+                            id,
+                            cache_error(cache, ErrorCode::BadRequest, err),
+                        ));
+                    }
+                };
+                match self.admit_cache_write(&cache, &key, payload.len(), true) {
+                    Ok((name, ttl)) => {
+                        self.write(Write::CachePutIf {
+                            cache,
+                            name,
+                            key,
+                            payload,
+                            ttl,
+                            condition,
+                            id,
+                        })
+                        .await
+                    }
+                    Err(refusal) => Next::Reply(with_id(id, *refusal)),
+                }
+            }
+            ClientMessage::CacheDeleteIf {
+                cache,
+                key,
+                version,
+                id,
+            } => match self.admit_cache_write(&cache, &key, 0, true) {
+                Ok((name, _)) => {
+                    self.write(Write::CacheDeleteIf {
+                        cache,
+                        name,
+                        key,
+                        version,
+                        id,
+                    })
+                    .await
+                }
+                Err(refusal) => Next::Reply(with_id(id, *refusal)),
+            },
             ClientMessage::CacheWatch { cache } => {
                 let name = match scope.cache(&cache, CacheAction::Watch) {
                     Ok(bound) => bound.name,
@@ -716,28 +803,51 @@ impl Session {
     }
 
     async fn write_cache(&mut self, cache: String, key: String, payload: Option<Vec<u8>>) -> Next {
-        let felix = Arc::clone(&self.felix);
-        let bound = match felix.scope.cache(&cache, CacheAction::Write) {
-            Ok(_) if !valid_name(&key) => {
-                return Next::Reply(cache_error(cache, ErrorCode::BadRequest, BAD_NAME));
+        let bytes = payload.as_ref().map_or(0, Vec::len);
+        match self.admit_cache_write(&cache, &key, bytes, false) {
+            Ok((name, ttl)) => {
+                self.write(Write::Cache {
+                    cache,
+                    name,
+                    key,
+                    payload,
+                    ttl,
+                })
+                .await
             }
-            Ok(bound) => bound,
-            Err(refusal) => return Next::Reply(cache_error(cache, ErrorCode::BadRequest, refusal)),
-        };
-        if let Err(refused) = self.charge(&bound, &cache, payload.as_ref().map_or(0, Vec::len)) {
-            let code = self.refusal_code(refused, ErrorCode::CacheFailed);
-            return Next::Reply(limited(cache_error(cache, code, ""), refused));
+            Err(refusal) => Next::Reply(*refusal),
         }
-        let ttl = bound.resource.ttl();
-        let name = bound.name;
-        self.write(Write::Cache {
-            cache,
-            name,
-            key,
-            payload,
-            ttl,
-        })
-        .await
+    }
+
+    /// Check that a write of `bytes` to `key` of `cache` is allowed and
+    /// within the limits, and spend it. Gives the cache's Felix name and TTL,
+    /// or the error to answer with. A `conditional` write also needs the
+    /// `cache_versions` feature.
+    fn admit_cache_write(
+        &mut self,
+        cache: &str,
+        key: &str,
+        bytes: usize,
+        conditional: bool,
+    ) -> Result<(String, Option<Duration>), Box<ServerMessage>> {
+        let refuse = |code, reason: &str| Box::new(cache_error(cache.to_string(), code, reason));
+        if conditional && !self.cache_versions {
+            return Err(refuse(
+                ErrorCode::BadRequest,
+                "a conditional write needs the cache_versions feature",
+            ));
+        }
+        let felix = Arc::clone(&self.felix);
+        let bound = match felix.scope.cache(cache, CacheAction::Write) {
+            Ok(_) if !valid_name(key) => return Err(refuse(ErrorCode::BadRequest, BAD_NAME)),
+            Ok(bound) => bound,
+            Err(refusal) => return Err(refuse(ErrorCode::BadRequest, &refusal)),
+        };
+        if let Err(refused) = self.charge(&bound, cache, bytes) {
+            let code = self.refusal_code(refused, ErrorCode::CacheFailed);
+            return Err(Box::new(limited(*refuse(code, ""), refused)));
+        }
+        Ok((bound.name, bound.resource.ttl()))
     }
 
     /// Check one write of `bytes` to `bound` against the payload limit and
@@ -840,6 +950,39 @@ async fn write_in_order(
                     Err(err) => cache_error(cache, ErrorCode::CacheFailed, err),
                 }
             }
+            Write::CachePutIf {
+                cache,
+                name,
+                key,
+                payload,
+                ttl,
+                condition,
+                id,
+            } => match felix
+                .cache_put_if(&name, &key, payload, ttl, condition)
+                .await
+            {
+                Ok(result) => ServerMessage::CachePutResult {
+                    id,
+                    applied: result.applied,
+                    version: result.version,
+                },
+                Err(err) => with_id(id, cache_error(cache, ErrorCode::CacheFailed, err)),
+            },
+            Write::CacheDeleteIf {
+                cache,
+                name,
+                key,
+                version,
+                id,
+            } => match felix.cache_delete_if(&name, &key, version).await {
+                Ok(result) => ServerMessage::CacheDeleteResult {
+                    id,
+                    applied: result.applied,
+                    version: result.version,
+                },
+                Err(err) => with_id(id, cache_error(cache, ErrorCode::CacheFailed, err)),
+            },
         };
         let _ = replies.send(reply);
     }
@@ -857,6 +1000,7 @@ struct Joined {
     read: bool,
     shards: bool,
     past_end: bool,
+    cache_versions: bool,
 }
 
 /// Wait for the browser's `join`, exchange its sign-in for a token that
@@ -954,6 +1098,10 @@ async fn accept(
         read: join.features.iter().any(|feature| feature == READ),
         shards: join.features.iter().any(|feature| feature == SHARDS),
         past_end: join.features.iter().any(|feature| feature == PAST_END),
+        cache_versions: join
+            .features
+            .iter()
+            .any(|feature| feature == CACHE_VERSIONS),
     })
 }
 
