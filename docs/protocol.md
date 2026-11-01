@@ -43,6 +43,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
   | `read` | [`read`](#read) reads a range of a durable stream's log without subscribing |
   | `shards` | A `subscribe` may name the `shard` of a stream to follow, instead of shard 0 |
+| `time` | [`offset_for_time`](#offset_for_time) finds the offset of a stream's shard at a wall-clock time |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
@@ -262,6 +263,53 @@ feature, `read` is refused with `bad_request`.
 
 A game's replay of a few seconds of its log is one `read`: a fixed slice, with
 no subscription to close afterwards.
+
+### `offset_for_time`
+
+```json
+{"type": "offset_for_time", "stream": "events", "shard": 2, "at_us": 1792700000000000, "id": 9}
+```
+
+Only with the `time` feature. Finds where a wall-clock time falls in a durable
+stream's log. A page that wants "the record at 14:00 yesterday" no longer has
+to guess an offset and correct it with repeated `read`s: it asks once, then
+starts a [`read`](#read) or a [`subscribe`](#subscribe) at the answer. It needs
+`subscribe` on the stream, as `read` does.
+
+| Field | Meaning |
+|---|---|
+| `stream` | A stream alias whose actions include `subscribe` |
+| `at_us` | The time, in microseconds since the Unix epoch, such as `Date.now() * 1000` |
+| `shard` | Optional: the shard to ask. Leaving it out is shard 0, the only one of a stream of one shard. Offsets are per shard, so ask each shard you follow |
+| `id` | As for `publish`; it comes back on the `offset` or `error` |
+
+The gateway answers with an `offset` message:
+
+```json
+{"type": "offset", "id": 9, "offset": 5400}
+```
+
+`offset` is the first record appended at or after `at_us`. A time before every
+record the shard still holds answers with the oldest offset kept. A time after
+the newest record answers `null`, because no record is that recent yet:
+subscribe from `"live"` to wait for one. The times are those of the broker that
+led the shard when it appended each record, so if that broker's clock stepped
+back, the answer is near the first record after the step rather than exactly
+it.
+
+For example, to read the 20 records from a time:
+
+```json
+{"type": "offset_for_time", "stream": "events", "at_us": 1792700000000000, "id": 1}
+{"type": "offset", "id": 1, "offset": 5400}
+{"type": "read", "stream": "events", "from": 5400, "end": 5420, "id": 2}
+```
+
+A lookup counts against the same 4 requests a session may have waiting as a
+`read` does; a fifth is refused at once with `read_failed`. Anything else Felix
+refuses, including a broker too old to look up by time, is an `error` with code
+`read_failed`. Without the feature, `offset_for_time` is refused with
+`bad_request`.
 
 ### `cache_put`
 
@@ -544,7 +592,7 @@ The connection stays open after any error except an answer to `join`.
 | `counter_failed` | Felix refused or lost a counter add. It may have been counted |
 | `cache_failed` | Felix refused or lost a cache read, write or delete |
 | `state_failed` | Felix refused or could not answer a `state_get` |
-| `read_failed` | Felix refused or could not answer a `read` |
+| `read_failed` | Felix refused or could not answer a `read` or an `offset_for_time` |
 | `trimmed` | A subscription or `read` asked for an offset retention has discarded. `oldest` is the oldest offset left |
 | `watch_failed` | A cache watch was refused or stopped. Send `cache_watch` again |
 | `rate_limited` | Only for a session that asked for the `rate_limited` feature. A gateway [limit](#limits) refused the write, or the `join`. Nothing reached Felix. `retry_after_ms`, when present, is how long until the write would fit |

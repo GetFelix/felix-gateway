@@ -11,6 +11,10 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Added
+
+- The `time` feature: `offset_for_time` answers, as an `offset` message, the first offset of a durable stream's shard appended at or after a time, so a browser can seek by wall-clock time in one lookup. It needs `subscribe` on the stream and shares the 4 requests a session may have waiting with `read` (#48).
+
 ### Changed
 
 - Built on and tested against Felix 0.6.2: felix-client and felix-wire 0.6.2, and the dev stack runs the 0.6.2 images.

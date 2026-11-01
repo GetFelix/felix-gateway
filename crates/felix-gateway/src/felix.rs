@@ -467,6 +467,32 @@ impl Felix {
         }
     }
 
+    /// The first offset of `stream`'s shard `shard` appended at or after
+    /// `at_micros`, `None` when no record is that recent.
+    pub(crate) async fn offset_for_time(
+        &self,
+        stream: &str,
+        shard: u32,
+        at_micros: u64,
+    ) -> Result<Option<u64>> {
+        match &self.link {
+            Link::Own(client) => {
+                client
+                    .offset_for_time(&self.tenant, &self.namespace, stream, shard, at_micros)
+                    .await
+            }
+            Link::Shared(session) => {
+                self.on_identity(session, |identity| async move {
+                    identity
+                        .client
+                        .offset_for_time(&self.tenant, &self.namespace, stream, shard, at_micros)
+                        .await
+                })
+                .await
+            }
+        }
+    }
+
     /// One page of `stream`'s shard `shard` from `from`, stopping before `end`.
     pub(crate) async fn read(
         &self,

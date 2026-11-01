@@ -11,7 +11,15 @@ pub const PROTOCOL: u32 = 1;
 
 /// Optional capabilities a `join` may ask for in `features`; `hello` answers
 /// with the ones asked for that are listed here.
-pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS, STATE, READ, SHARDS];
+pub const FEATURES: &[&str] = &[
+    RATE_LIMITED,
+    BINARY_EVENTS,
+    SLOTS,
+    STATE,
+    READ,
+    SHARDS,
+    TIME,
+];
 
 /// The feature under which a write or join refused by a limit is answered
 /// with [`ErrorCode::RateLimited`] and `retry_after_ms`. Without it the
@@ -37,6 +45,10 @@ pub const READ: &str = "read";
 /// The feature under which a `subscribe` may name the `shard` of a stream to
 /// follow.
 pub const SHARDS: &str = "shards";
+
+/// The feature under which a session may ask a durable stream's shard which
+/// offset a wall-clock time falls at, with `offset_for_time`.
+pub const TIME: &str = "time";
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -139,6 +151,18 @@ pub enum ClientMessage {
         max: u32,
         /// The shard whose offsets `from` and `end` are. Leaving it out means
         /// shard 0, the only one of a stream of one shard.
+        #[serde(default)]
+        shard: u32,
+        id: u64,
+    },
+    /// With [`TIME`]: the first offset of a durable stream's shard whose
+    /// record was appended at or after `at_us`. Answered with a
+    /// [`ServerMessage::Offset`] carrying the same `id`.
+    OffsetForTime {
+        stream: String,
+        /// Microseconds since the Unix epoch.
+        at_us: u64,
+        /// The shard to ask. Leaving it out means shard 0.
         #[serde(default)]
         shard: u32,
         id: u64,
@@ -246,6 +270,13 @@ pub enum ServerMessage {
         /// the range is done; not always the last offset plus one, since
         /// offsets that hold no record are passed over.
         next_offset: u64,
+    },
+    /// The answer to the `offset_for_time` with this `id`.
+    Offset {
+        id: u64,
+        /// The first offset appended at or after the time, `null` when no
+        /// record is that recent yet.
+        offset: Option<u64>,
     },
     /// Every entry in the cache when the watch started.
     CacheEntries {
@@ -525,6 +556,38 @@ mod tests {
             serde_json::to_value(&value).unwrap(),
             json!({"type": "state_value", "id": 6, "payload": "AQI=", "version": 40, "as_of": 42})
         );
+    }
+
+    #[test]
+    fn parses_a_time_lookup_and_serializes_its_answer() {
+        assert_eq!(
+            parse(
+                json!({"type": "offset_for_time", "stream": "events", "at_us": 1792700000000000u64, "id": 9})
+            ),
+            ClientMessage::OffsetForTime {
+                stream: "events".into(),
+                at_us: 1_792_700_000_000_000,
+                shard: 0,
+                id: 9
+            }
+        );
+        assert_eq!(
+            parse(
+                json!({"type": "offset_for_time", "stream": "events", "shard": 2, "at_us": 5, "id": 10})
+            ),
+            ClientMessage::OffsetForTime {
+                stream: "events".into(),
+                at_us: 5,
+                shard: 2,
+                id: 10
+            }
+        );
+        for offset in [Some(5400), None] {
+            assert_eq!(
+                serde_json::to_value(ServerMessage::Offset { id: 9, offset }).unwrap(),
+                json!({"type": "offset", "id": 9, "offset": offset})
+            );
+        }
     }
 
     #[test]

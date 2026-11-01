@@ -30,6 +30,8 @@ browser client.
 
 - Publish and subscribe on Felix streams, from a log offset or from live, with
   each event's offset so a browser can see exactly what it missed.
+- Seeking by time: `offset_for_time` finds a shard's offset for a wall-clock
+  time, to start a `read` or a `subscribe` there.
 - Cache reads, writes, deletes and watches, with a per-cache TTL for entries
   such as a presence list.
 - Counter adds.
