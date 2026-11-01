@@ -336,14 +336,15 @@ When a cache holds a fold of a stream up to some offset, as a snapshot would,
 read it after subscribing, never before:
 
 1. `subscribe` to the stream from `"live"` and wait for `subscribed`. Its
-   `live_offset` is the tail `L`, and every record from `L` on will arrive as
-   an event, including any published while the next step is in flight.
+   `live_offset` is the tail `L`, and every event published from then on will
+   arrive, including any published while the next step is in flight.
 2. `cache_get` the fold. Say it covers the stream through offset `N`.
 3. Drop buffered events at or below `N`. If `N + 1 < L`, `subscribe` again
    from `N + 1` to read the records in between. With no fold, subscribe from 0.
 4. That `subscribed` has a `live_offset` of its own, `L2`. The records in
-   between are all read once the event at `L2 - 1` has been handled; if `L2`
-   is no higher than `N + 1` there is nothing to wait for. Take this target
+   between are all read once the event at `L2 - 1` has arrived on this new
+   subscription, not from the buffer of the one it replaced; if `L2` is no
+   higher than `N + 1` there is nothing to wait for. Take this target
    from the second `subscribed`, never from the first: against a Felix 0.6.0
    broker, `L` can sit past a record that holds no event, and nothing arrives
    at `L - 1`.
@@ -403,8 +404,8 @@ record that holds no event, such as a new leader's generation-start record, can
 sit in the middle of the range, where `skipped_before` counts it, but not at
 its end. The exception is a `"live"` subscribe to a Felix 0.6.0 broker: it
 reports the raw tail, which can sit past such a record, so nothing ever arrives
-at `live_offset - 1`. Felix 0.6.1 and later stop short of it, and a subscribe
-from an offset does on every version. A browser that must work against 0.6.0
+at `live_offset - 1`. Felix 0.6.1 and later end the tail before it, and a
+subscribe from an offset does on every version. A browser that must work against 0.6.0
 takes its target from a subscribe from an offset, as [Subscribe before
 reading](#subscribe-before-reading) does.
 
