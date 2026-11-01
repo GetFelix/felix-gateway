@@ -43,6 +43,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
   | `read` | [`read`](#read) reads a range of a durable stream's log without subscribing |
   | `shards` | A `subscribe` may name the `shard` of a stream to follow, instead of shard 0 |
+| `cache_versions` | `cache_value` carries the entry's version, and [`cache_put_if`](#cache_put_if) and [`cache_delete_if`](#cache_delete_if) write only if the entry is still at the version the browser read |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
@@ -204,7 +205,8 @@ counted.
 
 Reads one entry of a cache whose actions include `read`. `key` follows the
 rule for `counter_add`. The gateway answers with a `cache_value` message
-carrying the same `id`.
+carrying the same `id`, which also names the entry's version with the
+`cache_versions` feature.
 
 ### `state_get`
 
@@ -298,6 +300,45 @@ exactly as for `join` before it deletes anything, and answers 204, 400 for a
 bad scope or key or a cache that does not allow `write`, 403 with the
 refusal as an `error` message, or 429 when its sender is over the write
 rate.
+
+### `cache_put_if`
+
+```json
+{"type": "cache_put_if", "cache": "world", "key": "c_3_-1_0", "payload": "gqRu...", "if": {"version": 5400}, "id": 12}
+{"type": "cache_put_if", "cache": "world", "key": "c_3_-1_0", "payload": "gqRu...", "if": "absent", "id": 13}
+```
+
+Only with the `cache_versions` feature. Writes one entry of a cache whose
+actions include `write` only if no one has written it since the browser read
+it, so two sessions editing one key cannot silently overwrite each other.
+
+| Field | Meaning |
+|---|---|
+| `cache`, `key`, `payload` | As for `cache_put`. The entry gets the cache's `ttl_s` when it has one |
+| `if` | `"absent"` when the key has no live entry, never written, deleted or expired, or `{"version": n}` when its entry is at version `n`, as a `cache_value` or an earlier answer named it |
+| `id` | As for `publish`; it comes back on the `cache_put_result` or `error` |
+
+The gateway answers with a `cache_put_result`. A refused write is an answer,
+not an error: the browser reads the key again, or takes the version in the
+answer, and tries again from there. An `error` with code `cache_failed` and
+the `id` means Felix could not say whether the write applied. The gateway
+never sends it again; a retry of a write that did apply would be refused by
+the version it wrote.
+
+The write goes out in the order the browser sent it, after its earlier
+writes, and counts against the write [limits](#limits) like `cache_put`. A
+write over a limit is an `error` carrying its `id`. Without the feature the
+message is refused with `bad_request`.
+
+### `cache_delete_if`
+
+```json
+{"type": "cache_delete_if", "cache": "world", "key": "c_3_-1_0", "version": 5400, "id": 14}
+```
+
+Only with the `cache_versions` feature. Deletes one entry, needing `write`,
+only if it is at `version`. Ordered, limited, answered and refused like
+`cache_put_if`, with a `cache_delete_result`.
 
 ### `cache_watch`
 
@@ -476,6 +517,30 @@ The counter's sum after the `counter_add` with this `id`.
 The answer to `cache_get`: the entry's bytes in base64, or `null` when there
 is none.
 
+```json
+{"type": "cache_value", "id": 9, "payload": "hKF2AaZvZmZzZXTN...", "version": 5400}
+```
+
+With the `cache_versions` feature the answer also has a `version`, the number
+a `cache_put_if` or `cache_delete_if` names to write only if the entry is
+unchanged. It is `null` when there is no entry. A key's version changes on
+every write to it and is never reused, so reading the same version twice
+means nothing was written in between. Without the feature the field is
+absent.
+
+### `cache_put_result` and `cache_delete_result`
+
+```json
+{"type": "cache_put_result", "id": 12, "applied": false, "version": 5480}
+{"type": "cache_delete_result", "id": 14, "applied": true, "version": null}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | The `cache_put_if` or `cache_delete_if` it answers |
+| `applied` | Whether the condition held and the write was made |
+| `version` | For an applied put, the version it wrote. Otherwise the entry's current version, `null` when it has none, which is also what an applied delete leaves |
+
 ### `state_value`
 
 ```json
@@ -514,6 +579,11 @@ is none.
 | `key` | The entry's key |
 | `payload` | The entry, base64, or `null` when it was deleted |
 | `expires_in_ms` | Milliseconds until the entry expires, measured on the gateway's clock when it relayed the change; `null` for an entry with no TTL |
+
+These carry no version, even with `cache_versions`, because Felix's watch does
+not report one yet. A browser that watches a cache and then writes with
+`cache_put_if` reads the key with `cache_get` first to learn the version to
+name.
 
 An entry that expires arrives as a `cache_change` with `payload` `null`,
 within about a second of its TTL passing (Felix 0.6.0-preview.2 and later).
@@ -563,7 +633,7 @@ stop at a refused one and resend from there.
 |---|---|---|
 | A `publish` over a rate | `rate_limited`, with `retry_after_ms` | `publish_failed` |
 | A `counter_add` over a rate | `rate_limited`, with `retry_after_ms` | `counter_failed` |
-| A `cache_put` or `cache_delete` over a rate | `rate_limited`, with `retry_after_ms` | `cache_failed` |
+| A `cache_put`, `cache_delete`, `cache_put_if` or `cache_delete_if` over a rate | `rate_limited`, with `retry_after_ms` | `cache_failed` |
 | A payload over `max_payload_bytes` | `bad_request` | `bad_request` |
 | A `join` over a session cap | `rate_limited` | `unavailable` |
 

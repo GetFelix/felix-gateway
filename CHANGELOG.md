@@ -11,6 +11,10 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Added
+
+- The `cache_versions` feature: `cache_value` carries the entry's version, and `cache_put_if` and `cache_delete_if` write only if the entry is absent or still at the version the browser read, answered with `cache_put_result` and `cache_delete_result`. `cacheGetVersioned`, `cachePutIf` and `cacheDeleteIf` in the browser client and its fake. Cache watches carry no versions yet; that needs a change in Felix (GetFelix/felix#1736) (#46).
+
 ### Changed
 
 - Built on and tested against Felix 0.6.2: felix-client and felix-wire 0.6.2, and the dev stack runs the 0.6.2 images.

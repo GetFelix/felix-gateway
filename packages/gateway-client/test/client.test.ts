@@ -114,6 +114,39 @@ describe("GatewayClient", () => {
     await expect(missing).resolves.toBeNull();
   });
 
+  it("sends conditional cache writes and reads versions", async () => {
+    const { client, socket } = await connect();
+    const read = client.cacheGetVersioned("world", "c");
+    const empty = client.cacheGetVersioned("world", "d");
+    const put = client.cachePutIf("world", "c", bytes(1, 2), { version: 5400 });
+    const absent = client.cachePutIf("world", "d", bytes(3), "absent");
+    const del = client.cacheDeleteIf("world", "c", 5480);
+    expect(socket.sent.slice(1)).toEqual([
+      { type: "cache_get", cache: "world", key: "c", id: 0 },
+      { type: "cache_get", cache: "world", key: "d", id: 1 },
+      {
+        type: "cache_put_if",
+        cache: "world",
+        key: "c",
+        payload: "AQI=",
+        if: { version: 5400 },
+        id: 2,
+      },
+      { type: "cache_put_if", cache: "world", key: "d", payload: "Aw==", if: "absent", id: 3 },
+      { type: "cache_delete_if", cache: "world", key: "c", version: 5480, id: 4 },
+    ]);
+    socket.receive({ type: "cache_value", id: 0, payload: "AQ==", version: 5400 });
+    socket.receive({ type: "cache_value", id: 1, payload: null, version: null });
+    socket.receive({ type: "cache_put_result", id: 2, applied: false, version: 5480 });
+    socket.receive({ type: "cache_put_result", id: 3, applied: true, version: 5481 });
+    socket.receive({ type: "cache_delete_result", id: 4, applied: true, version: null });
+    await expect(read).resolves.toEqual({ payload: bytes(1), version: 5400 });
+    await expect(empty).resolves.toBeNull();
+    await expect(put).resolves.toEqual({ applied: false, version: 5480 });
+    await expect(absent).resolves.toEqual({ applied: true, version: 5481 });
+    await expect(del).resolves.toEqual({ applied: true, version: null });
+  });
+
   it("rejects the request an error names and reports the rest", async () => {
     const { client, socket } = await connect();
     const errors: [GatewayError, string | undefined][] = [];

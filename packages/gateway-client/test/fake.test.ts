@@ -83,6 +83,40 @@ describe("FakeGateway", () => {
     await expect(b.counterAdd("seq", "next", 1)).resolves.toBe(3);
   });
 
+  it("lets exactly one of two conditional writes at one version apply", async () => {
+    const scope = new FakeScope();
+    const a = new FakeGateway(scope);
+    const b = new FakeGateway(scope);
+    const first = await Promise.all([
+      a.cachePutIf("world", "c", bytes(1), "absent"),
+      b.cachePutIf("world", "c", bytes(2), "absent"),
+    ]);
+    const winner = first.find((result) => result.applied)!;
+    const loser = first.find((result) => !result.applied)!;
+    expect(first.filter((result) => result.applied)).toHaveLength(1);
+    expect(loser).toEqual({ applied: false, version: winner.version });
+
+    const read = await b.cacheGetVersioned("world", "c");
+    expect(read?.version).toBe(winner.version);
+    const second = await Promise.all([
+      a.cachePutIf("world", "c", bytes(3), { version: read!.version }),
+      b.cachePutIf("world", "c", bytes(4), { version: read!.version }),
+    ]);
+    expect(second.filter((result) => result.applied)).toHaveLength(1);
+    const next = second.find((result) => result.applied)!.version;
+    expect(next).toBeGreaterThan(read!.version);
+
+    await expect(a.cacheDeleteIf("world", "c", read!.version)).resolves.toEqual({
+      applied: false,
+      version: next,
+    });
+    await expect(a.cacheDeleteIf("world", "c", next!)).resolves.toEqual({
+      applied: true,
+      version: null,
+    });
+    await expect(a.cacheGetVersioned("world", "c")).resolves.toBeNull();
+  });
+
   it("stops delivering once closed", async () => {
     const scope = new FakeScope();
     const gateway = new FakeGateway(scope);

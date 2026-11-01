@@ -16,6 +16,25 @@ client.subscribe("ops", "live");
 await client.publish("ops", new TextEncoder().encode("hello"));
 ```
 
+Two sessions editing one cache key can avoid overwriting each other by joining
+with the `cache_versions` feature, reading a key with `cacheGetVersioned` and
+writing it with `cachePutIf`, which applies only if the key is still at the
+version that was read:
+
+```ts
+const client = await GatewayClient.connect(url, { room: "lobby", token }, ["cache_versions"]);
+const entry = await client.cacheGetVersioned("world", "chunk");
+const result = await client.cachePutIf(
+  "world",
+  "chunk",
+  next,
+  entry ? { version: entry.version } : "absent",
+);
+if (!result.applied) {
+  // Someone else wrote first: read the key again and retry from its version.
+}
+```
+
 `felix-gateway-client/fake` has `FakeScope` and `FakeGateway`, an in-memory
 stand-in with the same shape as `GatewayClient`, for tests that should not need
 a gateway or a broker. It can drop live records and lose acks to exercise

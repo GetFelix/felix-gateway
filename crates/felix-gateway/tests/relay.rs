@@ -628,6 +628,167 @@ async fn a_room_without_a_snapshot_answers_null() {
     assert_eq!(browser.recv().await["code"], "bad_request");
 }
 
+/// A session in the lobby that asked for `cache_versions`.
+async fn versioned_session(addr: SocketAddr) -> Browser {
+    let token = sign_in("ana").await;
+    let mut browser = Browser::connect_with(addr, "lobby", &token, json!(["cache_versions"])).await;
+    let hello = browser.recv_type("hello").await;
+    assert_eq!(hello["features"], json!(["cache_versions"]));
+    browser
+}
+
+impl Browser {
+    /// Send `request` with a fresh id and return the id.
+    async fn request(&mut self, mut request: Value) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        request["id"] = json!(id);
+        self.send(request).await;
+        id
+    }
+
+    /// The next message answering request `id`.
+    async fn answer(&mut self, id: u64) -> Value {
+        loop {
+            let message = self.recv().await;
+            if message["id"].as_u64() == Some(id) {
+                return message;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn of_two_conditional_writes_at_one_version_exactly_one_applies() {
+    let (_gateway, addr) = start_gateway().await;
+    let key = run_tag("cas").replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let mut ana = versioned_session(addr).await;
+    let mut ben = versioned_session(addr).await;
+    let put = |payload: &str, condition: Value| {
+        json!({
+            "type": "cache_put_if", "cache": "members", "key": key,
+            "payload": BASE64.encode(payload), "if": condition
+        })
+    };
+
+    // Both write to a key that is not there.
+    let a = ana.request(put("ana", json!("absent"))).await;
+    let b = ben.request(put("ben", json!("absent"))).await;
+    let (a, b) = (ana.answer(a).await, ben.answer(b).await);
+    let (winner, loser) = match (a["applied"].as_bool(), b["applied"].as_bool()) {
+        (Some(true), Some(false)) => (a, b),
+        (Some(false), Some(true)) => (b, a),
+        other => panic!("one write applies: {other:?} {a} {b}"),
+    };
+    assert_eq!(winner["type"], "cache_put_result");
+    let version = winner["version"].as_u64().expect("the version written");
+    assert_eq!(
+        loser["version"], winner["version"],
+        "the loser learns the winner's version"
+    );
+
+    // A read names the version a next write must be conditioned on.
+    let read = ana
+        .request(json!({"type": "cache_get", "cache": "members", "key": key}))
+        .await;
+    let read = ana.answer(read).await;
+    assert_eq!(read["version"].as_u64(), Some(version), "{read}");
+    let held = BASE64.decode(read["payload"].as_str().unwrap()).unwrap();
+    assert!(held == b"ana" || held == b"ben", "{read}");
+
+    // Both write at the version they read.
+    let a = ana.request(put("ana2", json!({"version": version}))).await;
+    let b = ben.request(put("ben2", json!({"version": version}))).await;
+    let (a, b) = (ana.answer(a).await, ben.answer(b).await);
+    let (winner, loser) = match (a["applied"].as_bool(), b["applied"].as_bool()) {
+        (Some(true), Some(false)) => (a, b),
+        (Some(false), Some(true)) => (b, a),
+        other => panic!("one write applies: {other:?} {a} {b}"),
+    };
+    let next = winner["version"].as_u64().unwrap();
+    assert!(next > version);
+    assert_eq!(loser["version"].as_u64(), Some(next));
+
+    // A delete at the old version is refused; at the current one it applies.
+    let stale = ana
+        .request(json!({
+            "type": "cache_delete_if", "cache": "members", "key": key, "version": version
+        }))
+        .await;
+    let stale = ana.answer(stale).await;
+    assert_eq!(
+        (
+            stale["type"].as_str(),
+            stale["applied"].as_bool(),
+            stale["version"].as_u64()
+        ),
+        (Some("cache_delete_result"), Some(false), Some(next)),
+        "{stale}"
+    );
+    let gone = ana
+        .request(json!({
+            "type": "cache_delete_if", "cache": "members", "key": key, "version": next
+        }))
+        .await;
+    let gone = ana.answer(gone).await;
+    assert_eq!(
+        (gone["applied"].as_bool(), &gone["version"]),
+        (Some(true), &Value::Null),
+        "{gone}"
+    );
+    let read = ben
+        .request(json!({"type": "cache_get", "cache": "members", "key": key}))
+        .await;
+    let read = ben.answer(read).await;
+    assert_eq!(
+        (&read["payload"], &read["version"]),
+        (&Value::Null, &Value::Null),
+        "{read}"
+    );
+
+    // A refused write is not an error, and one that cannot reach the cache is.
+    let bad = ana
+        .request(json!({
+            "type": "cache_put_if", "cache": "snap", "key": key,
+            "payload": BASE64.encode("x"), "if": "absent"
+        }))
+        .await;
+    let bad = ana.answer(bad).await;
+    assert_eq!(bad["code"], "bad_request", "{bad}");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_session_without_cache_versions_sees_no_versions_and_cannot_write_conditionally() {
+    let (_gateway, addr) = start_gateway().await;
+    let key = run_tag("plain").replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let mut browser = Browser::open(addr).await;
+    browser
+        .send(json!({
+            "type": "cache_put", "cache": "members", "key": key, "payload": BASE64.encode("v")
+        }))
+        .await;
+    let read = browser
+        .request(json!({"type": "cache_get", "cache": "members", "key": key}))
+        .await;
+    let read = browser.answer(read).await;
+    assert_eq!(read["type"], "cache_value");
+    assert!(read.get("version").is_none(), "{read}");
+
+    for request in [
+        json!({
+            "type": "cache_put_if", "cache": "members", "key": key,
+            "payload": BASE64.encode("v"), "if": "absent"
+        }),
+        json!({"type": "cache_delete_if", "cache": "members", "key": key, "version": 1}),
+    ] {
+        let id = browser.request(request).await;
+        let refused = browser.answer(id).await;
+        assert_eq!(refused["code"], "bad_request", "{refused}");
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
 async fn members_are_listed_watched_and_expire() {
