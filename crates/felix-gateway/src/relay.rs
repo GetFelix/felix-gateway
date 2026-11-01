@@ -1080,7 +1080,10 @@ async fn relay_subscription(
         past_end,
     } = target;
     let ended = |code, err| {
-        let mut message = subscription_error(stream.clone(), code, err, past_end);
+        // Only a subscribe that fails to open is past the end; a running one
+        // that resumed after a failover ends as `subscription_ended`.
+        let at_open = code == ErrorCode::SubscribeFailed;
+        let mut message = subscription_error(stream.clone(), code, err, past_end && at_open);
         with_slot(&mut message, slot.as_ref());
         with_shard(&mut message, shard);
         Outbound::Message(message)

@@ -18,7 +18,7 @@ release notes the Felix version it was tested against.
 
 ### Changed
 
-- The protocol reference says that `as_of` and `version` are offsets of the shard that answered, and that a `read` of `as_of` on that shard succeeds at once (#45).
+- The protocol reference says that `as_of` and `version` are offsets of the shard that answered, and that a `read` of `as_of` on that shard succeeds at once, barring a leader change (#45).
 - Built on and tested against Felix 0.6.2: felix-client and felix-wire 0.6.2, and the dev stack runs the 0.6.2 images.
 
 ## [0.7.0] - 2026-10-23

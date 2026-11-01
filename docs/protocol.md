@@ -42,8 +42,8 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `slots` | A `subscribe` may name a `slot`, so one stream can hold more than one subscription on a connection |
   | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
   | `read` | [`read`](#read) reads a range of a durable stream's log without subscribing |
-  | `shards` | A `subscribe` may name the `shard` of a stream to follow, instead of shard 0 |
-| `past_end` | A `read`, or a `subscribe` from an offset, that asks for an offset beyond the end of the log is answered with the code `past_end` and the log's `tail`, instead of `read_failed` or `subscribe_failed` |
+  | `shards` | A `subscribe` or a [`state_get`](#state_get) may name the `shard` of a stream, instead of shard 0 or the one an entity key picks |
+  | `past_end` | A `read`, or a `subscribe` from an offset, that asks for an offset beyond the end of the log is answered with the code `past_end` and the log's `tail`, instead of `read_failed` or `subscribe_failed` |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
@@ -243,16 +243,18 @@ that commit's event first. Without the feature, `state_get` is refused with
 
 `version` and `as_of` are offsets in the log of the shard that answered, and
 only a `read` or `subscribe` on that same shard understands them. With an
-`entity` the shard is picked by the stream's own routing, modulo or jump hash,
-which is fixed when the stream is created and which the answer does not
-report. Guess it wrong and the offsets belong to another shard. For example,
-shard 1 of `events` holds records up to offset 5040 and shard 3 only up to 5028:
+`entity` the shard is picked by the stream's own routing, fixed when the stream
+is created: either a hash of the entity key modulo the shard count, or a jump
+consistent hash of it. The answer does not report which shard that was. Guess
+it wrong and the offsets belong to another shard. For example, say `d01` routes
+to shard 1, which holds records up to offset 5040, and the page assumed shard 3,
+which holds only up to 5028:
 
 ```json
 {"type": "state_get", "stream": "events", "key": "keyframe", "entity": "d01", "id": 1}
 {"type": "state_value", "id": 1, "payload": "AQI=", "version": 5012, "as_of": 5040}
 {"type": "read", "stream": "events", "from": 5039, "shard": 3, "id": 2}
-{"type": "error", "id": 2, "code": "read_failed", "message": "offset 5039 is past the end of the stream; tail is 5029"}
+{"type": "error", "id": 2, "stream": "events", "code": "read_failed", "message": "offset 5039 is past the end of the stream; tail is 5029"}
 ```
 
 If the page does not know how the stream routes, name the shard and leave out
@@ -523,7 +525,7 @@ is none.
 | `id` | The `state_get` it answers |
 | `payload` | The value in base64, or `null` when the key was never written or was deleted |
 | `version` | The offset of the commit that wrote the value, or `null` with no value |
-| `as_of` | The offset of the last commit the answer reflects. Every commit at or below it is reflected, and its event can be read from the shard's log, so a `read` of `as_of` on that shard succeeds as soon as the answer arrives. Records past it may not be there yet. Like `version`, it is an offset of the shard that answered |
+| `as_of` | The offset of the last commit the answer reflects. Every commit at or below it is reflected, and its event can be read from the shard's log, so a `read` of `as_of` on that shard succeeds as soon as the answer arrives, unless the shard's leader changed in between and the new one does not have it. Commits after it are not reflected. Like `version`, it is an offset of the shard that answered |
 | `shard` | Present only when the `state_get` named one |
 
 ### `records`
