@@ -147,6 +147,13 @@ describe("GatewayClient", () => {
     await expect(del).resolves.toEqual({ applied: true, version: null });
   });
 
+  it("refuses to read a version from a session without the feature", async () => {
+    const { client, socket } = await connect();
+    const read = client.cacheGetVersioned("world", "c");
+    socket.receive({ type: "cache_value", id: 0, payload: "AQ==" });
+    await expect(read).rejects.toMatchObject({ code: "bad_request" });
+  });
+
   it("rejects the request an error names and reports the rest", async () => {
     const { client, socket } = await connect();
     const errors: [GatewayError, string | undefined][] = [];

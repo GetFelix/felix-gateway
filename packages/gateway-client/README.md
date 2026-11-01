@@ -20,7 +20,9 @@ Two sessions that write one cache key with `cachePut` overwrite each other.
 Join with the `cache_versions` feature to avoid that: `cacheGetVersioned` reads
 a key with its version, and `cachePutIf` writes it only if the key is still at
 that version. A refused write returns the current version instead of throwing,
-so the usual loop is read, edit, write, and read again when refused:
+so the usual loop is read, edit, write, and read again when refused. `edit` runs
+again on every refusal, so it must be safe to repeat. `url` and `token` are the
+gateway's WebSocket URL and the ID token from signing in:
 
 ```ts
 import { GatewayClient, type Gateway } from "felix-gateway-client";
@@ -51,8 +53,8 @@ async function update(
 
 `felix-gateway-client/fake` has `FakeScope` and `FakeGateway`, an in-memory
 stand-in with the same shape as `GatewayClient`, for tests that should not need
-a gateway or a broker. It numbers cache versions as Felix does, so conditional
-writes behave as they would against a gateway, and it can drop live records and
+a gateway or a broker. It gives every cache write a new version that is never reused, as Felix does, so
+conditional writes behave as they would against a gateway, and it can drop live records and
 lose acks to exercise recovery paths.
 
 ## License

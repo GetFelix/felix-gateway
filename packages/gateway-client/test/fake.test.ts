@@ -39,7 +39,7 @@ async function update(
 }
 
 describe("the read, edit, write loop", () => {
-  it("keeps both of two concurrent edits", async () => {
+  it("keeps every one of several concurrent edits", async () => {
     const scope = new FakeScope();
     const count = (current: Uint8Array | null) => bytes((current?.[0] ?? 0) + 1);
     await Promise.all([1, 2, 3].map(() => update(new FakeGateway(scope), "world", "chunk", count)));

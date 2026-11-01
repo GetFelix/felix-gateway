@@ -43,7 +43,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
   | `read` | [`read`](#read) reads a range of a durable stream's log without subscribing |
   | `shards` | A `subscribe` may name the `shard` of a stream to follow, instead of shard 0 |
-| `cache_versions` | `cache_value` carries the entry's version, and [`cache_put_if`](#cache_put_if) and [`cache_delete_if`](#cache_delete_if) write only if the entry is still at the version the browser read |
+  | `cache_versions` | `cache_value` carries the entry's version, and [`cache_put_if`](#cache_put_if) and [`cache_delete_if`](#cache_delete_if) write only if the entry is still at the version the browser read. Needs a Felix broker from 0.6.0-preview.3 on; against an older one the session's `cache_get` and conditional writes fail with `cache_failed` |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
@@ -352,10 +352,20 @@ async function update(
 }
 ```
 
-An `error` with code `cache_failed` and the `id` means Felix could not say
-whether the write applied. The gateway never sends it again, because a retry of
-a write that did apply would be refused by the version it wrote. Read the key
-to find out.
+An `error` with code `cache_failed` and the `id` means Felix refused the write
+or could not say whether it applied, for instance because the connection was
+lost. A write over a limit has the same code when the session did not ask for
+`rate_limited`, and then never reached Felix. The gateway never sends a write
+again, because a retry of one that did apply would be refused by the version it
+wrote.
+
+After a failure with an unknown outcome, such as `cache_failed` after a lost
+connection or a `closed` rejection in the browser client, read the key before
+writing again, and do not rerun an edit that is not safe to repeat. The earlier
+write may still land after the read. A write conditioned on version `v` cannot
+land once the read shows another version, but a write conditioned on `"absent"`
+can. An edit that must apply exactly once should carry an id in the payload that
+the next read can check for.
 
 The write goes out in the order the browser sent it, after its earlier writes,
 and counts against the write [limits](#limits) like `cache_put`. A write over a

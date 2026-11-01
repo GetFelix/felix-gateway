@@ -255,7 +255,10 @@ export class GatewayClient {
       payload: string | null;
       version?: number | null;
     };
-    if (answer.payload === null || answer.version == null) return null;
+    if (answer.version === undefined) {
+      throw new GatewayError("bad_request", "cacheGetVersioned needs the cache_versions feature");
+    }
+    if (answer.payload === null || answer.version === null) return null;
     return { payload: fromBase64(answer.payload), version: answer.version };
   }
 
