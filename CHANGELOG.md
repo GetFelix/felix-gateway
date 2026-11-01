@@ -11,6 +11,10 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Fixed
+
+- The join pattern in the protocol reference could hang a browser against a Felix 0.6.0 cluster: a `live` subscribe reports the raw log tail there, which can sit past a generation-start record that is never delivered. The reference now has a worked example and a runnable `catchUp` function for the join, takes the catch-up target from the replay's `subscribed`, says what `live_offset` promises, and notes that 0.6.1 and later report a tail a browser can wait for (#43).
+
 ### Changed
 
 - Built on and tested against Felix 0.6.2: felix-client and felix-wire 0.6.2, and the dev stack runs the 0.6.2 images.
