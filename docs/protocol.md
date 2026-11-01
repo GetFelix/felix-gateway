@@ -332,25 +332,82 @@ gateway.
 
 ### Subscribe before reading
 
-When a cache holds a fold of a stream up to some offset, as a snapshot would,
-read it after subscribing, never before:
+A page that opens a room needs the history it missed and everything that
+happens from then on. When the history is a snapshot held in a cache, as when
+an app saves its state every few seconds, the order of the steps matters:
+read the snapshot first and any record published between the read and the
+subscribe is lost. Subscribe first.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant G as Gateway
+    B->>G: subscribe ops from live
+    G-->>B: subscribed, live_offset 10
+    B->>G: cache_get snap
+    G-->>B: cache_value, covers events through 6
+    B->>G: subscribe ops from 7
+    G-->>B: subscribed, live_offset 10
+    G-->>B: events 7, 8 and 9: the history
+    G-->>B: event 10 and on, as they are published
+```
 
 1. `subscribe` to the stream from `"live"` and wait for `subscribed`. Its
-   `live_offset` is the tail `L`, and every event published from then on will
-   arrive, including any published while the next step is in flight.
-2. `cache_get` the fold. Say it covers the stream through offset `N`.
-3. Drop buffered events at or below `N`. If `N + 1 < L`, `subscribe` again
-   from `N + 1` to read the records in between. With no fold, subscribe from 0.
-4. That `subscribed` has a `live_offset` of its own, `L2`. The records in
-   between are all read once the event at `L2 - 1` has arrived on this new
-   subscription, not from the buffer of the one it replaced; if `L2` is no
-   higher than `N + 1` there is nothing to wait for. Take this target
-   from the second `subscribed`, never from the first: against a Felix 0.6.0
-   broker, `L` can sit past a record that holds no event, and nothing arrives
-   at `L - 1`.
+   `live_offset` is the tail `L`. Every event published from now on arrives,
+   including those published while the next steps run. Buffer them.
+2. `cache_get` the snapshot. Say it covers the stream through offset `N`.
+3. Compare `N + 1` with `L`:
+   - If `N + 1 >= L`, the snapshot already covers the history. Drop the
+     buffered events at or below `N` and apply the rest in order.
+   - Otherwise events `N + 1` to `L - 1` are in neither the snapshot nor the
+     buffer. `subscribe` again from `N + 1`. That replaces the live
+     subscription and delivers everything from `N + 1` on, so discard the
+     buffer and use the new subscription's events. With no snapshot, subscribe
+     from 0.
+4. The new `subscribed` has a `live_offset` of its own, `L2`. The history is
+   complete once the event at offset `L2 - 1` has arrived on the new
+   subscription. Events after it are live.
 
-Reading first would lose the records published between the read and the
-subscribe.
+In the example, the log holds events 0 to 9, so `L` is 10. The snapshot covers
+through 6, so the page subscribes again from 7. Events 7, 8 and 9 arrive, and
+the one at `L2 - 1 = 9` ends the wait.
+
+Take the target from the second `subscribed`, never from the first. Against a
+Felix 0.6.0 broker, `L` can be larger than the offset after the last event, and
+nothing ever arrives at `L - 1`; see [`subscribed`](#subscribed). The second
+`live_offset` is right on every Felix version.
+
+The same step in the browser client. It ignores anything that arrives before
+the new `subscribed`, because that is the replaced subscription's:
+
+```ts
+import type { Gateway, GatewayEvent } from "felix-gateway-client";
+
+/**
+ * Subscribe to `stream` from `from` and resolve once every event the log
+ * already held has reached `apply`. Later events keep arriving at `apply`.
+ */
+function catchUp(
+  client: Gateway,
+  stream: string,
+  from: number,
+  apply: (event: GatewayEvent) => void,
+): Promise<void> {
+  return new Promise((resolve) => {
+    let target: number | null = null; // the offset where the history ends
+    client.onSubscribed = (_stream, _start, live) => {
+      target = live ?? 0;
+      if (from >= target) resolve(); // nothing to wait for
+    };
+    client.onEvent = (event) => {
+      if (target === null) return; // from the subscription this one replaced
+      apply(event);
+      if (event.offset !== null && event.offset + 1 >= target) resolve();
+    };
+    client.subscribe(stream, from);
+  });
+}
+```
 
 ### More than one connection
 
@@ -392,22 +449,28 @@ The answer to `join`: the session is open on this scope.
 ```
 
 The subscription is registered with the broker. Anything published from this
-point on will be delivered. `start_offset` is the first offset this
-subscription delivers and `live_offset` is where the records written before it
-registered end: the subscription delivers the events from `start_offset` up to
-it, then every record as it is written. Both are `null` on a stream with no
-log, such as `presence`. From `"live"` the two are equal.
+point on will be delivered.
+
+| Field | Meaning |
+|---|---|
+| `start_offset` | The first offset this subscription delivers |
+| `live_offset` | Where the history ends and live delivery begins. The events below it were in the log when the subscription registered, and it delivers those from `start_offset` first. Everything from `live_offset` on is published afterwards |
+
+Both are `null` on a stream with no log, such as `presence`. From `"live"` the
+two are equal, because there is no history to deliver.
 
 When `live_offset` is above `start_offset`, the offset `live_offset - 1` holds
 an event, so a browser catching up is done once it has handled that offset. A
 record that holds no event, such as a new leader's generation-start record, can
 sit in the middle of the range, where `skipped_before` counts it, but not at
-its end. The exception is a `"live"` subscribe to a Felix 0.6.0 broker: it
-reports the raw tail, which can sit past such a record, so nothing ever arrives
+its end.
+
+The exception is a `"live"` subscribe to a Felix 0.6.0 broker. It reports the
+raw tail of the log, which can sit past such a record, so nothing ever arrives
 at `live_offset - 1`. Felix 0.6.1 and later end the tail before it, and a
-subscribe from an offset does on every version. A browser that must work against 0.6.0
-takes its target from a subscribe from an offset, as [Subscribe before
-reading](#subscribe-before-reading) does.
+subscribe from an offset does on every version. A browser that must work
+against 0.6.0 therefore takes its target from a subscribe from an offset, as
+[Subscribe before reading](#subscribe-before-reading) does.
 
 `slot` and `shard` are present when the `subscribe` named them; a
 `subscribe` without a `shard` is answered exactly as before. `start_offset`
