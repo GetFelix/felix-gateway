@@ -43,7 +43,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
   | `read` | [`read`](#read) reads a range of a durable stream's log without subscribing |
   | `shards` | A `subscribe` may name the `shard` of a stream to follow, instead of shard 0 |
-| `time` | [`offset_for_time`](#offset_for_time) finds the offset of a stream's shard at a wall-clock time |
+  | `time` | [`offset_for_time`](#offset_for_time) finds the offset of a stream's shard at a wall-clock time |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
