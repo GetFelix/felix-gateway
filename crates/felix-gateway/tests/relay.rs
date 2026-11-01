@@ -792,6 +792,94 @@ async fn state_get_reads_a_key_with_the_offset_of_the_commit_that_wrote_it() {
 
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
+async fn the_offset_state_get_reports_is_readable_on_the_shard_it_came_from() {
+    let config = config();
+    if config.shared.is_some() {
+        return;
+    }
+    let (gateway, addr) = start_gateway().await;
+    let token = gateway
+        .scope_token(&sign_in("ana").await, "lobby")
+        .await
+        .expect("ana may open the lobby");
+    let client = Arc::new(
+        gateway
+            .connect_felix(Arc::new(Fixed(token)))
+            .await
+            .expect("connect to Felix"),
+    );
+    let tag = run_tag("as-of");
+    let writers: Vec<_> = (0..4)
+        .map(|writer| {
+            let client = Arc::clone(&client);
+            let (tenant, namespace) = (config.tenant.clone(), config.namespace.clone());
+            let tag = tag.clone();
+            tokio::spawn(async move {
+                for i in 0..250 {
+                    let key = format!("{tag}/{writer}");
+                    client
+                        .commit(
+                            &tenant,
+                            &namespace,
+                            b"demo.ops.lobby",
+                            vec![
+                                CommitOp::publish(
+                                    "demo.ops.lobby",
+                                    format!("{key}/{i}").into_bytes(),
+                                ),
+                                CommitOp::put(
+                                    "demo.ops.lobby",
+                                    key.as_str(),
+                                    i.to_string().into_bytes(),
+                                ),
+                            ],
+                        )
+                        .await
+                        .expect("the commit lands");
+                }
+            })
+        })
+        .collect();
+
+    let token = sign_in("ana").await;
+    let mut browser = Browser::connect_with(addr, "lobby", &token, json!(["state", "read"])).await;
+    browser.recv_type("hello").await;
+    let started = tokio::time::Instant::now();
+    let (mut probes, mut failures) = (0, Vec::new());
+    while writers.iter().any(|writer| !writer.is_finished()) {
+        browser
+            .send(json!({"type": "state_get", "stream": "ops", "key": format!("{tag}/0"), "id": 1}))
+            .await;
+        let state = browser.recv_type("state_value").await;
+        let Some(as_of) = state["as_of"].as_u64().filter(|as_of| *as_of > 0) else {
+            continue;
+        };
+        browser
+            .send(json!({"type": "read", "stream": "ops", "from": as_of - 1, "end": as_of + 1, "id": 2}))
+            .await;
+        let answer = browser.recv().await;
+        probes += 1;
+        let reached = answer["records"]
+            .as_array()
+            .and_then(|records| records.last())
+            .and_then(|record| record["offset"].as_u64());
+        if reached != Some(as_of) {
+            failures.push((as_of, answer.to_string()));
+        }
+    }
+    for writer in writers {
+        writer.await.unwrap();
+    }
+    eprintln!(
+        "as_of probes: {probes} in {:?}, {} unreadable: {failures:?}",
+        started.elapsed(),
+        failures.len()
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
 async fn read_answers_a_range_of_the_log_without_subscribing() {
     let (_gateway, addr) = start_gateway().await;
     let token = sign_in("ana").await;
