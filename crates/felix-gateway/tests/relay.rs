@@ -611,7 +611,8 @@ async fn an_op_published_while_the_snapshot_is_read_reaches_a_browser_that_subsc
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
 async fn a_live_subscribe_and_a_replay_agree_where_the_events_end() {
-    // The join pattern in docs/protocol.md. A replicated shard's log can end
+    // The join pattern in docs/protocol.md. Nothing else writes the studio's
+    // ops stream, so the tails below are exact. A replicated shard's log can end
     // in a generation-start record, which a subscriber never receives; both
     // subscribes must name the tail below it, or a browser waiting for the
     // offset before the tail waits forever. The dev stream is not replicated,

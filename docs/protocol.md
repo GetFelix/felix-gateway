@@ -355,7 +355,9 @@ sequenceDiagram
 1. `subscribe` to the stream from `"live"` and wait for `subscribed`. Its
    `live_offset` is the tail `L`. Every event published from now on arrives,
    including those published while the next steps run. Buffer them.
-2. `cache_get` the snapshot. Say it covers the stream through offset `N`.
+2. `cache_get` the snapshot. Say it covers the stream through offset `N`. The
+   app has to record `N` itself, for example in the snapshot's payload next to
+   the state, when it writes the snapshot.
 3. Compare `N + 1` with `L`:
    - If `N + 1 >= L`, the snapshot already covers the history. Drop the
      buffered events at or below `N` and apply the rest in order.
@@ -364,13 +366,18 @@ sequenceDiagram
      subscription and delivers everything from `N + 1` on, so discard the
      buffer and use the new subscription's events. With no snapshot, subscribe
      from 0.
-4. The new `subscribed` has a `live_offset` of its own, `L2`. The history is
-   complete once the event at offset `L2 - 1` has arrived on the new
-   subscription. Events after it are live.
+4. After subscribing again, the new `subscribed` has a `live_offset` of its
+   own, `L2`. The history is complete once the event at offset `L2 - 1` has
+   arrived on the new subscription. Events after it are live. If `L2` is no
+   higher than the offset subscribed from, there is no history to wait for.
 
 In the example, the log holds events 0 to 9, so `L` is 10. The snapshot covers
 through 6, so the page subscribes again from 7. Events 7, 8 and 9 arrive, and
-the one at `L2 - 1 = 9` ends the wait.
+the one at `L2 - 1 = 9` ends the wait. Had the snapshot covered through 9,
+`N + 1` would equal `L`, nothing would be missing, and the page would apply the
+buffered events from 10 on directly. A stream with no log, such as `presence`,
+has no history: its `live_offset` is `null`. The steps run per subscription, so
+a page that follows several slots or shards runs them for each.
 
 Take the target from the second `subscribed`, never from the first. Against a
 Felix 0.6.0 broker, `L` can be larger than the offset after the last event, and
@@ -378,7 +385,12 @@ nothing ever arrives at `L - 1`; see [`subscribed`](#subscribed). The second
 `live_offset` is right on every Felix version.
 
 The same step in the browser client. It ignores anything that arrives before
-the new `subscribed`, because that is the replaced subscription's:
+the new `subscribed`, because that is the replaced subscription's, and the new
+one delivers it again. (With `binary_events`, a frame's `sub` number tells the
+two subscriptions apart too.) It rejects if the subscribe fails, for instance
+with `trimmed` when retention has already passed the snapshot's offset; the page
+then needs a newer snapshot, or it reads from the oldest offset the log still
+holds, which the `error` message gives as `oldest`.
 
 ```ts
 import type { Gateway, GatewayEvent } from "felix-gateway-client";
@@ -393,7 +405,7 @@ function catchUp(
   from: number,
   apply: (event: GatewayEvent) => void,
 ): Promise<void> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let target: number | null = null; // the offset where the history ends
     client.onSubscribed = (_stream, _start, live) => {
       target = live ?? 0;
@@ -403,6 +415,9 @@ function catchUp(
       if (target === null) return; // from the subscription this one replaced
       apply(event);
       if (event.offset !== null && event.offset + 1 >= target) resolve();
+    };
+    client.onError = (error, failed) => {
+      if (failed === stream) reject(error);
     };
     client.subscribe(stream, from);
   });
@@ -461,12 +476,14 @@ two are equal, because there is no history to deliver.
 
 When `live_offset` is above `start_offset`, the offset `live_offset - 1` holds
 an event, so a browser catching up is done once it has handled that offset. A
-record that holds no event, such as a new leader's generation-start record, can
-sit in the middle of the range, where `skipped_before` counts it, but not at
-its end.
+record that holds no event can sit in the middle of the range, where
+`skipped_before` counts it, but not at its end. The usual one is a
+generation-start record: a marker a new leader writes into the log, which takes
+an offset and is never delivered.
 
 The exception is a `"live"` subscribe to a Felix 0.6.0 broker. It reports the
-raw tail of the log, which can sit past such a record, so nothing ever arrives
+raw tail of the log, the offset the next record will get, which can sit past such
+a record, so nothing ever arrives
 at `live_offset - 1`. Felix 0.6.1 and later end the tail before it, and a
 subscribe from an offset does on every version. A browser that must work
 against 0.6.0 therefore takes its target from a subscribe from an offset, as

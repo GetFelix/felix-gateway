@@ -26,7 +26,7 @@ function catchUp(
   from: number,
   apply: (event: GatewayEvent) => void,
 ): Promise<void> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let target: number | null = null; // the offset where the history ends
     client.onSubscribed = (_stream, _start, live) => {
       target = live ?? 0;
@@ -36,6 +36,9 @@ function catchUp(
       if (target === null) return; // from the subscription this one replaced
       apply(event);
       if (event.offset !== null && event.offset + 1 >= target) resolve();
+    };
+    client.onError = (error, failed) => {
+      if (failed === stream) reject(error);
     };
     client.subscribe(stream, from);
   });
@@ -61,6 +64,14 @@ describe("catching up from a snapshot", () => {
     const offsets: (number | null)[] = [];
     await catchUp(new FakeGateway(filled()), "ops", 10, (event) => offsets.push(event.offset));
     expect(offsets).toEqual([]);
+  });
+
+  it("rejects when the snapshot's offset has been trimmed", async () => {
+    const scope = filled();
+    scope.retainedFrom.set("ops", 5);
+    await expect(catchUp(new FakeGateway(scope), "ops", 3, () => {})).rejects.toMatchObject({
+      code: "trimmed",
+    });
   });
 
   it("applies an event once when it also reached the subscription it replaces", async () => {
