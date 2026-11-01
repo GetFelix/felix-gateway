@@ -154,6 +154,8 @@ Pre-1.0. The protocol, the scope file format and the library API may change
 between minor versions; version 1 of the wire protocol is frozen, and later
 changes arrive as negotiated features. Tested against Felix 0.6.2.
 Shared connections require 0.6.0-preview.7 or later.
+A `live` subscribe reports a tail a browser can wait for from Felix 0.6.1
+on; see [Subscribe before reading](docs/protocol.md#subscribe-before-reading).
 
 Known limits, all on the Felix side:
 

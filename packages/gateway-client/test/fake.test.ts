@@ -47,6 +47,74 @@ describe("the read, edit, write loop", () => {
   });
 });
 
+// The same function as in docs/protocol.md, "Subscribe before reading".
+function catchUp(
+  client: Gateway,
+  stream: string,
+  from: number,
+  apply: (event: GatewayEvent) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let target: number | null = null; // the offset where the history ends
+    client.onSubscribed = (_stream, _start, live) => {
+      target = live ?? 0;
+      if (from >= target) resolve(); // nothing to wait for
+    };
+    client.onEvent = (event) => {
+      if (target === null) return; // from the subscription this one replaced
+      apply(event);
+      if (event.offset !== null && event.offset + 1 >= target) resolve();
+    };
+    client.onError = (error, failed) => {
+      if (failed === stream) reject(error);
+    };
+    client.subscribe(stream, from);
+  });
+}
+
+describe("catching up from a snapshot", () => {
+  const filled = () => {
+    const scope = new FakeScope();
+    for (let i = 0; i < 10; i++) scope.append("ops", bytes(i));
+    return scope;
+  };
+
+  it("resolves at the last event of the history and then keeps delivering", async () => {
+    const scope = filled();
+    const offsets: (number | null)[] = [];
+    await catchUp(new FakeGateway(scope), "ops", 7, (event) => offsets.push(event.offset));
+    expect(offsets).toEqual([7, 8, 9]);
+    scope.append("ops", bytes(10));
+    expect(offsets).toEqual([7, 8, 9, 10]);
+  });
+
+  it("has nothing to wait for when the snapshot covers the log", async () => {
+    const offsets: (number | null)[] = [];
+    await catchUp(new FakeGateway(filled()), "ops", 10, (event) => offsets.push(event.offset));
+    expect(offsets).toEqual([]);
+  });
+
+  it("rejects when the snapshot's offset has been trimmed", async () => {
+    const scope = filled();
+    scope.retainedFrom.set("ops", 5);
+    await expect(catchUp(new FakeGateway(scope), "ops", 3, () => {})).rejects.toMatchObject({
+      code: "trimmed",
+    });
+  });
+
+  it("applies an event once when it also reached the subscription it replaces", async () => {
+    const scope = filled();
+    const gateway = new FakeGateway(scope);
+    gateway.subscribe("ops", "live");
+    await new Promise((resolve) => setTimeout(resolve));
+    const offsets: (number | null)[] = [];
+    const caught = catchUp(gateway, "ops", 7, (event) => offsets.push(event.offset));
+    scope.append("ops", bytes(10)); // reaches the live subscription before the new one registers
+    await caught;
+    expect(offsets).toEqual([7, 8, 9, 10]);
+  });
+});
+
 describe("FakeGateway", () => {
   it("replays from an offset, then delivers live records", async () => {
     const scope = new FakeScope();
