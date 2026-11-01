@@ -11,8 +11,14 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Added
+
+- `state_get` takes a `shard` under the `shards` feature, and `state_value` echoes it. A browser no longer has to guess how a stream routes entity keys: the `as_of` and `version` it gets are offsets of the shard it named, which a `read` or `subscribe` on that shard understands (#45).
+- The `past_end` feature: a `read` or a `subscribe` from an offset beyond the end of the log is answered with the code `past_end` and the log's `tail`, instead of a message to match (#45).
+
 ### Changed
 
+- The protocol reference says that `as_of` and `version` are offsets of the shard that answered, and that a `read` of `as_of` on that shard succeeds at once (#45).
 - Built on and tested against Felix 0.6.2: felix-client and felix-wire 0.6.2, and the dev stack runs the 0.6.2 images.
 
 ## [0.7.0] - 2026-10-23

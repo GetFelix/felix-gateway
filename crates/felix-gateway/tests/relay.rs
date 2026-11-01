@@ -792,7 +792,7 @@ async fn state_get_reads_a_key_with_the_offset_of_the_commit_that_wrote_it() {
 
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
-async fn the_offset_state_get_reports_is_readable_on_the_shard_it_came_from() {
+async fn state_get_names_a_shard_and_its_as_of_is_readable_there() {
     let config = config();
     if config.shared.is_some() {
         return;
@@ -809,26 +809,28 @@ async fn the_offset_state_get_reports_is_readable_on_the_shard_it_came_from() {
             .expect("connect to Felix"),
     );
     let tag = run_tag("as-of");
-    let writers: Vec<_> = (0..4)
-        .map(|writer| {
+    // Shard 1 gets three times the commits of shard 3, so the two logs end
+    // at different offsets.
+    let writers: Vec<_> = [(1, 450), (3, 150)]
+        .into_iter()
+        .map(|(shard, count)| {
             let client = Arc::clone(&client);
             let (tenant, namespace) = (config.tenant.clone(), config.namespace.clone());
-            let tag = tag.clone();
+            let key = format!("{tag}/{shard}");
             tokio::spawn(async move {
-                for i in 0..250 {
-                    let key = format!("{tag}/{writer}");
+                for i in 0..count {
                     client
                         .commit(
                             &tenant,
                             &namespace,
-                            b"demo.ops.lobby",
+                            &entity_on(shard),
                             vec![
                                 CommitOp::publish(
-                                    "demo.ops.lobby",
+                                    "demo.shards.lobby",
                                     format!("{key}/{i}").into_bytes(),
                                 ),
                                 CommitOp::put(
-                                    "demo.ops.lobby",
+                                    "demo.shards.lobby",
                                     key.as_str(),
                                     i.to_string().into_bytes(),
                                 ),
@@ -842,40 +844,140 @@ async fn the_offset_state_get_reports_is_readable_on_the_shard_it_came_from() {
         .collect();
 
     let token = sign_in("ana").await;
-    let mut browser = Browser::connect_with(addr, "lobby", &token, json!(["state", "read"])).await;
+    let features = json!(["state", "read", "shards", "past_end"]);
+    let mut browser = Browser::connect_with(addr, "lobby", &token, features).await;
     browser.recv_type("hello").await;
-    let started = tokio::time::Instant::now();
-    let (mut probes, mut failures) = (0, Vec::new());
+    // Whatever as_of a state read reports, the same shard's log holds it at
+    // once, with commits still landing.
+    let mut probes = 0;
     while writers.iter().any(|writer| !writer.is_finished()) {
-        browser
-            .send(json!({"type": "state_get", "stream": "ops", "key": format!("{tag}/0"), "id": 1}))
-            .await;
-        let state = browser.recv_type("state_value").await;
-        let Some(as_of) = state["as_of"].as_u64().filter(|as_of| *as_of > 0) else {
-            continue;
-        };
-        browser
-            .send(json!({"type": "read", "stream": "ops", "from": as_of - 1, "end": as_of + 1, "id": 2}))
-            .await;
-        let answer = browser.recv().await;
-        probes += 1;
-        let reached = answer["records"]
-            .as_array()
-            .and_then(|records| records.last())
-            .and_then(|record| record["offset"].as_u64());
-        if reached != Some(as_of) {
-            failures.push((as_of, answer.to_string()));
+        for shard in [1, 3] {
+            browser
+                .send(json!({
+                    "type": "state_get", "stream": "sharded", "key": format!("{tag}/{shard}"),
+                    "shard": shard, "id": 1
+                }))
+                .await;
+            let state = browser.recv_type("state_value").await;
+            assert_eq!(state["shard"], shard, "{state}");
+            let Some(as_of) = state["as_of"].as_u64().filter(|as_of| *as_of > 0) else {
+                continue;
+            };
+            browser
+                .send(json!({
+                    "type": "read", "stream": "sharded", "from": as_of - 1, "end": as_of + 1,
+                    "shard": shard, "id": 2
+                }))
+                .await;
+            let answer = browser.recv_type("records").await;
+            let reached = answer["records"]
+                .as_array()
+                .and_then(|records| records.last())
+                .and_then(|record| record["offset"].as_u64());
+            assert_eq!(reached, Some(as_of), "shard {shard}: {answer}");
+            probes += 1;
         }
     }
     for writer in writers {
         writer.await.unwrap();
     }
-    eprintln!(
-        "as_of probes: {probes} in {:?}, {} unreadable: {failures:?}",
-        started.elapsed(),
-        failures.len()
+    assert!(probes > 0);
+
+    let mut as_of = Vec::new();
+    for shard in [1, 3] {
+        browser
+            .send(json!({
+                "type": "state_get", "stream": "sharded", "key": format!("{tag}/{shard}"),
+                "shard": shard, "id": 3
+            }))
+            .await;
+        as_of.push(browser.recv_type("state_value").await);
+    }
+    let (one, three) = (&as_of[0], &as_of[1]);
+    assert!(
+        one["as_of"].as_u64() > three["as_of"].as_u64(),
+        "{one} {three}"
     );
-    assert!(failures.is_empty(), "{failures:?}");
+
+    // The entity the commits named reaches the same shard's state.
+    let entity = String::from_utf8(entity_on(1)).unwrap();
+    browser
+        .send(json!({
+            "type": "state_get", "stream": "sharded", "key": format!("{tag}/1"),
+            "entity": entity, "id": 4
+        }))
+        .await;
+    let by_entity = browser.recv_type("state_value").await;
+    assert_eq!(
+        (
+            &by_entity["payload"],
+            &by_entity["version"],
+            by_entity.get("shard")
+        ),
+        (&one["payload"], &one["version"], None),
+        "{by_entity}"
+    );
+
+    // Shard 1's as_of is past the end of shard 3's log, and says so.
+    browser
+        .send(json!({
+            "type": "read", "stream": "sharded", "from": one["as_of"], "shard": 3, "id": 5
+        }))
+        .await;
+    let past = browser.recv().await;
+    assert_eq!(
+        (past["code"].as_str(), past["id"].as_u64()),
+        (Some("past_end"), Some(5)),
+        "{past}"
+    );
+    assert!(past["tail"].as_u64() > three["as_of"].as_u64(), "{past}");
+    assert!(past["tail"].as_u64() <= one["as_of"].as_u64(), "{past}");
+
+    browser
+        .send(json!({
+            "type": "subscribe", "stream": "sharded", "from": one["as_of"], "shard": 3
+        }))
+        .await;
+    let past = browser.recv_type("error").await;
+    assert_eq!(past["code"], "past_end", "{past}");
+    assert_eq!(past["shard"], 3, "{past}");
+
+    let mut older = Browser::connect_with(addr, "lobby", &token, json!(["read"])).await;
+    older.recv_type("hello").await;
+    older
+        .send(json!({
+            "type": "read", "stream": "sharded", "from": one["as_of"], "shard": 3, "id": 5
+        }))
+        .await;
+    let failed = older.recv().await;
+    assert_eq!(failed["code"], "read_failed", "{failed}");
+    assert!(failed.get("tail").is_none(), "{failed}");
+
+    for (refused, id) in [
+        (json!({"shard": 1, "entity": entity}), 6),
+        (json!({"shard": 4}), 7),
+    ] {
+        let mut request = json!({"type": "state_get", "stream": "sharded", "key": "k", "id": id});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(refused.as_object().unwrap().clone());
+        browser.send(request).await;
+        let refusal = browser.recv().await;
+        assert_eq!(
+            (refusal["code"].as_str(), refusal["id"].as_u64()),
+            (Some("bad_request"), Some(id)),
+            "{refusal}"
+        );
+    }
+
+    // A session that did not ask for shards cannot name one.
+    let mut plain = Browser::connect_with(addr, "lobby", &token, json!(["state"])).await;
+    plain.recv_type("hello").await;
+    plain
+        .send(json!({"type": "state_get", "stream": "sharded", "key": "k", "shard": 1, "id": 8}))
+        .await;
+    assert_eq!(plain.recv().await["code"], "bad_request");
 }
 
 #[tokio::test]

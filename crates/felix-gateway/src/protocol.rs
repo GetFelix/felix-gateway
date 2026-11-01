@@ -11,7 +11,15 @@ pub const PROTOCOL: u32 = 1;
 
 /// Optional capabilities a `join` may ask for in `features`; `hello` answers
 /// with the ones asked for that are listed here.
-pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS, STATE, READ, SHARDS];
+pub const FEATURES: &[&str] = &[
+    RATE_LIMITED,
+    BINARY_EVENTS,
+    SLOTS,
+    STATE,
+    READ,
+    SHARDS,
+    PAST_END,
+];
 
 /// The feature under which a write or join refused by a limit is answered
 /// with [`ErrorCode::RateLimited`] and `retry_after_ms`. Without it the
@@ -37,6 +45,11 @@ pub const READ: &str = "read";
 /// The feature under which a `subscribe` may name the `shard` of a stream to
 /// follow.
 pub const SHARDS: &str = "shards";
+
+/// The feature under which a read or a subscribe from an offset past the end
+/// of the log is answered with [`ErrorCode::PastEnd`] and the `tail`, instead
+/// of the request's own failure code.
+pub const PAST_END: &str = "past_end";
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -122,6 +135,10 @@ pub enum ClientMessage {
         /// means the empty key, which is enough for a stream of one shard.
         #[serde(default)]
         entity: String,
+        /// With [`SHARDS`]: the shard to read, instead of the one `entity`
+        /// routes to.
+        #[serde(default)]
+        shard: Option<u32>,
         id: u64,
     },
     /// With [`READ`]: one page of a durable stream's records from `from`,
@@ -236,6 +253,9 @@ pub enum ServerMessage {
         version: Option<u64>,
         /// The offset of the last commit the answer reflects.
         as_of: Option<u64>,
+        /// The shard the `state_get` named, when it named one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shard: Option<u32>,
     },
     /// The page for the `read` with this `id`.
     Records {
@@ -278,6 +298,9 @@ pub enum ServerMessage {
         /// With [`ErrorCode::Trimmed`]: the oldest offset the log still holds.
         #[serde(skip_serializing_if = "Option::is_none")]
         oldest: Option<u64>,
+        /// With [`ErrorCode::PastEnd`]: the offset the next record will get.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tail: Option<u64>,
         /// With [`ErrorCode::RateLimited`]: milliseconds until the write
         /// would fit.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,6 +336,9 @@ pub enum ErrorCode {
     ReadFailed,
     /// The subscription asked for an offset the log no longer holds.
     Trimmed,
+    /// The read or subscribe asked for an offset beyond the end of the log.
+    /// Only for sessions that asked for [`PAST_END`].
+    PastEnd,
     /// The join carried no usable sign-in. Sign in again.
     SignedOut,
     /// The signed-in user may not open this scope.
@@ -501,6 +527,7 @@ mod tests {
                 stream: "ops".into(),
                 key: "match/3".into(),
                 entity: String::new(),
+                shard: None,
                 id: 6
             }
         );
@@ -512,18 +539,37 @@ mod tests {
                 stream: "ops".into(),
                 key: "k".into(),
                 entity: "e".into(),
+                shard: None,
                 id: 7
             }
         );
-        let value = ServerMessage::StateValue {
+        assert_eq!(
+            parse(json!({"type": "state_get", "stream": "ops", "key": "k", "shard": 3, "id": 8})),
+            ClientMessage::StateGet {
+                stream: "ops".into(),
+                key: "k".into(),
+                entity: String::new(),
+                shard: Some(3),
+                id: 8
+            }
+        );
+        let value = |shard| ServerMessage::StateValue {
             id: 6,
             payload: Some("AQI=".into()),
             version: Some(40),
             as_of: Some(42),
+            shard,
         };
         assert_eq!(
-            serde_json::to_value(&value).unwrap(),
+            serde_json::to_value(value(None)).unwrap(),
             json!({"type": "state_value", "id": 6, "payload": "AQI=", "version": 40, "as_of": 42})
+        );
+        assert_eq!(
+            serde_json::to_value(value(Some(3))).unwrap(),
+            json!({
+                "type": "state_value", "id": 6, "payload": "AQI=", "version": 40,
+                "as_of": 42, "shard": 3
+            })
         );
     }
 
@@ -655,6 +701,7 @@ mod tests {
             cache: None,
             code: ErrorCode::RateLimited,
             oldest: None,
+            tail: None,
             retry_after_ms: Some(120),
             message: "slow down".into(),
         };
