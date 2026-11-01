@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { FakeGateway, FakeScope } from "../src/fake.js";
-import type { CacheEntry, GatewayEvent } from "../src/index.js";
+import type { CacheEntry, Gateway, GatewayEvent } from "../src/index.js";
 
 const bytes = (...values: number[]) => new Uint8Array(values);
 
@@ -18,6 +18,34 @@ function watch(gateway: FakeGateway): GatewayEvent[] {
   gateway.onEvent = (event) => events.push(event);
   return events;
 }
+
+// The same function as in docs/protocol.md, "cache_put_if".
+async function update(
+  client: Gateway,
+  cache: string,
+  key: string,
+  edit: (current: Uint8Array | null) => Uint8Array,
+): Promise<void> {
+  for (;;) {
+    const entry = await client.cacheGetVersioned(cache, key);
+    const result = await client.cachePutIf(
+      cache,
+      key,
+      edit(entry?.payload ?? null),
+      entry ? { version: entry.version } : "absent",
+    );
+    if (result.applied) return;
+  }
+}
+
+describe("the read, edit, write loop", () => {
+  it("keeps both of two concurrent edits", async () => {
+    const scope = new FakeScope();
+    const count = (current: Uint8Array | null) => bytes((current?.[0] ?? 0) + 1);
+    await Promise.all([1, 2, 3].map(() => update(new FakeGateway(scope), "world", "chunk", count)));
+    expect(scope.readCache("world", "chunk")).toEqual(bytes(3));
+  });
+});
 
 describe("FakeGateway", () => {
   it("replays from an offset, then delivers live records", async () => {

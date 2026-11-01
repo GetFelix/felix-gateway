@@ -303,32 +303,64 @@ rate.
 
 ### `cache_put_if`
 
+Two sessions that write the same cache key with `cache_put` overwrite each
+other, and the later write wins without anyone noticing. A shared editor that
+keeps one chunk per key needs the write to fail when the chunk changed since
+the session read it. `cache_put_if` is that: it writes only if the entry is
+still at the version the session read, and otherwise says what the version is
+now.
+
 ```json
 {"type": "cache_put_if", "cache": "world", "key": "c_3_-1_0", "payload": "gqRu...", "if": {"version": 5400}, "id": 12}
 {"type": "cache_put_if", "cache": "world", "key": "c_3_-1_0", "payload": "gqRu...", "if": "absent", "id": 13}
 ```
 
-Only with the `cache_versions` feature. Writes one entry of a cache whose
-actions include `write` only if no one has written it since the browser read
-it, so two sessions editing one key cannot silently overwrite each other.
+Only with the `cache_versions` feature, which also adds the `version` to
+[`cache_value`](#cache_value). It needs a cache whose actions include `write`.
 
 | Field | Meaning |
 |---|---|
 | `cache`, `key`, `payload` | As for `cache_put`. The entry gets the cache's `ttl_s` when it has one |
-| `if` | `"absent"` when the key has no live entry, never written, deleted or expired, or `{"version": n}` when its entry is at version `n`, as a `cache_value` or an earlier answer named it |
+| `if` | `"absent"` when the key has no live entry (never written, deleted or expired), or `{"version": n}` when its entry is at version `n`, as a `cache_value` or an earlier answer named it |
 | `id` | As for `publish`; it comes back on the `cache_put_result` or `error` |
 
-The gateway answers with a `cache_put_result`. A refused write is an answer,
-not an error: the browser reads the key again, or takes the version in the
-answer, and tries again from there. An `error` with code `cache_failed` and
-the `id` means Felix could not say whether the write applied. The gateway
-never sends it again; a retry of a write that did apply would be refused by
-the version it wrote.
+The gateway answers with a [`cache_put_result`](#cache_put_result-and-cache_delete_result).
+A refused write is an answer, not an error: `applied` is false and `version`
+is the entry's current version. Read the key again to get the newer value,
+rebase the edit on it, and write at the new version:
 
-The write goes out in the order the browser sent it, after its earlier
-writes, and counts against the write [limits](#limits) like `cache_put`. A
-write over a limit is an `error` carrying its `id`. Without the feature the
-message is refused with `bad_request`.
+```ts
+import type { Gateway } from "felix-gateway-client";
+
+/** Apply `edit` to a cache entry, trying again whenever someone else wrote it first. */
+async function update(
+  client: Gateway,
+  cache: string,
+  key: string,
+  edit: (current: Uint8Array | null) => Uint8Array,
+): Promise<void> {
+  for (;;) {
+    const entry = await client.cacheGetVersioned(cache, key);
+    const result = await client.cachePutIf(
+      cache,
+      key,
+      edit(entry?.payload ?? null),
+      entry ? { version: entry.version } : "absent",
+    );
+    if (result.applied) return;
+  }
+}
+```
+
+An `error` with code `cache_failed` and the `id` means Felix could not say
+whether the write applied. The gateway never sends it again, because a retry of
+a write that did apply would be refused by the version it wrote. Read the key
+to find out.
+
+The write goes out in the order the browser sent it, after its earlier writes,
+and counts against the write [limits](#limits) like `cache_put`. A write over a
+limit is an `error` carrying its `id`. Without the feature the message is
+refused with `bad_request`.
 
 ### `cache_delete_if`
 
