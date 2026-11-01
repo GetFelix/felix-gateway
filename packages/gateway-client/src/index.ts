@@ -14,6 +14,7 @@ export type ServerMessage =
       namespace: string;
       cache_ttl_ms: Record<string, number>;
       missing?: string[];
+      principal?: string;
     }
   | {
       type: "subscribed";
@@ -75,6 +76,8 @@ export interface Hello {
   cacheTtlMs: Record<string, number>;
   /** Optional resources the sign-in does not reach. */
   missing: string[];
+  /** The session's Felix principal, when the `principal` feature was asked for. */
+  principal: string | null;
 }
 
 interface WireEntry {
@@ -275,6 +278,7 @@ export class GatewayClient {
           features: message.features,
           cacheTtlMs: message.cache_ttl_ms,
           missing: message.missing ?? [],
+          principal: message.principal ?? null,
         });
         break;
       case "subscribed":

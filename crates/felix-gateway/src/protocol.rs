@@ -11,7 +11,15 @@ pub const PROTOCOL: u32 = 1;
 
 /// Optional capabilities a `join` may ask for in `features`; `hello` answers
 /// with the ones asked for that are listed here.
-pub const FEATURES: &[&str] = &[RATE_LIMITED, BINARY_EVENTS, SLOTS, STATE, READ, SHARDS];
+pub const FEATURES: &[&str] = &[
+    RATE_LIMITED,
+    BINARY_EVENTS,
+    SLOTS,
+    STATE,
+    READ,
+    SHARDS,
+    PRINCIPAL,
+];
 
 /// The feature under which a write or join refused by a limit is answered
 /// with [`ErrorCode::RateLimited`] and `retry_after_ms`. Without it the
@@ -37,6 +45,10 @@ pub const READ: &str = "read";
 /// The feature under which a `subscribe` may name the `shard` of a stream to
 /// follow.
 pub const SHARDS: &str = "shards";
+
+/// The feature under which `hello` names the session's Felix principal, the
+/// one `stamp_sender` writes in front of its records.
+pub const PRINCIPAL: &str = "principal";
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -183,6 +195,9 @@ pub enum ServerMessage {
         /// Optional resources this session's sign-in does not reach.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         missing: Vec<String>,
+        /// With [`PRINCIPAL`]: the session's Felix principal.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        principal: Option<String>,
     },
     /// The subscription is registered with the broker: anything published
     /// from here on will be delivered.
@@ -585,20 +600,25 @@ mod tests {
 
     #[test]
     fn serializes_hello_with_the_scope_under_its_field() {
-        let hello = ServerMessage::Hello {
+        let hello = |principal| ServerMessage::Hello {
             protocol: 1,
             features: vec![],
             namespace: "default".into(),
             scope: BTreeMap::from([("room".into(), "lobby".into())]),
             cache_ttl_ms: BTreeMap::from([("members".into(), 30_000)]),
             missing: vec![],
+            principal,
         };
         assert_eq!(
-            serde_json::to_value(&hello).unwrap(),
+            serde_json::to_value(hello(None)).unwrap(),
             json!({
                 "type": "hello", "protocol": 1, "features": [], "namespace": "default",
                 "room": "lobby", "cache_ttl_ms": {"members": 30000}
             })
+        );
+        assert_eq!(
+            serde_json::to_value(hello(Some("9f2c".into()))).unwrap()["principal"],
+            json!("9f2c")
         );
     }
 

@@ -11,6 +11,10 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+### Added
+
+- The `principal` feature: `hello` names the session's Felix principal, the string `stamp_sender` writes in front of its records, so a page can tell its own records from the rest without decoding its ID token. The browser client's `Hello` has it as `principal` (#47).
+
 ### Changed
 
 - Built on and tested against Felix 0.6.2: felix-client and felix-wire 0.6.2, and the dev stack runs the 0.6.2 images.

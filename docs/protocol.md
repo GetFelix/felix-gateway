@@ -43,6 +43,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
   | `read` | [`read`](#read) reads a range of a durable stream's log without subscribing |
   | `shards` | A `subscribe` may name the `shard` of a stream to follow, instead of shard 0 |
+| `principal` | `hello` names the session's Felix principal in `principal` |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
@@ -177,6 +178,21 @@ On a stream with `stamp_sender`, each payload reaches Felix prefixed with the
 publisher's Felix principal: a 2-byte big-endian length, then the principal's
 UTF-8 bytes. Readers learn who sent each record, and a browser cannot speak
 for someone else.
+
+A reader splits the stamp off with the length, and a session that joined with
+the [`principal` feature](#hello) can tell its own records from the rest by
+comparing the stamp with the `principal` in its `hello`:
+
+```ts
+/** The principal a `stamp_sender` stream put in front of `payload`, and the record behind it. */
+function unstamp(payload: Uint8Array): { sender: string; record: Uint8Array } {
+  const length = new DataView(payload.buffer, payload.byteOffset).getUint16(0); // big-endian
+  return {
+    sender: new TextDecoder().decode(payload.subarray(2, 2 + length)),
+    record: payload.subarray(2 + length),
+  };
+}
+```
 
 ### `counter_add`
 
@@ -367,6 +383,13 @@ count against them.
 
 The answer to `join`: the session is open on this scope.
 
+A page that needs to know who it is, for instance to recognise its own records
+on a `stamp_sender` stream, joins with the `principal` feature:
+
+```json
+{"type": "hello", "protocol": 1, "features": ["principal"], "namespace": "default", "room": "lobby", "cache_ttl_ms": {"members": 30000}, "principal": "6d9e57adf7797f314e8d147faaa09ca37084c41d5503e878204577703e5b8f6e"}
+```
+
 | Field | Meaning |
 |---|---|
 | `protocol` | The version the session speaks |
@@ -375,6 +398,7 @@ The answer to `join`: the session is open on this scope.
 | `room` | The scope's value, under the scope file's `field` |
 | `cache_ttl_ms` | How long an entry lasts without a write, for each cache with a `ttl_s` |
 | `missing` | Present only when not empty: aliases of `optional` resources this sign-in does not reach |
+| `principal` | Only with the `principal` feature: the session's Felix principal, the `sub` of its Felix token. It is the string `stamp_sender` writes in front of the session's records |
 
 ### `subscribed`
 
