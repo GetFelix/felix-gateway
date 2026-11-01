@@ -611,10 +611,11 @@ async fn an_op_published_while_the_snapshot_is_read_reaches_a_browser_that_subsc
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
 async fn a_live_subscribe_and_a_replay_agree_where_the_events_end() {
-    // Nothing else writes the studio's ops, so on a fresh stack its log is
-    // empty or holds only a new leader's generation-start record, which a
-    // subscriber never receives. A Felix 0.6.0 broker reports that record's
-    // place as the live tail; a browser waiting for it would wait forever.
+    // The join pattern in docs/protocol.md. A replicated shard's log can end
+    // in a generation-start record, which a subscriber never receives; both
+    // subscribes must name the tail below it, or a browser waiting for the
+    // offset before the tail waits forever. The dev stream is not replicated,
+    // so this checks the agreement, not that case.
     let (_gateway, addr) = start_gateway().await;
     let mut browser = Browser::join(addr, "ana", "studio").await;
     let live = browser.subscribe("ops", json!("live")).await;
