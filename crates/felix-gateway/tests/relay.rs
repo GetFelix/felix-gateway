@@ -1023,6 +1023,81 @@ async fn state_get_reads_a_key_with_the_offset_of_the_commit_that_wrote_it() {
     assert_eq!(plain.recv().await["code"], "bad_request");
 }
 
+fn unix_micros() -> u64 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    u64::try_from(since.as_micros()).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn offset_for_time_finds_where_a_time_falls_in_the_log() {
+    let (_gateway, addr) = start_gateway().await;
+    let token = sign_in("ana").await;
+    let mut browser = Browser::connect_with(addr, "studio", &token, json!(["time"])).await;
+    assert_eq!(browser.recv().await["features"], json!(["time"]));
+    // The times come from this host's clock and are compared with the broker's
+    // at append, so the broker must share the host's clock: true for a
+    // container on Linux, not necessarily for a VM on macOS.
+    let tag = run_tag("time");
+    let pause = || tokio::time::sleep(Duration::from_millis(100));
+
+    // Nothing else writes the studio's sharded stream, and an unkeyed publish
+    // goes to shard 0, so the two records are the only ones in the window.
+    let before = unix_micros();
+    browser
+        .publish("sharded", &format!("{tag}/first"), true)
+        .await;
+    let first = browser.recv_type("ack").await["offset"].as_u64().unwrap();
+    pause().await;
+    let between = unix_micros();
+    pause().await;
+    browser
+        .publish("sharded", &format!("{tag}/second"), true)
+        .await;
+    let second = browser.recv_type("ack").await["offset"].as_u64().unwrap();
+    pause().await;
+    let after = unix_micros();
+
+    for (at, expected) in [
+        (before, Some(first)),
+        (between, Some(second)),
+        (after, None),
+    ] {
+        let id = browser
+            .request(json!({"type": "offset_for_time", "stream": "sharded", "at_us": at}))
+            .await;
+        let answer = browser.answer(id).await;
+        assert_eq!(answer["type"], "offset", "{answer}");
+        assert_eq!(answer["offset"].as_u64(), expected, "at {at}: {answer}");
+    }
+
+    // A time before everything the shard holds answers with its oldest offset.
+    let id = browser
+        .request(json!({"type": "offset_for_time", "stream": "sharded", "at_us": 0}))
+        .await;
+    let oldest = browser.answer(id).await;
+    assert_eq!(oldest["type"], "offset", "{oldest}");
+    let oldest = oldest["offset"]
+        .as_u64()
+        .expect("an old time answers an offset");
+    assert!(oldest <= first, "oldest {oldest}, first {first}");
+
+    // The answer is an offset a subscribe can start at.
+    browser
+        .send(json!({"type": "subscribe", "stream": "sharded", "from": second}))
+        .await;
+    let event = browser.recv_type("event").await;
+    assert_eq!(event["offset"].as_u64(), Some(second), "{event}");
+
+    // A session that did not ask for the feature is refused.
+    let mut plain = Browser::join(addr, "ana", "studio").await;
+    let id = plain
+        .request(json!({"type": "offset_for_time", "stream": "sharded", "at_us": before}))
+        .await;
+    let refused = plain.answer(id).await;
+    assert_eq!(refused["code"], "bad_request", "{refused}");
+}
+
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
 async fn state_get_names_a_shard_and_its_as_of_is_readable_there() {

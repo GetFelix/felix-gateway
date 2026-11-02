@@ -17,6 +17,7 @@ release notes the Felix version it was tested against.
 - `state_get` takes a `shard` under the `shards` feature, and `state_value` echoes it. A browser no longer has to guess how a stream routes entity keys: the `as_of` and `version` it gets are offsets of the shard it named, which a `read` or `subscribe` on that shard understands (#45).
 - The `past_end` feature: a `read` or a `subscribe` from an offset beyond the end of the log is answered with the code `past_end` and the log's `tail`, instead of a message to match (#45).
 - The `principal` feature: `hello` names the session's Felix principal, the string `stamp_sender` writes in front of its records, so a page can tell its own records from the rest. The browser client's `Hello` has it as `principal` (#47).
+- The `time` feature: `offset_for_time` answers, as an `offset` message, the first offset of a durable stream's shard appended at or after a time, so a browser can seek by wall-clock time in one lookup. It needs `subscribe` on the stream and shares the 4 requests a session may have waiting with `read` (#48).
 
 ### Fixed
 

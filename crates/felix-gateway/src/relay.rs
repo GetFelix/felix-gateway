@@ -25,7 +25,7 @@ use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
     BINARY_EVENTS, CACHE_VERSIONS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES,
     Join, PAST_END, PRINCIPAL, PROTOCOL, RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE,
-    ServerMessage, StartAt,
+    ServerMessage, StartAt, TIME,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -161,6 +161,8 @@ struct Session {
     past_end: bool,
     /// The session asked for [`CACHE_VERSIONS`].
     cache_versions: bool,
+    /// The session asked for [`TIME`].
+    time: bool,
     /// Range reads sent to Felix whose answer is not yet sent on.
     reads: Arc<AtomicUsize>,
     /// The number the next subscription's frames carry.
@@ -201,6 +203,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         shards,
         past_end,
         cache_versions,
+        time,
     }) = join(&mut conn, &gateway, client).await
     else {
         return;
@@ -229,6 +232,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         shards,
         past_end,
         cache_versions,
+        time,
         reads: Arc::default(),
         next_sub: 0,
         throttle: Arc::new(Throttle::default()),
@@ -675,7 +679,7 @@ impl Session {
                         stream_error(
                             stream,
                             ErrorCode::ReadFailed,
-                            format!("at most {READS_IN_FLIGHT} reads may wait at once"),
+                            format!("at most {READS_IN_FLIGHT} reads or lookups may wait at once"),
                         ),
                     ));
                 }
@@ -701,6 +705,56 @@ impl Session {
                             id,
                             subscription_error(stream, ErrorCode::ReadFailed, err, past_end),
                         ),
+                    };
+                    let _ = replies.send(reply);
+                    reads.fetch_sub(1, Ordering::Relaxed);
+                });
+                Next::Continue
+            }
+            ClientMessage::OffsetForTime {
+                stream,
+                at_us,
+                shard,
+                id,
+            } => {
+                // A time lookup is authorized as a subscribe to the stream.
+                let name = match scope.stream(&stream, StreamAction::Subscribe) {
+                    Ok(bound) if self.time => bound.name,
+                    Ok(_) => {
+                        return Next::Reply(with_id(
+                            id,
+                            stream_error(
+                                stream,
+                                ErrorCode::BadRequest,
+                                "offset_for_time needs the time feature",
+                            ),
+                        ));
+                    }
+                    Err(refusal) => {
+                        return Next::Reply(with_id(
+                            id,
+                            stream_error(stream, ErrorCode::BadRequest, refusal),
+                        ));
+                    }
+                };
+                if self.reads.fetch_add(1, Ordering::Relaxed) >= READS_IN_FLIGHT {
+                    self.reads.fetch_sub(1, Ordering::Relaxed);
+                    return Next::Reply(with_id(
+                        id,
+                        stream_error(
+                            stream,
+                            ErrorCode::ReadFailed,
+                            format!("at most {READS_IN_FLIGHT} reads or lookups may wait at once"),
+                        ),
+                    ));
+                }
+                let felix = Arc::clone(&self.felix);
+                let replies = self.replies.clone();
+                let reads = Arc::clone(&self.reads);
+                tokio::spawn(async move {
+                    let reply = match felix.offset_for_time(&name, shard, at_us).await {
+                        Ok(offset) => ServerMessage::Offset { id, offset },
+                        Err(err) => with_id(id, stream_error(stream, ErrorCode::ReadFailed, err)),
                     };
                     let _ = replies.send(reply);
                     reads.fetch_sub(1, Ordering::Relaxed);
@@ -1001,6 +1055,7 @@ struct Joined {
     shards: bool,
     past_end: bool,
     cache_versions: bool,
+    time: bool,
 }
 
 /// Wait for the browser's `join`, exchange its sign-in for a token that
@@ -1107,6 +1162,7 @@ async fn accept(
             .features
             .iter()
             .any(|feature| feature == CACHE_VERSIONS),
+        time: join.features.iter().any(|feature| feature == TIME),
     })
 }
 

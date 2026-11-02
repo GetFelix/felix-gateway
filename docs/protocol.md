@@ -46,6 +46,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `past_end` | A `read`, or a `subscribe` from an offset, that asks for an offset beyond the end of the log is answered with the code `past_end` and the log's `tail`, instead of `read_failed` or `subscribe_failed` |
   | `cache_versions` | `cache_value` carries the entry's version, and [`cache_put_if`](#cache_put_if) and [`cache_delete_if`](#cache_delete_if) write only if the entry is still at the version the browser read. Needs a Felix broker from 0.6.0-preview.3 on; against an older one the session's `cache_get` and conditional writes fail with `cache_failed` |
   | `principal` | `hello` names the session's Felix principal (the identity Felix knows it by) in `principal` |
+  | `time` | [`offset_for_time`](#offset_for_time) finds the offset of a stream's shard at a wall-clock time |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
@@ -316,12 +317,60 @@ retention has discarded is an `error` with code `trimmed` and the `oldest`
 offset left. An offset past the tail is an `error` with code `read_failed`, or with the
 `past_end` feature `past_end` and the `tail`. Anything else Felix refuses,
 such as a stream with no log, is `read_failed`. A session may
-have 4 reads waiting for their answer at once; a fifth is refused at once with
-`read_failed`. Without the
+have 4 requests waiting for their answer at once, counting [`offset_for_time`](#offset_for_time)
+lookups; a fifth is refused at once with `read_failed`. Without the
 feature, `read` is refused with `bad_request`.
 
 A game's replay of a few seconds of its log is one `read`: a fixed slice, with
 no subscription to close afterwards.
+
+### `offset_for_time`
+
+```json
+{"type": "offset_for_time", "stream": "events", "shard": 2, "at_us": 1792700000000000, "id": 9}
+```
+
+Only with the `time` feature. Finds where a wall-clock time falls in a durable
+stream's log. A page that wants "the record at 14:00 yesterday" no longer has
+to guess an offset and correct it with repeated `read`s: it asks once, then
+starts a [`read`](#read) or a [`subscribe`](#subscribe) at the answer. It needs
+`subscribe` on the stream, as `read` does.
+
+| Field | Meaning |
+|---|---|
+| `stream` | A stream alias whose actions include `subscribe` |
+| `at_us` | The time, in microseconds since the Unix epoch, such as `Date.now() * 1000` |
+| `shard` | Optional: the shard to ask. Leaving it out is shard 0, the only one of a stream of one shard. Offsets are per shard, so ask each shard you follow |
+| `id` | As for `publish`; it comes back on the `offset` or `error` |
+
+The gateway answers with an `offset` message:
+
+```json
+{"type": "offset", "id": 9, "offset": 5400}
+```
+
+`offset` is the first record appended at or after `at_us`. A time before every
+record the shard still holds answers with the oldest offset kept. A time after
+the newest record answers `null`, because no record is that recent yet:
+subscribe from `"live"` to wait for one. The times are those of the broker that
+led the shard when it appended each record, so if that broker's clock stepped
+back, the answer is near the first record after the step rather than exactly
+it.
+
+For example, to read up to 20 records from a time (browser to gateway, then the
+answer, then the next request):
+
+```json
+{"type": "offset_for_time", "stream": "events", "at_us": 1792700000000000, "id": 1}
+{"type": "offset", "id": 1, "offset": 5400}
+{"type": "read", "stream": "events", "from": 5400, "end": 5420, "id": 2}
+```
+
+A lookup counts against the same 4 requests a session may have waiting as a
+`read` does; a fifth is refused at once with `read_failed`. Anything else Felix
+refuses, including a stream with no log such as `presence` and a broker too old to look
+up by time, is an `error` with code `read_failed`. Without the feature, `offset_for_time` is refused with
+`bad_request`.
 
 ### `cache_put`
 
@@ -830,7 +879,7 @@ a session with the `past_end` feature:
 | `counter_failed` | Felix refused or lost a counter add. It may have been counted |
 | `cache_failed` | Felix refused or lost a cache read, write or delete |
 | `state_failed` | Felix refused or could not answer a `state_get` |
-| `read_failed` | Felix refused or could not answer a `read` |
+| `read_failed` | Felix refused or could not answer a `read` or an `offset_for_time` |
 | `trimmed` | A subscription or `read` asked for an offset retention has discarded. `oldest` is the oldest offset left |
 | `past_end` | Only for a session that asked for the `past_end` feature: a `read` or a `subscribe` from an offset asked for one beyond the end of the log. `tail` is the offset the next record will get |
 | `watch_failed` | A cache watch was refused or stopped. Send `cache_watch` again |
