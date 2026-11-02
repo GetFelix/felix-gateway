@@ -11,6 +11,21 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-02
+
+Tested against Felix 0.6.2. Four opt-in additions, each turned on by naming it
+in the `features` of `join`:
+
+- `cache_versions` lets a browser write or delete a cache entry only if nobody
+  changed it since it read it.
+- `past_end` answers a read or subscribe beyond the end of a log with a code
+  and the log's tail.
+- `principal` has `hello` tell a session who Felix knows it as.
+- `time` finds a shard's offset for a wall-clock time.
+
+`state_get` also takes a `shard`, under the `shards` feature from 0.7.0.
+Sessions that do not ask for these features see no change.
+
 ### Added
 
 - The `cache_versions` feature: `cache_value` carries the entry's version, and `cache_put_if` and `cache_delete_if` write only if the entry is absent or still at the version the browser read, answered with `cache_put_result` and `cache_delete_result`. `cacheGetVersioned`, `cachePutIf` and `cacheDeleteIf` in the browser client and its fake. Cache watches carry no versions yet; that needs a change in Felix (GetFelix/felix#1736) (#46).
