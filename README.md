@@ -30,6 +30,9 @@ browser client.
 
 - Publish and subscribe on Felix streams, from a log offset or from live, with
   each event's offset so a browser can see exactly what it missed.
+- Reads of a stream's state (`state_get`) and of a range of its log (`read`),
+  and subscriptions to any shard of a stream. A state read can name its shard,
+  so the offsets it returns are the ones a `read` of that shard understands.
 - Cache reads, writes, deletes and watches, with a per-cache TTL for entries
   such as a presence list.
 - Conditional cache writes: a read names the entry's version, and a write or delete applies only if the entry is still at it, so sessions that all write a key conditionally cannot overwrite each other. A

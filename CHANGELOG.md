@@ -14,6 +14,8 @@ release notes the Felix version it was tested against.
 ### Added
 
 - The `cache_versions` feature: `cache_value` carries the entry's version, and `cache_put_if` and `cache_delete_if` write only if the entry is absent or still at the version the browser read, answered with `cache_put_result` and `cache_delete_result`. `cacheGetVersioned`, `cachePutIf` and `cacheDeleteIf` in the browser client and its fake. Cache watches carry no versions yet; that needs a change in Felix (GetFelix/felix#1736) (#46).
+- `state_get` takes a `shard` under the `shards` feature, and `state_value` echoes it. A browser no longer has to guess how a stream routes entity keys: the `as_of` and `version` it gets are offsets of the shard it named, which a `read` or `subscribe` on that shard understands (#45).
+- The `past_end` feature: a `read` or a `subscribe` from an offset beyond the end of the log is answered with the code `past_end` and the log's `tail`, instead of a message to match (#45).
 
 ### Fixed
 
@@ -21,6 +23,7 @@ release notes the Felix version it was tested against.
 
 ### Changed
 
+- The protocol reference says that `as_of` and `version` are offsets of the shard that answered, and that a `read` of `as_of` on that shard succeeds at once, barring a leader change (#45).
 - Built on and tested against Felix 0.6.2: felix-client and felix-wire 0.6.2, and the dev stack runs the 0.6.2 images.
 
 ## [0.7.0] - 2026-10-23

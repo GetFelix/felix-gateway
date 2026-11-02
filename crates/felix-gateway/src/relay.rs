@@ -24,7 +24,8 @@ use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
     BINARY_EVENTS, CACHE_VERSIONS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES,
-    Join, PROTOCOL, RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE, ServerMessage, StartAt,
+    Join, PAST_END, PROTOCOL, RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE, ServerMessage,
+    StartAt,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -156,6 +157,8 @@ struct Session {
     read: bool,
     /// The session asked for [`SHARDS`].
     shards: bool,
+    /// The session asked for [`PAST_END`].
+    past_end: bool,
     /// The session asked for [`CACHE_VERSIONS`].
     cache_versions: bool,
     /// Range reads sent to Felix whose answer is not yet sent on.
@@ -196,6 +199,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         state,
         read,
         shards,
+        past_end,
         cache_versions,
     }) = join(&mut conn, &gateway, client).await
     else {
@@ -223,6 +227,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         state,
         read,
         shards,
+        past_end,
         cache_versions,
         reads: Arc::default(),
         next_sub: 0,
@@ -439,6 +444,7 @@ impl Session {
                     slot: slot.clone(),
                     shard,
                     sub,
+                    past_end: self.past_end,
                 };
                 let task = tokio::spawn(relay_subscription(
                     target,
@@ -575,10 +581,15 @@ impl Session {
                 stream,
                 key,
                 entity,
+                shard,
                 id,
             } => {
                 let refusal = if !self.state {
                     Some("state_get needs the state feature".to_string())
+                } else if shard.is_some() && !self.shards {
+                    Some("a shard needs the shards feature".to_string())
+                } else if shard.is_some() && !entity.is_empty() {
+                    Some("name a shard or an entity, not both".to_string())
                 } else if !valid_state_key(&key) || !(entity.is_empty() || valid_state_key(&entity))
                 {
                     Some(BAD_STATE_KEY.to_string())
@@ -598,12 +609,30 @@ impl Session {
                 let felix = Arc::clone(&self.felix);
                 let replies = self.replies.clone();
                 tokio::spawn(async move {
-                    let reply = match felix.state_get(&name, &entity, &key).await {
+                    let state = match shard {
+                        Some(shard) => match felix.shard_exists(&name, shard).await {
+                            Ok(Ok(())) => felix.state_get_on_shard(&name, shard, &key).await,
+                            Ok(Err(count)) => {
+                                let reason = format!(
+                                    "the stream has {count} shards, so shard {shard} does not exist"
+                                );
+                                let _ = replies.send(with_id(
+                                    id,
+                                    stream_error(stream, ErrorCode::BadRequest, reason),
+                                ));
+                                return;
+                            }
+                            Err(err) => Err(err),
+                        },
+                        None => felix.state_get(&name, &entity, &key).await,
+                    };
+                    let reply = match state {
                         Ok(state) => ServerMessage::StateValue {
                             id,
                             payload: state.value.map(|bytes| BASE64.encode(bytes)),
                             version: state.version,
                             as_of: state.as_of,
+                            shard,
                         },
                         Err(err) => with_id(id, stream_error(stream, ErrorCode::StateFailed, err)),
                     };
@@ -653,6 +682,7 @@ impl Session {
                 let felix = Arc::clone(&self.felix);
                 let replies = self.replies.clone();
                 let reads = Arc::clone(&self.reads);
+                let past_end = self.past_end;
                 tokio::spawn(async move {
                     let reply = match felix.read(&name, shard, from, end, max).await {
                         Ok(page) => ServerMessage::Records {
@@ -667,9 +697,10 @@ impl Session {
                                 .collect(),
                             next_offset: page.next_offset,
                         },
-                        Err(err) => {
-                            with_id(id, subscription_error(stream, ErrorCode::ReadFailed, err))
-                        }
+                        Err(err) => with_id(
+                            id,
+                            subscription_error(stream, ErrorCode::ReadFailed, err, past_end),
+                        ),
                     };
                     let _ = replies.send(reply);
                     reads.fetch_sub(1, Ordering::Relaxed);
@@ -968,6 +999,7 @@ struct Joined {
     state: bool,
     read: bool,
     shards: bool,
+    past_end: bool,
     cache_versions: bool,
 }
 
@@ -1065,6 +1097,7 @@ async fn accept(
         state: join.features.iter().any(|feature| feature == STATE),
         read: join.features.iter().any(|feature| feature == READ),
         shards: join.features.iter().any(|feature| feature == SHARDS),
+        past_end: join.features.iter().any(|feature| feature == PAST_END),
         cache_versions: join
             .features
             .iter()
@@ -1175,6 +1208,8 @@ struct Target {
     slot: Option<String>,
     shard: Option<u32>,
     sub: Option<u32>,
+    /// The session asked for [`PAST_END`].
+    past_end: bool,
 }
 
 async fn relay_subscription(
@@ -1190,9 +1225,13 @@ async fn relay_subscription(
         slot,
         shard,
         sub,
+        past_end,
     } = target;
     let ended = |code, err| {
-        let mut message = subscription_error(stream.clone(), code, err);
+        // Only a subscribe that fails to open is past the end; a running one
+        // that resumed after a failover ends as `subscription_ended`.
+        let at_open = code == ErrorCode::SubscribeFailed;
+        let mut message = subscription_error(stream.clone(), code, err, past_end && at_open);
         with_slot(&mut message, slot.as_ref());
         with_shard(&mut message, shard);
         Outbound::Message(message)
@@ -1278,16 +1317,34 @@ fn with_shard(message: &mut ServerMessage, shard: Option<u32>) {
 }
 
 /// `trimmed`, naming the oldest offset left, when retention has passed the
-/// offset a subscription or read asked for; `code` otherwise.
-fn subscription_error(stream: String, code: ErrorCode, err: anyhow::Error) -> ServerMessage {
-    let trimmed = err
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<SubscribeCursorError>())
-        .find(|cursor| cursor.reason == CursorErrorReason::TooOld);
+/// offset a subscription or read asked for. With `past_end`, `past_end`
+/// naming the tail when the offset is beyond the log's end. `code` otherwise.
+fn subscription_error(
+    stream: String,
+    code: ErrorCode,
+    err: anyhow::Error,
+    past_end: bool,
+) -> ServerMessage {
+    let cursor = |reason| {
+        err.chain()
+            .filter_map(|cause| cause.downcast_ref::<SubscribeCursorError>())
+            .find(|cursor| cursor.reason == reason)
+            .copied()
+    };
+    let trimmed = cursor(CursorErrorReason::TooOld);
+    let beyond = cursor(CursorErrorReason::InFuture).filter(|_| past_end);
     let mut message = stream_error(stream, code, &err);
-    if let (Some(cursor), ServerMessage::Error { code, oldest, .. }) = (trimmed, &mut message) {
-        *code = ErrorCode::Trimmed;
-        *oldest = Some(cursor.available);
+    if let ServerMessage::Error {
+        code, oldest, tail, ..
+    } = &mut message
+    {
+        if let Some(cursor) = trimmed {
+            *code = ErrorCode::Trimmed;
+            *oldest = Some(cursor.available);
+        } else if let Some(cursor) = beyond {
+            *code = ErrorCode::PastEnd;
+            *tail = Some(cursor.available);
+        }
     }
     message
 }
@@ -1381,6 +1438,7 @@ fn error(code: ErrorCode, err: impl std::fmt::Display) -> ServerMessage {
         cache: None,
         code,
         oldest: None,
+        tail: None,
         retry_after_ms: None,
         message: format!("{err:#}"),
     }
@@ -1488,7 +1546,7 @@ mod tests {
             available: 120,
         })
         .context("subscribe to app.ops.lobby");
-        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, err);
+        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, err, false);
         let ServerMessage::Error {
             code,
             oldest,
@@ -1503,16 +1561,33 @@ mod tests {
             (ErrorCode::Trimmed, Some(120), Some("ops"))
         );
 
-        let future = anyhow::Error::new(SubscribeCursorError {
-            reason: CursorErrorReason::InFuture,
-            requested: 900,
-            available: 10,
-        });
-        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, future);
-        let ServerMessage::Error { code, oldest, .. } = message else {
+        let future = || {
+            anyhow::Error::new(SubscribeCursorError {
+                reason: CursorErrorReason::InFuture,
+                requested: 900,
+                available: 10,
+            })
+        };
+        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, future(), false);
+        let ServerMessage::Error {
+            code, oldest, tail, ..
+        } = message
+        else {
             panic!("{message:?}");
         };
-        assert_eq!((code, oldest), (ErrorCode::SubscribeFailed, None));
+        assert_eq!(
+            (code, oldest, tail),
+            (ErrorCode::SubscribeFailed, None, None)
+        );
+
+        let message = subscription_error("ops".into(), ErrorCode::ReadFailed, future(), true);
+        let ServerMessage::Error {
+            code, oldest, tail, ..
+        } = message
+        else {
+            panic!("{message:?}");
+        };
+        assert_eq!((code, oldest, tail), (ErrorCode::PastEnd, None, Some(10)));
     }
 
     #[test]

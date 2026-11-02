@@ -569,6 +569,31 @@ impl Felix {
         }
     }
 
+    /// `key` in the state of `stream`'s shard `shard`.
+    pub(crate) async fn state_get_on_shard(
+        &self,
+        stream: &str,
+        shard: u32,
+        key: &str,
+    ) -> Result<StateValue> {
+        match &self.link {
+            Link::Own(client) => {
+                client
+                    .state_get_on_shard(&self.tenant, &self.namespace, stream, shard, key)
+                    .await
+            }
+            Link::Shared(session) => {
+                self.on_identity(session, |identity| async move {
+                    identity
+                        .client
+                        .state_get_on_shard(&self.tenant, &self.namespace, stream, shard, key)
+                        .await
+                })
+                .await
+            }
+        }
+    }
+
     /// One page of `stream`'s shard `shard` from `from`, stopping before `end`.
     pub(crate) async fn read(
         &self,

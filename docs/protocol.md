@@ -42,7 +42,8 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `slots` | A `subscribe` may name a `slot`, so one stream can hold more than one subscription on a connection |
   | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
   | `read` | [`read`](#read) reads a range of a durable stream's log without subscribing |
-  | `shards` | A `subscribe` may name the `shard` of a stream to follow, instead of shard 0 |
+  | `shards` | A `subscribe` or a [`state_get`](#state_get) may name the `shard` of a stream, instead of shard 0 or the one an entity key picks |
+  | `past_end` | A `read`, or a `subscribe` from an offset, that asks for an offset beyond the end of the log is answered with the code `past_end` and the log's `tail`, instead of `read_failed` or `subscribe_failed` |
   | `cache_versions` | `cache_value` carries the entry's version, and [`cache_put_if`](#cache_put_if) and [`cache_delete_if`](#cache_delete_if) write only if the entry is still at the version the browser read. Needs a Felix broker from 0.6.0-preview.3 on; against an older one the session's `cache_get` and conditional writes fail with `cache_failed` |
 
 - A `join` asking for another version is refused with `unsupported`.
@@ -141,6 +142,8 @@ subscription, subscribe again from the last offset handled plus one.
 
 An offset the log no longer holds is answered with a `trimmed` error naming the
 oldest offset left of the shard followed.
+An offset past the end of the log is a `subscribe_failed` error, or with the
+`past_end` feature a `past_end` error that names the `tail`.
 
 A subscription follows one shard. To follow several shards of a stream, send
 one `subscribe` per shard, each on a slot of its own, since the replace rule
@@ -212,17 +215,24 @@ carrying the same `id`, which also names the entry's version with the
 
 ```json
 {"type": "state_get", "stream": "ops", "key": "latest", "id": 10}
+{"type": "state_get", "stream": "events", "key": "keyframe", "shard": 3, "id": 11}
 ```
 
 Only with the `state` feature. Reads one key of a stream's state: the keys a
 Felix atomic commit writes together with its event (Felix's
-`docs/atomic-commit.md`). It needs `subscribe` on the stream, as Felix does.
+`docs/atomic-commit.md`). A game can use it to find its newest keyframe in one
+request instead of scanning the log. It needs `subscribe` on the stream, as
+Felix does.
+
+A stream can be split into shards. Each shard has its own log, so its own
+offsets, and its own state. A state read answers for one shard.
 
 | Field | Meaning |
 |---|---|
 | `stream` | A stream alias whose actions include `subscribe` |
 | `key` | 1 to 256 printable ASCII characters, without spaces. `/` is allowed |
 | `entity` | Optional: the entity key that picks the stream's shard, as the writer's commit named it, under the same rule as `key`. A writer whose entity keys fall outside that rule cannot be read through the gateway. Leaving it out is the empty key, which is enough on a stream of one shard |
+| `shard` | Only with the `shards` feature, optional: the shard to read, instead of the one `entity` picks. It cannot be combined with `entity`. A shard past the stream's shard count is refused with `bad_request`, as is any `shard` without the feature |
 | `id` | As for `publish`; it comes back on the `state_value` or `error` |
 
 The gateway answers with a `state_value` message. Its `version` is the offset
@@ -230,6 +240,33 @@ of the commit that wrote the value, so a browser can subscribe from it and get
 that commit's event first. Without the feature, `state_get` is refused with
 `bad_request`. A read Felix refuses or cannot answer is an `error` with code
 `state_failed`.
+
+#### Which shard answered
+
+`version` and `as_of` are offsets in the log of the shard that answered, and
+only a `read` or `subscribe` on that same shard understands them. With an
+`entity` the shard is picked by the stream's own routing, fixed when the stream
+is created: either a hash of the entity key modulo the shard count, or a jump
+consistent hash of it. The answer does not report which shard that was. Guess
+it wrong and the offsets belong to another shard. For example, say `d01` routes
+to shard 1, which holds records up to offset 5040, and the page assumed shard 3,
+which holds only up to 5028:
+
+```json
+{"type": "state_get", "stream": "events", "key": "keyframe", "entity": "d01", "id": 1}
+{"type": "state_value", "id": 1, "payload": "AQI=", "version": 5012, "as_of": 5040}
+{"type": "read", "stream": "events", "from": 5039, "shard": 3, "id": 2}
+{"type": "error", "id": 2, "stream": "events", "code": "read_failed", "message": "offset 5039 is past the end of the stream; tail is 5029"}
+```
+
+If the page does not know how the stream routes, name the shard and leave out
+`entity`. The answer repeats the `shard`, and `as_of` can be read on it at
+once:
+
+```json
+{"type": "state_get", "stream": "events", "key": "keyframe", "shard": 3, "id": 3}
+{"type": "state_value", "id": 3, "payload": "AQI=", "version": 5001, "as_of": 5028, "shard": 3}
+```
 
 ### `read`
 
@@ -256,8 +293,9 @@ records, is capped in records and bytes by the broker, and never waits: once
 it reaches what is committed it comes back short or empty. Read the next page
 from its `next_offset`; the range is done once that reaches `end`. An offset
 retention has discarded is an `error` with code `trimmed` and the `oldest`
-offset left. Anything else Felix refuses, such as an offset past the tail or a
-stream with no log, is an `error` with code `read_failed`. A session may
+offset left. An offset past the tail is an `error` with code `read_failed`, or with the
+`past_end` feature `past_end` and the `tail`. Anything else Felix refuses,
+such as a stream with no log, is `read_failed`. A session may
 have 4 reads waiting for their answer at once; a fifth is refused at once with
 `read_failed`. Without the
 feature, `read` is refused with `bad_request`.
@@ -693,7 +731,8 @@ absent.
 | `id` | The `state_get` it answers |
 | `payload` | The value in base64, or `null` when the key was never written or was deleted |
 | `version` | The offset of the commit that wrote the value, or `null` with no value |
-| `as_of` | The offset of the last commit the answer reflects. Every commit at or below it is reflected, and its event can be read from the stream |
+| `as_of` | The offset of the last commit the answer reflects. Every commit at or below it is reflected, and its event can be read from the shard's log, so a `read` of `as_of` on that shard succeeds as soon as the answer arrives, unless the shard's leader changed in between and the new one does not have it. Commits after it are not reflected. Like `version`, it is an offset of the shard that answered |
+| `shard` | Present only when the `state_get` named one |
 
 ### `records`
 
@@ -741,9 +780,16 @@ time keeps the browser's own clock out of it.
 `id` is present when the error answers one request, and `stream` or `cache`
 when it is about one stream or cache. `slot` is present on an error about a
 subscription that named one, and `shard` on one that named a shard.
-`oldest` is present only on `trimmed`,
+`oldest` is present only on `trimmed`, `tail` only on `past_end`,
 and `retry_after_ms` only on `rate_limited`.
 The connection stays open after any error except an answer to `join`.
+
+A `read` or `subscribe` that asks for an offset beyond the end of the log, from
+a session with the `past_end` feature:
+
+```json
+{"type": "error", "id": 2, "stream": "events", "code": "past_end", "tail": 5029, "message": "offset 5039 is past the end of the stream; tail is 5029"}
+```
 
 | Code | Meaning |
 |---|---|
@@ -757,6 +803,7 @@ The connection stays open after any error except an answer to `join`.
 | `state_failed` | Felix refused or could not answer a `state_get` |
 | `read_failed` | Felix refused or could not answer a `read` |
 | `trimmed` | A subscription or `read` asked for an offset retention has discarded. `oldest` is the oldest offset left |
+| `past_end` | Only for a session that asked for the `past_end` feature: a `read` or a `subscribe` from an offset asked for one beyond the end of the log. `tail` is the offset the next record will get |
 | `watch_failed` | A cache watch was refused or stopped. Send `cache_watch` again |
 | `rate_limited` | Only for a session that asked for the `rate_limited` feature. A gateway [limit](#limits) refused the write, or the `join`. Nothing reached Felix. `retry_after_ms`, when present, is how long until the write would fit |
 | `forbidden`, `signed_out`, `unavailable` | Only in answer to `join`; see [`join`](#join) |
