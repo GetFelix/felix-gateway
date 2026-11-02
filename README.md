@@ -185,7 +185,7 @@ and the lockfiles, and merges it once CI passes. Prereleases are skipped.
 
 Every night a workflow ([`felix-nightly.yml`](.github/workflows/felix-nightly.yml))
 points this repo at the commit behind Felix's `nightly` tag and runs
-[`.github/felix-nightly.sh`](.github/felix-nightly.sh): it starts the dev stack from the `:nightly` Felix images and runs the integration tests, over a session per connection and over shared connections. A failure opens an
+[`.github/felix-nightly.sh`](.github/felix-nightly.sh): it starts the dev stack from the `:nightly` Felix images and runs the relay tests, over a session per connection and over shared connections. A failure opens an
 issue labelled `felix-nightly` and a green run closes it, so a Felix change that
 breaks this repo shows up before the next release. See the latest run with
 `gh run list -R GetFelix/felix-gateway --workflow "Felix nightly" --limit 1`, or start

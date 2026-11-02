@@ -8,8 +8,6 @@ on:
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
-  push:
-    branches: [ci/felix-nightly]
 
 permissions:
   contents: read
@@ -19,6 +17,6 @@ jobs:
     permissions:
       contents: read
       issues: write
-    uses: GetFelix/.github/.github/workflows/felix-nightly.yml@felix-ci-nightly
+    uses: GetFelix/.github/.github/workflows/felix-nightly.yml@main
     with:
       timeout_minutes: 45
