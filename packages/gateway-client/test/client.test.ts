@@ -86,7 +86,9 @@ describe("GatewayClient", () => {
 
     // The same function as in docs/protocol.md, "publish".
     function unstamp(payload: Uint8Array): { sender: string; record: Uint8Array } {
-      const length = new DataView(payload.buffer, payload.byteOffset).getUint16(0); // big-endian
+      const length = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint16(
+        0,
+      ); // big-endian
       return {
         sender: new TextDecoder().decode(payload.subarray(2, 2 + length)),
         record: payload.subarray(2 + length),
