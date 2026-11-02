@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use felix_wire::CacheCondition;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -18,6 +19,8 @@ pub const FEATURES: &[&str] = &[
     STATE,
     READ,
     SHARDS,
+    PAST_END,
+    CACHE_VERSIONS,
     PRINCIPAL,
 ];
 
@@ -45,6 +48,15 @@ pub const READ: &str = "read";
 /// The feature under which a `subscribe` may name the `shard` of a stream to
 /// follow.
 pub const SHARDS: &str = "shards";
+
+/// The feature under which a read or a subscribe from an offset past the end
+/// of the log is answered with [`ErrorCode::PastEnd`] and the `tail`, instead
+/// of the request's own failure code.
+pub const PAST_END: &str = "past_end";
+/// The feature under which cache reads carry the entry's version and a
+/// session may write conditionally, with `cache_put_if` and
+/// `cache_delete_if`.
+pub const CACHE_VERSIONS: &str = "cache_versions";
 
 /// The feature under which `hello` names the session's Felix principal, the
 /// one `stamp_sender` writes in front of its records.
@@ -134,6 +146,10 @@ pub enum ClientMessage {
         /// means the empty key, which is enough for a stream of one shard.
         #[serde(default)]
         entity: String,
+        /// With [`SHARDS`]: the shard to read, instead of the one `entity`
+        /// routes to.
+        #[serde(default)]
+        shard: Option<u32>,
         id: u64,
     },
     /// With [`READ`]: one page of a durable stream's records from `from`,
@@ -163,6 +179,26 @@ pub enum ClientMessage {
     },
     /// Delete one cache entry.
     CacheDelete { cache: String, key: String },
+    /// With [`CACHE_VERSIONS`]: write one cache entry only if it meets
+    /// `condition`. Answered with a [`ServerMessage::CachePutResult`]
+    /// carrying the same `id`.
+    CachePutIf {
+        cache: String,
+        key: String,
+        payload: String,
+        #[serde(rename = "if")]
+        condition: CacheCondition,
+        id: u64,
+    },
+    /// With [`CACHE_VERSIONS`]: delete one cache entry only if it is at
+    /// `version`. Answered with a [`ServerMessage::CacheDeleteResult`]
+    /// carrying the same `id`.
+    CacheDeleteIf {
+        cache: String,
+        key: String,
+        version: u64,
+        id: u64,
+    },
     /// Send the cache's entries as one [`ServerMessage::CacheEntries`], then
     /// every change as a [`ServerMessage::CacheChange`]. Replaces an earlier
     /// watch of the same cache.
@@ -240,7 +276,32 @@ pub enum ServerMessage {
     Counter { id: u64, value: i64 },
     /// The entry for the `cache_get` with this `id`, base64, or `null` when
     /// there is none.
-    CacheValue { id: u64, payload: Option<String> },
+    CacheValue {
+        id: u64,
+        payload: Option<String>,
+        /// With [`CACHE_VERSIONS`]: the entry's version, `null` when there is
+        /// no entry. Absent for a session without the feature.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<Option<u64>>,
+    },
+    /// The answer to the `cache_put_if` with this `id`.
+    CachePutResult {
+        id: u64,
+        /// Whether the condition held and the entry was written.
+        applied: bool,
+        /// The version written when applied, otherwise the entry's current
+        /// one, `null` when it has none.
+        version: Option<u64>,
+    },
+    /// The answer to the `cache_delete_if` with this `id`.
+    CacheDeleteResult {
+        id: u64,
+        /// Whether the entry was at the version and was deleted.
+        applied: bool,
+        /// `null` when applied, otherwise the entry's current version, `null`
+        /// when it has none.
+        version: Option<u64>,
+    },
     /// The key for the `state_get` with this `id`.
     StateValue {
         id: u64,
@@ -251,6 +312,9 @@ pub enum ServerMessage {
         version: Option<u64>,
         /// The offset of the last commit the answer reflects.
         as_of: Option<u64>,
+        /// The shard the `state_get` named, when it named one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shard: Option<u32>,
     },
     /// The page for the `read` with this `id`.
     Records {
@@ -293,6 +357,9 @@ pub enum ServerMessage {
         /// With [`ErrorCode::Trimmed`]: the oldest offset the log still holds.
         #[serde(skip_serializing_if = "Option::is_none")]
         oldest: Option<u64>,
+        /// With [`ErrorCode::PastEnd`]: the offset the next record will get.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tail: Option<u64>,
         /// With [`ErrorCode::RateLimited`]: milliseconds until the write
         /// would fit.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,6 +395,9 @@ pub enum ErrorCode {
     ReadFailed,
     /// The subscription asked for an offset the log no longer holds.
     Trimmed,
+    /// The read or subscribe asked for an offset beyond the end of the log.
+    /// Only for sessions that asked for [`PAST_END`].
+    PastEnd,
     /// The join carried no usable sign-in. Sign in again.
     SignedOut,
     /// The signed-in user may not open this scope.
@@ -516,6 +586,7 @@ mod tests {
                 stream: "ops".into(),
                 key: "match/3".into(),
                 entity: String::new(),
+                shard: None,
                 id: 6
             }
         );
@@ -527,18 +598,37 @@ mod tests {
                 stream: "ops".into(),
                 key: "k".into(),
                 entity: "e".into(),
+                shard: None,
                 id: 7
             }
         );
-        let value = ServerMessage::StateValue {
+        assert_eq!(
+            parse(json!({"type": "state_get", "stream": "ops", "key": "k", "shard": 3, "id": 8})),
+            ClientMessage::StateGet {
+                stream: "ops".into(),
+                key: "k".into(),
+                entity: String::new(),
+                shard: Some(3),
+                id: 8
+            }
+        );
+        let value = |shard| ServerMessage::StateValue {
             id: 6,
             payload: Some("AQI=".into()),
             version: Some(40),
             as_of: Some(42),
+            shard,
         };
         assert_eq!(
-            serde_json::to_value(&value).unwrap(),
+            serde_json::to_value(value(None)).unwrap(),
             json!({"type": "state_value", "id": 6, "payload": "AQI=", "version": 40, "as_of": 42})
+        );
+        assert_eq!(
+            serde_json::to_value(value(Some(3))).unwrap(),
+            json!({
+                "type": "state_value", "id": 6, "payload": "AQI=", "version": 40,
+                "as_of": 42, "shard": 3
+            })
         );
     }
 
@@ -623,14 +713,90 @@ mod tests {
     }
 
     #[test]
+    fn parses_conditional_writes_and_serializes_their_answers() {
+        assert_eq!(
+            parse(json!({
+                "type": "cache_put_if", "cache": "world", "key": "c_3", "payload": "AQ==",
+                "if": {"version": 5400}, "id": 12
+            })),
+            ClientMessage::CachePutIf {
+                cache: "world".into(),
+                key: "c_3".into(),
+                payload: "AQ==".into(),
+                condition: CacheCondition::Version(5400),
+                id: 12
+            }
+        );
+        assert_eq!(
+            parse(json!({
+                "type": "cache_put_if", "cache": "world", "key": "c_3", "payload": "AQ==",
+                "if": "absent", "id": 13
+            })),
+            ClientMessage::CachePutIf {
+                cache: "world".into(),
+                key: "c_3".into(),
+                payload: "AQ==".into(),
+                condition: CacheCondition::Absent,
+                id: 13
+            }
+        );
+        assert_eq!(
+            parse(json!({
+                "type": "cache_delete_if", "cache": "world", "key": "c_3", "version": 9, "id": 14
+            })),
+            ClientMessage::CacheDeleteIf {
+                cache: "world".into(),
+                key: "c_3".into(),
+                version: 9,
+                id: 14
+            }
+        );
+        let refused = ServerMessage::CachePutResult {
+            id: 12,
+            applied: false,
+            version: Some(5480),
+        };
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap(),
+            json!({"type": "cache_put_result", "id": 12, "applied": false, "version": 5480})
+        );
+        let deleted = ServerMessage::CacheDeleteResult {
+            id: 14,
+            applied: true,
+            version: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&deleted).unwrap(),
+            json!({"type": "cache_delete_result", "id": 14, "applied": true, "version": null})
+        );
+    }
+
+    #[test]
     fn serializes_cache_answers_flat() {
         let none = ServerMessage::CacheValue {
             id: 5,
             payload: None,
+            version: None,
         };
         assert_eq!(
             serde_json::to_value(&none).unwrap(),
             json!({"type": "cache_value", "id": 5, "payload": null})
+        );
+        let versioned = |payload, version| {
+            serde_json::to_value(ServerMessage::CacheValue {
+                id: 5,
+                payload,
+                version: Some(version),
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            versioned(Some("AQ==".into()), Some(7)),
+            json!({"type": "cache_value", "id": 5, "payload": "AQ==", "version": 7})
+        );
+        assert_eq!(
+            versioned(None, None),
+            json!({"type": "cache_value", "id": 5, "payload": null, "version": null})
         );
         let left = ServerMessage::CacheChange {
             cache: "members".into(),
@@ -675,6 +841,7 @@ mod tests {
             cache: None,
             code: ErrorCode::RateLimited,
             oldest: None,
+            tail: None,
             retry_after_ms: Some(120),
             message: "slow down".into(),
         };

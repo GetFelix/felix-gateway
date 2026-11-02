@@ -42,7 +42,9 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `slots` | A `subscribe` may name a `slot`, so one stream can hold more than one subscription on a connection |
   | `state` | [`state_get`](#state_get) reads a key of a stream's state, which Felix's atomic commits write |
   | `read` | [`read`](#read) reads a range of a durable stream's log without subscribing |
-  | `shards` | A `subscribe` may name the `shard` of a stream to follow, instead of shard 0 |
+  | `shards` | A `subscribe` or a [`state_get`](#state_get) may name the `shard` of a stream, instead of shard 0 or the one an entity key picks |
+  | `past_end` | A `read`, or a `subscribe` from an offset, that asks for an offset beyond the end of the log is answered with the code `past_end` and the log's `tail`, instead of `read_failed` or `subscribe_failed` |
+  | `cache_versions` | `cache_value` carries the entry's version, and [`cache_put_if`](#cache_put_if) and [`cache_delete_if`](#cache_delete_if) write only if the entry is still at the version the browser read. Needs a Felix broker from 0.6.0-preview.3 on; against an older one the session's `cache_get` and conditional writes fail with `cache_failed` |
   | `principal` | `hello` names the session's Felix principal in `principal` |
 
 - A `join` asking for another version is refused with `unsupported`.
@@ -141,6 +143,8 @@ subscription, subscribe again from the last offset handled plus one.
 
 An offset the log no longer holds is answered with a `trimmed` error naming the
 oldest offset left of the shard followed.
+An offset past the end of the log is a `subscribe_failed` error, or with the
+`past_end` feature a `past_end` error that names the `tail`.
 
 A subscription follows one shard. To follow several shards of a stream, send
 one `subscribe` per shard, each on a slot of its own, since the replace rule
@@ -220,23 +224,31 @@ counted.
 
 Reads one entry of a cache whose actions include `read`. `key` follows the
 rule for `counter_add`. The gateway answers with a `cache_value` message
-carrying the same `id`.
+carrying the same `id`, which also names the entry's version with the
+`cache_versions` feature.
 
 ### `state_get`
 
 ```json
 {"type": "state_get", "stream": "ops", "key": "latest", "id": 10}
+{"type": "state_get", "stream": "events", "key": "keyframe", "shard": 3, "id": 11}
 ```
 
 Only with the `state` feature. Reads one key of a stream's state: the keys a
 Felix atomic commit writes together with its event (Felix's
-`docs/atomic-commit.md`). It needs `subscribe` on the stream, as Felix does.
+`docs/atomic-commit.md`). A game can use it to find its newest keyframe in one
+request instead of scanning the log. It needs `subscribe` on the stream, as
+Felix does.
+
+A stream can be split into shards. Each shard has its own log, so its own
+offsets, and its own state. A state read answers for one shard.
 
 | Field | Meaning |
 |---|---|
 | `stream` | A stream alias whose actions include `subscribe` |
 | `key` | 1 to 256 printable ASCII characters, without spaces. `/` is allowed |
 | `entity` | Optional: the entity key that picks the stream's shard, as the writer's commit named it, under the same rule as `key`. A writer whose entity keys fall outside that rule cannot be read through the gateway. Leaving it out is the empty key, which is enough on a stream of one shard |
+| `shard` | Only with the `shards` feature, optional: the shard to read, instead of the one `entity` picks. It cannot be combined with `entity`. A shard past the stream's shard count is refused with `bad_request`, as is any `shard` without the feature |
 | `id` | As for `publish`; it comes back on the `state_value` or `error` |
 
 The gateway answers with a `state_value` message. Its `version` is the offset
@@ -244,6 +256,33 @@ of the commit that wrote the value, so a browser can subscribe from it and get
 that commit's event first. Without the feature, `state_get` is refused with
 `bad_request`. A read Felix refuses or cannot answer is an `error` with code
 `state_failed`.
+
+#### Which shard answered
+
+`version` and `as_of` are offsets in the log of the shard that answered, and
+only a `read` or `subscribe` on that same shard understands them. With an
+`entity` the shard is picked by the stream's own routing, fixed when the stream
+is created: either a hash of the entity key modulo the shard count, or a jump
+consistent hash of it. The answer does not report which shard that was. Guess
+it wrong and the offsets belong to another shard. For example, say `d01` routes
+to shard 1, which holds records up to offset 5040, and the page assumed shard 3,
+which holds only up to 5028:
+
+```json
+{"type": "state_get", "stream": "events", "key": "keyframe", "entity": "d01", "id": 1}
+{"type": "state_value", "id": 1, "payload": "AQI=", "version": 5012, "as_of": 5040}
+{"type": "read", "stream": "events", "from": 5039, "shard": 3, "id": 2}
+{"type": "error", "id": 2, "stream": "events", "code": "read_failed", "message": "offset 5039 is past the end of the stream; tail is 5029"}
+```
+
+If the page does not know how the stream routes, name the shard and leave out
+`entity`. The answer repeats the `shard`, and `as_of` can be read on it at
+once:
+
+```json
+{"type": "state_get", "stream": "events", "key": "keyframe", "shard": 3, "id": 3}
+{"type": "state_value", "id": 3, "payload": "AQI=", "version": 5001, "as_of": 5028, "shard": 3}
+```
 
 ### `read`
 
@@ -270,8 +309,9 @@ records, is capped in records and bytes by the broker, and never waits: once
 it reaches what is committed it comes back short or empty. Read the next page
 from its `next_offset`; the range is done once that reaches `end`. An offset
 retention has discarded is an `error` with code `trimmed` and the `oldest`
-offset left. Anything else Felix refuses, such as an offset past the tail or a
-stream with no log, is an `error` with code `read_failed`. A session may
+offset left. An offset past the tail is an `error` with code `read_failed`, or with the
+`past_end` feature `past_end` and the `tail`. Anything else Felix refuses,
+such as a stream with no log, is `read_failed`. A session may
 have 4 reads waiting for their answer at once; a fifth is refused at once with
 `read_failed`. Without the
 feature, `read` is refused with `bad_request`.
@@ -315,6 +355,87 @@ bad scope or key or a cache that does not allow `write`, 403 with the
 refusal as an `error` message, or 429 when its sender is over the write
 rate.
 
+### `cache_put_if`
+
+Two sessions that write the same cache key with `cache_put` overwrite each
+other, and the later write wins without anyone noticing. A shared editor that
+keeps one chunk per key needs the write to fail when the chunk changed since
+the session read it. `cache_put_if` is that: it writes only if the entry is
+still at the version the session read, and otherwise says what the version is
+now.
+
+```json
+{"type": "cache_put_if", "cache": "world", "key": "c_3_-1_0", "payload": "gqRu...", "if": {"version": 5400}, "id": 12}
+{"type": "cache_put_if", "cache": "world", "key": "c_3_-1_0", "payload": "gqRu...", "if": "absent", "id": 13}
+```
+
+Only with the `cache_versions` feature, which also adds the `version` to
+[`cache_value`](#cache_value). It needs a cache whose actions include `write`.
+
+| Field | Meaning |
+|---|---|
+| `cache`, `key`, `payload` | As for `cache_put`. The entry gets the cache's `ttl_s` when it has one |
+| `if` | `"absent"` when the key has no live entry (never written, deleted or expired), or `{"version": n}` when its entry is at version `n`, as a `cache_value` or an earlier answer named it |
+| `id` | As for `publish`; it comes back on the `cache_put_result` or `error` |
+
+The gateway answers with a [`cache_put_result`](#cache_put_result-and-cache_delete_result).
+A refused write is an answer, not an error: `applied` is false and `version`
+is the entry's current version. Read the key again to get the newer value,
+rebase the edit on it, and write at the new version:
+
+```ts
+import type { Gateway } from "felix-gateway-client";
+
+/** Apply `edit` to a cache entry, trying again whenever someone else wrote it first. */
+async function update(
+  client: Gateway,
+  cache: string,
+  key: string,
+  edit: (current: Uint8Array | null) => Uint8Array,
+): Promise<void> {
+  for (;;) {
+    const entry = await client.cacheGetVersioned(cache, key);
+    const result = await client.cachePutIf(
+      cache,
+      key,
+      edit(entry?.payload ?? null),
+      entry ? { version: entry.version } : "absent",
+    );
+    if (result.applied) return;
+  }
+}
+```
+
+An `error` with code `cache_failed` and the `id` means Felix refused the write
+or could not say whether it applied, for instance because the connection was
+lost. A write over a limit has the same code when the session did not ask for
+`rate_limited`, and then never reached Felix. The gateway never sends a write
+again, because a retry of one that did apply would be refused by the version it
+wrote.
+
+After a failure with an unknown outcome, such as `cache_failed` after a lost
+connection or a `closed` rejection in the browser client, read the key before
+writing again, and do not rerun an edit that is not safe to repeat. The earlier
+write may still land after the read. A write conditioned on version `v` cannot
+land once the read shows another version, but a write conditioned on `"absent"`
+can. An edit that must apply exactly once should carry an id in the payload that
+the next read can check for.
+
+The write goes out in the order the browser sent it, after its earlier writes,
+and counts against the write [limits](#limits) like `cache_put`. A write over a
+limit is an `error` carrying its `id`. Without the feature the message is
+refused with `bad_request`.
+
+### `cache_delete_if`
+
+```json
+{"type": "cache_delete_if", "cache": "world", "key": "c_3_-1_0", "version": 5400, "id": 14}
+```
+
+Only with the `cache_versions` feature. Deletes one entry, needing `write`,
+only if it is at `version`. Ordered, limited, answered and refused like
+`cache_put_if`, with a `cache_delete_result`.
+
 ### `cache_watch`
 
 ```json
@@ -348,18 +469,97 @@ gateway.
 
 ### Subscribe before reading
 
-When a cache holds a fold of a stream up to some offset, as a snapshot would,
-read it after subscribing, never before:
+A page that opens a room needs the history it missed and everything that
+happens from then on. When the history is a snapshot held in a cache, as when
+an app saves its state every few seconds, the order of the steps matters:
+read the snapshot first and any record published between the read and the
+subscribe is lost. Subscribe first.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant G as Gateway
+    B->>G: subscribe ops from live
+    G-->>B: subscribed, live_offset 10
+    B->>G: cache_get snap
+    G-->>B: cache_value, covers events through 6
+    B->>G: subscribe ops from 7
+    G-->>B: subscribed, live_offset 10
+    G-->>B: events 7, 8 and 9: the history
+    G-->>B: event 10 and on, as they are published
+```
 
 1. `subscribe` to the stream from `"live"` and wait for `subscribed`. Its
-   `live_offset` is the tail `L`, and every record from `L` on will arrive as
-   an event, including any published while the next step is in flight.
-2. `cache_get` the fold. Say it covers the stream through offset `N`.
-3. Drop buffered events at or below `N`. If `N + 1 < L`, `subscribe` again
-   from `N + 1` to read the records in between. With no fold, subscribe from 0.
+   `live_offset` is the tail `L`. Every event published from now on arrives,
+   including those published while the next steps run. Buffer them.
+2. `cache_get` the snapshot. Say it covers the stream through offset `N`. The
+   app has to record `N` itself, for example in the snapshot's payload next to
+   the state, when it writes the snapshot.
+3. Compare `N + 1` with `L`:
+   - If `N + 1 >= L`, the snapshot already covers the history. Drop the
+     buffered events at or below `N` and apply the rest in order.
+   - Otherwise events `N + 1` to `L - 1` are in neither the snapshot nor the
+     buffer. `subscribe` again from `N + 1`. That replaces the live
+     subscription and delivers everything from `N + 1` on, so discard the
+     buffer and use the new subscription's events. With no snapshot, subscribe
+     from 0.
+4. After subscribing again, the new `subscribed` has a `live_offset` of its
+   own, `L2`. The history is complete once the event at offset `L2 - 1` has
+   arrived on the new subscription. Events after it are live. If `L2` is no
+   higher than the offset subscribed from, there is no history to wait for.
 
-Reading first would lose the records published between the read and the
-subscribe.
+In the example, the log holds events 0 to 9, so `L` is 10. The snapshot covers
+through 6, so the page subscribes again from 7. Events 7, 8 and 9 arrive, and
+the one at `L2 - 1 = 9` ends the wait. Had the snapshot covered through 9,
+`N + 1` would equal `L`, nothing would be missing, and the page would apply the
+buffered events from 10 on directly. A stream with no log, such as `presence`,
+has no history: its `live_offset` is `null`. The steps run per subscription, so
+a page that follows several slots or shards runs them for each.
+
+Take the target from the second `subscribed`, never from the first. Against a
+Felix 0.6.0 broker, `L` can be larger than the offset after the last event, and
+nothing ever arrives at `L - 1`; see [`subscribed`](#subscribed). The second
+`live_offset` is right on every Felix version.
+
+The same step in the browser client. It ignores anything that arrives before
+the new `subscribed`, because that is the replaced subscription's, and the new
+one delivers it again. (With `binary_events`, a frame's `sub` number tells the
+two subscriptions apart too.) It rejects if the subscribe fails, for instance
+with `trimmed` when retention has already passed the snapshot's offset; the page
+then needs a newer snapshot, or it reads from the oldest offset the log still
+holds, which the `error` message gives as `oldest`.
+
+```ts
+import type { Gateway, GatewayEvent } from "felix-gateway-client";
+
+/**
+ * Subscribe to `stream` from `from` and resolve once every event the log
+ * already held has reached `apply`. Later events keep arriving at `apply`.
+ */
+function catchUp(
+  client: Gateway,
+  stream: string,
+  from: number,
+  apply: (event: GatewayEvent) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let target: number | null = null; // the offset where the history ends
+    client.onSubscribed = (_stream, _start, live) => {
+      target = live ?? 0;
+      if (from >= target) resolve(); // nothing to wait for
+    };
+    client.onEvent = (event) => {
+      if (target === null) return; // from the subscription this one replaced
+      apply(event);
+      if (event.offset !== null && event.offset + 1 >= target) resolve();
+    };
+    client.onError = (error, failed) => {
+      if (failed === stream) reject(error);
+    };
+    client.subscribe(stream, from);
+  });
+}
+```
 
 ### More than one connection
 
@@ -409,10 +609,30 @@ on a `stamp_sender` stream, joins with the `principal` feature:
 ```
 
 The subscription is registered with the broker. Anything published from this
-point on will be delivered. `start_offset` is the first offset this
-subscription delivers and `live_offset` is the stream's tail when it was
-registered; both are `null` on a stream with no log, such as `presence`. From
-`"live"` the two are equal.
+point on will be delivered.
+
+| Field | Meaning |
+|---|---|
+| `start_offset` | The first offset this subscription delivers |
+| `live_offset` | Where the history ends and live delivery begins. The events below it were in the log when the subscription registered, and it delivers those from `start_offset` first. Everything from `live_offset` on is published afterwards |
+
+Both are `null` on a stream with no log, such as `presence`. From `"live"` the
+two are equal, because there is no history to deliver.
+
+When `live_offset` is above `start_offset`, the offset `live_offset - 1` holds
+an event, so a browser catching up is done once it has handled that offset. A
+record that holds no event can sit in the middle of the range, where
+`skipped_before` counts it, but not at its end. The usual one is a
+generation-start record: a marker a new leader writes into the log, which takes
+an offset and is never delivered.
+
+The exception is a `"live"` subscribe to a Felix 0.6.0 broker. It reports the
+raw tail of the log, the offset the next record will get, which can sit past such
+a record, so nothing ever arrives
+at `live_offset - 1`. Felix 0.6.1 and later end the tail before it, and a
+subscribe from an offset does on every version. A browser that must work
+against 0.6.0 therefore takes its target from a subscribe from an offset, as
+[Subscribe before reading](#subscribe-before-reading) does.
 
 `slot` and `shard` are present when the `subscribe` named them; a
 `subscribe` without a `shard` is answered exactly as before. `start_offset`
@@ -500,6 +720,30 @@ The counter's sum after the `counter_add` with this `id`.
 The answer to `cache_get`: the entry's bytes in base64, or `null` when there
 is none.
 
+```json
+{"type": "cache_value", "id": 9, "payload": "hKF2AaZvZmZzZXTN...", "version": 5400}
+```
+
+With the `cache_versions` feature the answer also has a `version`, the number
+a `cache_put_if` or `cache_delete_if` names to write only if the entry is
+unchanged. It is `null` when there is no entry. A key's version changes on
+every write to it and is never reused, so reading the same version twice
+means nothing was written in between. Without the feature the field is
+absent.
+
+### `cache_put_result` and `cache_delete_result`
+
+```json
+{"type": "cache_put_result", "id": 12, "applied": false, "version": 5480}
+{"type": "cache_delete_result", "id": 14, "applied": true, "version": null}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | The `cache_put_if` or `cache_delete_if` it answers |
+| `applied` | Whether the condition held and the write was made |
+| `version` | For an applied put, the version it wrote. Otherwise the entry's current version, `null` when it has none, which is also what an applied delete leaves |
+
 ### `state_value`
 
 ```json
@@ -511,7 +755,8 @@ is none.
 | `id` | The `state_get` it answers |
 | `payload` | The value in base64, or `null` when the key was never written or was deleted |
 | `version` | The offset of the commit that wrote the value, or `null` with no value |
-| `as_of` | The offset of the last commit the answer reflects. Every commit at or below it is reflected, and its event can be read from the stream |
+| `as_of` | The offset of the last commit the answer reflects. Every commit at or below it is reflected, and its event can be read from the shard's log, so a `read` of `as_of` on that shard succeeds as soon as the answer arrives, unless the shard's leader changed in between and the new one does not have it. Commits after it are not reflected. Like `version`, it is an offset of the shard that answered |
+| `shard` | Present only when the `state_get` named one |
 
 ### `records`
 
@@ -539,6 +784,11 @@ is none.
 | `payload` | The entry, base64, or `null` when it was deleted |
 | `expires_in_ms` | Milliseconds until the entry expires, measured on the gateway's clock when it relayed the change; `null` for an entry with no TTL |
 
+These carry no version, even with `cache_versions`, because Felix's watch does
+not report one yet. A browser that watches a cache and then writes with
+`cache_put_if` reads the key with `cache_get` first to learn the version to
+name.
+
 An entry that expires arrives as a `cache_change` with `payload` `null`,
 within about a second of its TTL passing (Felix 0.6.0-preview.2 and later).
 Reads treat it as gone at once, so a browser that needs the exact moment can
@@ -554,9 +804,16 @@ time keeps the browser's own clock out of it.
 `id` is present when the error answers one request, and `stream` or `cache`
 when it is about one stream or cache. `slot` is present on an error about a
 subscription that named one, and `shard` on one that named a shard.
-`oldest` is present only on `trimmed`,
+`oldest` is present only on `trimmed`, `tail` only on `past_end`,
 and `retry_after_ms` only on `rate_limited`.
 The connection stays open after any error except an answer to `join`.
+
+A `read` or `subscribe` that asks for an offset beyond the end of the log, from
+a session with the `past_end` feature:
+
+```json
+{"type": "error", "id": 2, "stream": "events", "code": "past_end", "tail": 5029, "message": "offset 5039 is past the end of the stream; tail is 5029"}
+```
 
 | Code | Meaning |
 |---|---|
@@ -570,6 +827,7 @@ The connection stays open after any error except an answer to `join`.
 | `state_failed` | Felix refused or could not answer a `state_get` |
 | `read_failed` | Felix refused or could not answer a `read` |
 | `trimmed` | A subscription or `read` asked for an offset retention has discarded. `oldest` is the oldest offset left |
+| `past_end` | Only for a session that asked for the `past_end` feature: a `read` or a `subscribe` from an offset asked for one beyond the end of the log. `tail` is the offset the next record will get |
 | `watch_failed` | A cache watch was refused or stopped. Send `cache_watch` again |
 | `rate_limited` | Only for a session that asked for the `rate_limited` feature. A gateway [limit](#limits) refused the write, or the `join`. Nothing reached Felix. `retry_after_ms`, when present, is how long until the write would fit |
 | `forbidden`, `signed_out`, `unavailable` | Only in answer to `join`; see [`join`](#join) |
@@ -587,7 +845,7 @@ stop at a refused one and resend from there.
 |---|---|---|
 | A `publish` over a rate | `rate_limited`, with `retry_after_ms` | `publish_failed` |
 | A `counter_add` over a rate | `rate_limited`, with `retry_after_ms` | `counter_failed` |
-| A `cache_put` or `cache_delete` over a rate | `rate_limited`, with `retry_after_ms` | `cache_failed` |
+| A `cache_put`, `cache_delete`, `cache_put_if` or `cache_delete_if` over a rate | `rate_limited`, with `retry_after_ms` | `cache_failed` |
 | A payload over `max_payload_bytes` | `bad_request` | `bad_request` |
 | A `join` over a session cap | `rate_limited` | `unavailable` |
 

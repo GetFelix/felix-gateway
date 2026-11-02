@@ -2,7 +2,14 @@
 // GatewayClient without a gateway or a broker. Everything is answered on a
 // later task, as a socket would.
 
-import { GatewayError, type CacheEntry, type Gateway } from "./index.js";
+import {
+  GatewayError,
+  type CacheCondition,
+  type CacheEntry,
+  type ConditionResult,
+  type Gateway,
+  type VersionedValue,
+} from "./index.js";
 
 /**
  * The streams, caches and counters of one scope, shared by every
@@ -13,6 +20,9 @@ export class FakeScope {
   readonly streams = new Map<string, Uint8Array[]>();
   /** Each cache's entries by key. */
   readonly caches = new Map<string, Map<string, Uint8Array>>();
+  /** Each cache entry's version by key. Versions are unique and never reused, as in Felix. */
+  readonly versions = new Map<string, Map<string, number>>();
+  #lastVersion = 0;
   /** Each counter's sums by key. */
   readonly counters = new Map<string, Map<string, number>>();
   /** The first offset each stream still holds; a subscribe from earlier is `trimmed`. */
@@ -42,11 +52,45 @@ export class FakeScope {
   writeCache(cache: string, key: string, payload: Uint8Array | null): void {
     let entries = this.caches.get(cache);
     if (!entries) this.caches.set(cache, (entries = new Map()));
-    if (payload === null) entries.delete(key);
-    else entries.set(key, payload);
+    let versions = this.versions.get(cache);
+    if (!versions) this.versions.set(cache, (versions = new Map()));
+    if (payload === null) {
+      entries.delete(key);
+      versions.delete(key);
+    } else {
+      entries.set(key, payload);
+      versions.set(key, ++this.#lastVersion);
+    }
     for (const connection of this.connections) {
       connection.changed(cache, { key, payload, expiresInMs: null });
     }
+  }
+
+  /** The version of `key` of `cache`, or `null` when it has no entry. */
+  versionOf(cache: string, key: string): number | null {
+    return this.versions.get(cache)?.get(key) ?? null;
+  }
+
+  /** Write `key` only if its entry meets `condition`, as the gateway's `cache_put_if`. */
+  writeCacheIf(
+    cache: string,
+    key: string,
+    payload: Uint8Array,
+    condition: CacheCondition,
+  ): ConditionResult {
+    const current = this.versionOf(cache, key);
+    const holds = condition === "absent" ? current === null : current === condition.version;
+    if (!holds) return { applied: false, version: current };
+    this.writeCache(cache, key, payload);
+    return { applied: true, version: this.versionOf(cache, key) };
+  }
+
+  /** Delete `key` only if its entry is at `version`, as the gateway's `cache_delete_if`. */
+  deleteCacheIf(cache: string, key: string, version: number): ConditionResult {
+    const current = this.versionOf(cache, key);
+    if (current !== version) return { applied: false, version: current };
+    this.writeCache(cache, key, null);
+    return { applied: true, version: null };
   }
 
   /** Add `delta` to `key` of `counter` and return the new sum. */
@@ -117,6 +161,28 @@ export class FakeGateway implements Gateway {
   async cacheGet(cache: string, key: string): Promise<Uint8Array | null> {
     await new Promise((resolve) => setTimeout(resolve));
     return this.scope.readCache(cache, key);
+  }
+
+  async cacheGetVersioned(cache: string, key: string): Promise<VersionedValue | null> {
+    await new Promise((resolve) => setTimeout(resolve));
+    const payload = this.scope.readCache(cache, key);
+    const version = this.scope.versionOf(cache, key);
+    return payload === null || version === null ? null : { payload, version };
+  }
+
+  async cachePutIf(
+    cache: string,
+    key: string,
+    payload: Uint8Array,
+    condition: CacheCondition,
+  ): Promise<ConditionResult> {
+    await new Promise((resolve) => setTimeout(resolve));
+    return this.scope.writeCacheIf(cache, key, payload, condition);
+  }
+
+  async cacheDeleteIf(cache: string, key: string, version: number): Promise<ConditionResult> {
+    await new Promise((resolve) => setTimeout(resolve));
+    return this.scope.deleteCacheIf(cache, key, version);
   }
 
   cachePut(cache: string, key: string, payload: Uint8Array): void {

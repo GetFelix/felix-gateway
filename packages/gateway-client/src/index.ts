@@ -31,7 +31,9 @@ export type ServerMessage =
     }
   | { type: "ack"; id: number; offset: number | null }
   | { type: "counter"; id: number; value: number }
-  | { type: "cache_value"; id: number; payload: string | null }
+  | { type: "cache_value"; id: number; payload: string | null; version?: number | null }
+  | { type: "cache_put_result"; id: number; applied: boolean; version: number | null }
+  | { type: "cache_delete_result"; id: number; applied: boolean; version: number | null }
   | { type: "cache_entries"; cache: string; entries: WireEntry[] }
   | ({ type: "cache_change"; cache: string } & WireEntry)
   | {
@@ -80,6 +82,27 @@ export interface Hello {
   principal: string | null;
 }
 
+/** What a conditional cache write must find: no entry, or one at this version. */
+export type CacheCondition = "absent" | { version: number };
+
+/** A cache entry's value with the version a conditional write names. */
+export interface VersionedValue {
+  payload: Uint8Array;
+  version: number;
+}
+
+/** The answer to a conditional cache write. */
+export interface ConditionResult {
+  /** Whether the condition held and the write was made. */
+  applied: boolean;
+  /**
+   * For an applied put, the version it wrote. Otherwise the entry's current
+   * version, `null` when it has none, which is also what an applied delete
+   * leaves.
+   */
+  version: number | null;
+}
+
 interface WireEntry {
   key: string;
   payload: string | null;
@@ -125,7 +148,7 @@ export class GatewayError extends Error {
 export type Gateway = Pick<GatewayClient, keyof GatewayClient>;
 
 interface Pending {
-  resolve: (value: number | string | null) => void;
+  resolve: (value: unknown) => void;
   reject: (error: GatewayError) => void;
 }
 
@@ -220,8 +243,59 @@ export class GatewayClient {
 
   /** Read `key` of `cache`: its value, or `null` when there is none. */
   async cacheGet(cache: string, key: string): Promise<Uint8Array | null> {
-    const payload = (await this.#request({ type: "cache_get", cache, key })) as string | null;
+    const { payload } = (await this.#request({ type: "cache_get", cache, key })) as {
+      payload: string | null;
+    };
     return payload === null ? null : fromBase64(payload);
+  }
+
+  /**
+   * Read `key` of `cache` with its version, or `null` when there is no
+   * entry. Needs the `cache_versions` feature.
+   */
+  async cacheGetVersioned(cache: string, key: string): Promise<VersionedValue | null> {
+    const answer = (await this.#request({ type: "cache_get", cache, key })) as {
+      payload: string | null;
+      version?: number | null;
+    };
+    if (answer.version === undefined) {
+      throw new GatewayError("bad_request", "cacheGetVersioned needs the cache_versions feature");
+    }
+    if (answer.payload === null || answer.version === null) return null;
+    return { payload: fromBase64(answer.payload), version: answer.version };
+  }
+
+  /**
+   * Write `key` of `cache` only if its entry meets `condition`. A refusal is
+   * a result with `applied` false and the entry's current version, not an
+   * error. Needs the `cache_versions` feature.
+   */
+  async cachePutIf(
+    cache: string,
+    key: string,
+    payload: Uint8Array,
+    condition: CacheCondition,
+  ): Promise<ConditionResult> {
+    return (await this.#request({
+      type: "cache_put_if",
+      cache,
+      key,
+      payload: toBase64(payload),
+      if: condition,
+    })) as ConditionResult;
+  }
+
+  /**
+   * Delete `key` of `cache` only if its entry is at `version`. Needs the
+   * `cache_versions` feature.
+   */
+  async cacheDeleteIf(cache: string, key: string, version: number): Promise<ConditionResult> {
+    return (await this.#request({
+      type: "cache_delete_if",
+      cache,
+      key,
+      version,
+    })) as ConditionResult;
   }
 
   /** Write `key` of `cache`. It expires after the cache's TTL unless written again. */
@@ -251,7 +325,7 @@ export class GatewayClient {
     this.#socket.close();
   }
 
-  #request(message: object): Promise<number | string | null> {
+  #request(message: object): Promise<unknown> {
     const id = this.#nextId++;
     this.#send({ ...message, id });
     return new Promise((resolve, reject) => this.#pending.set(id, { resolve, reject }));
@@ -297,7 +371,11 @@ export class GatewayClient {
         this.#take(message.id)?.resolve(message.offset);
         break;
       case "cache_value":
-        this.#take(message.id)?.resolve(message.payload);
+        this.#take(message.id)?.resolve(message);
+        break;
+      case "cache_put_result":
+      case "cache_delete_result":
+        this.#take(message.id)?.resolve({ applied: message.applied, version: message.version });
         break;
       case "error": {
         const error = new GatewayError(message.code, message.message, message.retry_after_ms);
