@@ -45,7 +45,8 @@ browser client.
 - Optional resources, for people who may join a scope without every grant,
   such as a spectator who cannot publish a player's input.
 - Sender stamping: on a stream marked `stamp_sender`, every record carries its
-  publisher's principal, so a browser cannot speak for someone else.
+  publisher's principal, so a browser cannot speak for someone else. A session
+  can ask `hello` for its own principal to recognise its records.
 - A protocol version and negotiated features, so old and new browsers work
   against one gateway.
 - Per-connection ordering of publishes and cache writes, and a bounded buffer

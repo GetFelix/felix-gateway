@@ -66,6 +66,37 @@ describe("GatewayClient", () => {
       features: [],
       cacheTtlMs: { members: 30000 },
       missing: [],
+      principal: null,
+    });
+  });
+
+  it("reports the principal hello names, and reads the stamp of a record", async () => {
+    const { client, socket } = await connect();
+    const hello = vi.fn();
+    client.onHello = hello;
+    socket.receive({
+      type: "hello",
+      protocol: 1,
+      features: ["principal"],
+      namespace: "default",
+      cache_ttl_ms: {},
+      principal: "9f2c",
+    });
+    expect(hello.mock.calls[0]?.[0]).toMatchObject({ principal: "9f2c" });
+
+    // The same function as in docs/protocol.md, "publish".
+    function unstamp(payload: Uint8Array): { sender: string; record: Uint8Array } {
+      const length = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint16(
+        0,
+      ); // big-endian
+      return {
+        sender: new TextDecoder().decode(payload.subarray(2, 2 + length)),
+        record: payload.subarray(2 + length),
+      };
+    }
+    expect(unstamp(bytes(0, 4, 57, 102, 50, 99, 7, 8))).toEqual({
+      sender: "9f2c",
+      record: bytes(7, 8),
     });
   });
 

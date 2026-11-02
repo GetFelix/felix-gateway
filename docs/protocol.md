@@ -45,6 +45,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `shards` | A `subscribe` or a [`state_get`](#state_get) may name the `shard` of a stream, instead of shard 0 or the one an entity key picks |
   | `past_end` | A `read`, or a `subscribe` from an offset, that asks for an offset beyond the end of the log is answered with the code `past_end` and the log's `tail`, instead of `read_failed` or `subscribe_failed` |
   | `cache_versions` | `cache_value` carries the entry's version, and [`cache_put_if`](#cache_put_if) and [`cache_delete_if`](#cache_delete_if) write only if the entry is still at the version the browser read. Needs a Felix broker from 0.6.0-preview.3 on; against an older one the session's `cache_get` and conditional writes fail with `cache_failed` |
+  | `principal` | `hello` names the session's Felix principal (the identity Felix knows it by) in `principal` |
   | `time` | [`offset_for_time`](#offset_for_time) finds the offset of a stream's shard at a wall-clock time |
 
 - A `join` asking for another version is refused with `unsupported`.
@@ -182,6 +183,25 @@ On a stream with `stamp_sender`, each payload reaches Felix prefixed with the
 publisher's Felix principal: a 2-byte big-endian length, then the principal's
 UTF-8 bytes. Readers learn who sent each record, and a browser cannot speak
 for someone else.
+
+A reader splits the stamp off with the length, and a session that joined with
+the [`principal` feature](#hello) can tell its own records from the rest by
+comparing the stamp with the `principal` in its `hello`:
+
+```ts
+/** The principal a `stamp_sender` stream put in front of `payload`, and the record behind it. */
+function unstamp(payload: Uint8Array): { sender: string; record: Uint8Array } {
+  const length = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint16(0); // big-endian
+  return {
+    sender: new TextDecoder().decode(payload.subarray(2, 2 + length)),
+    record: payload.subarray(2 + length),
+  };
+}
+```
+
+Only records the gateway published carry a stamp. A record written by another
+client to a `stamp_sender` stream has none, so `unstamp` would misread it; a
+stream that also takes unstamped writers needs a marker of its own.
 
 ### `counter_add`
 
@@ -624,6 +644,15 @@ The answer to `join`: the session is open on this scope.
 | `room` | The scope's value, under the scope file's `field` |
 | `cache_ttl_ms` | How long an entry lasts without a write, for each cache with a `ttl_s` |
 | `missing` | Present only when not empty: aliases of `optional` resources this sign-in does not reach |
+| `principal` | Only with the `principal` feature: the session's Felix principal, the `sub` of its Felix token. It is the string `stamp_sender` writes in front of the session's records |
+
+A page that needs to know who it is, for instance to recognise its own records
+on a `stamp_sender` stream, joins with the `principal` feature. The principal
+is an opaque string: compare it for equality, do not parse it.
+
+```json
+{"type": "hello", "protocol": 1, "features": ["principal"], "namespace": "default", "room": "lobby", "cache_ttl_ms": {"members": 30000}, "principal": "6d9e57adf7797f314e8d147faaa09ca37084c41d5503e878204577703e5b8f6e"}
+```
 
 ### `subscribed`
 
