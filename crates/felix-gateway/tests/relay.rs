@@ -821,6 +821,9 @@ async fn offset_for_time_finds_where_a_time_falls_in_the_log() {
     let token = sign_in("ana").await;
     let mut browser = Browser::connect_with(addr, "studio", &token, json!(["time"])).await;
     assert_eq!(browser.recv().await["features"], json!(["time"]));
+    // The times come from this host's clock and are compared with the broker's
+    // at append, so the broker must share the host's clock: true for a
+    // container on Linux, not necessarily for a VM on macOS.
     let tag = run_tag("time");
     let pause = || tokio::time::sleep(Duration::from_millis(100));
 
@@ -859,7 +862,11 @@ async fn offset_for_time_finds_where_a_time_falls_in_the_log() {
         .request(json!({"type": "offset_for_time", "stream": "sharded", "at_us": 0}))
         .await;
     let oldest = browser.answer(id).await;
-    assert!(oldest["offset"].as_u64() <= Some(first), "{oldest}");
+    assert_eq!(oldest["type"], "offset", "{oldest}");
+    let oldest = oldest["offset"]
+        .as_u64()
+        .expect("an old time answers an offset");
+    assert!(oldest <= first, "oldest {oldest}, first {first}");
 
     // The answer is an offset a subscribe can start at.
     browser

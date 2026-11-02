@@ -614,7 +614,7 @@ impl Session {
                         stream_error(
                             stream,
                             ErrorCode::ReadFailed,
-                            format!("at most {READS_IN_FLIGHT} reads may wait at once"),
+                            format!("at most {READS_IN_FLIGHT} reads or lookups may wait at once"),
                         ),
                     ));
                 }
@@ -677,7 +677,7 @@ impl Session {
                         stream_error(
                             stream,
                             ErrorCode::ReadFailed,
-                            format!("at most {READS_IN_FLIGHT} reads may wait at once"),
+                            format!("at most {READS_IN_FLIGHT} reads or lookups may wait at once"),
                         ),
                     ));
                 }

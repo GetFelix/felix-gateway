@@ -257,8 +257,8 @@ from its `next_offset`; the range is done once that reaches `end`. An offset
 retention has discarded is an `error` with code `trimmed` and the `oldest`
 offset left. Anything else Felix refuses, such as an offset past the tail or a
 stream with no log, is an `error` with code `read_failed`. A session may
-have 4 reads waiting for their answer at once; a fifth is refused at once with
-`read_failed`. Without the
+have 4 requests waiting for their answer at once, counting [`offset_for_time`](#offset_for_time)
+lookups; a fifth is refused at once with `read_failed`. Without the
 feature, `read` is refused with `bad_request`.
 
 A game's replay of a few seconds of its log is one `read`: a fixed slice, with
@@ -297,7 +297,8 @@ led the shard when it appended each record, so if that broker's clock stepped
 back, the answer is near the first record after the step rather than exactly
 it.
 
-For example, to read the 20 records from a time:
+For example, to read up to 20 records from a time (browser to gateway, then the
+answer, then the next request):
 
 ```json
 {"type": "offset_for_time", "stream": "events", "at_us": 1792700000000000, "id": 1}
@@ -307,8 +308,8 @@ For example, to read the 20 records from a time:
 
 A lookup counts against the same 4 requests a session may have waiting as a
 `read` does; a fifth is refused at once with `read_failed`. Anything else Felix
-refuses, including a broker too old to look up by time, is an `error` with code
-`read_failed`. Without the feature, `offset_for_time` is refused with
+refuses, including a stream with no log such as `presence` and a broker too old to look
+up by time, is an `error` with code `read_failed`. Without the feature, `offset_for_time` is refused with
 `bad_request`.
 
 ### `cache_put`
