@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL};
 use felix_client::{CacheWatchFilter, CommitOp, TokenFuture, TokenProvider};
 use felix_gateway::{Config, Gateway, Heartbeat, Refused, ScopeConfig, SharedConfig};
 use felix_wire::AckMode;
@@ -606,6 +606,36 @@ async fn an_op_published_while_the_snapshot_is_read_reaches_a_browser_that_subsc
     assert!(event >= Some(live));
     let payload = &snapshot.unwrap()["payload"];
     assert!(payload.is_null() || payload.is_string(), "{payload}");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn hello_names_the_principal_only_to_a_session_that_asks() {
+    let (gateway, addr) = start_gateway().await;
+    let token = sign_in("ana").await;
+    let mut browser = Browser::connect_with(addr, "lobby", &token, json!(["principal"])).await;
+    let hello = browser.recv_type("hello").await;
+    assert_eq!(hello["features"], json!(["principal"]));
+    let principal = hello["principal"]
+        .as_str()
+        .expect("hello names the principal");
+
+    // It is the `sub` of the Felix token, which is what `stamp_sender` writes.
+    let scope_token = gateway.scope_token(&token, "lobby").await.unwrap();
+    let claims = BASE64_URL
+        .decode(scope_token.split('.').nth(1).unwrap())
+        .unwrap();
+    let claims: Value = serde_json::from_slice(&claims).unwrap();
+    assert_eq!(claims["sub"], principal);
+
+    let ben = sign_in("ben").await;
+    let mut other = Browser::connect_with(addr, "lobby", &ben, json!(["principal"])).await;
+    let other = other.recv_type("hello").await;
+    assert_ne!(other["principal"], hello["principal"]);
+
+    let mut plain = Browser::connect(addr, "lobby", &token).await;
+    let plain = plain.recv_type("hello").await;
+    assert!(plain.get("principal").is_none(), "{plain}");
 }
 
 #[tokio::test]

@@ -24,8 +24,8 @@ use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
     BINARY_EVENTS, CACHE_VERSIONS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES,
-    Join, PAST_END, PROTOCOL, RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE, ServerMessage,
-    StartAt,
+    Join, PAST_END, PRINCIPAL, PROTOCOL, RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE,
+    ServerMessage, StartAt,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -1086,6 +1086,11 @@ async fn accept(
         scope: BTreeMap::from([(field.clone(), felix.scope.value().to_string())]),
         cache_ttl_ms: gateway.scope.cache_ttl_ms(),
         missing,
+        principal: join
+            .features
+            .iter()
+            .any(|feature| feature == PRINCIPAL)
+            .then(|| felix.principal.clone()),
     };
     Ok(Joined {
         felix,
