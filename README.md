@@ -30,10 +30,15 @@ browser client.
 
 - Publish and subscribe on Felix streams, from a log offset or from live, with
   each event's offset so a browser can see exactly what it missed.
+- Reads of a stream's state (`state_get`) and of a range of its log (`read`),
+  and subscriptions to any shard of a stream. A state read can name its shard,
+  so the offsets it returns are the ones a `read` of that shard understands.
 - Seeking by time: `offset_for_time` finds a shard's offset for a wall-clock
   time, to start a `read` or a `subscribe` there.
 - Cache reads, writes, deletes and watches, with a per-cache TTL for entries
   such as a presence list.
+- Conditional cache writes: a read names the entry's version, and a write or delete applies only if the entry is still at it, so sessions that all write a key conditionally cannot overwrite each other. A
+  plain `cache_put` still overwrites.
 - Counter adds.
 - Sign-in through any OpenID Connect provider. Each connection's Felix token
   covers one scope and only the actions the scope file lists.
@@ -154,6 +159,8 @@ Pre-1.0. The protocol, the scope file format and the library API may change
 between minor versions; version 1 of the wire protocol is frozen, and later
 changes arrive as negotiated features. Tested against Felix 0.6.2.
 Shared connections require 0.6.0-preview.7 or later.
+A `live` subscribe reports a tail a browser can wait for from Felix 0.6.1
+on; see [Subscribe before reading](docs/protocol.md#subscribe-before-reading).
 
 Known limits, all on the Felix side:
 
@@ -164,6 +171,8 @@ Known limits, all on the Felix side:
   ends and is subscribed again by the browser.
 - Felix events carry no publisher, which is why sender stamping lives in the
   gateway.
+- Felix's cache watch carries no entry versions, so a watching browser reads a
+  key before writing it conditionally (GetFelix/felix#1736).
 
 ## Docs
 

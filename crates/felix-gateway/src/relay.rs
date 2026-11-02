@@ -13,6 +13,7 @@ use axum::body::Bytes;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use felix_client::{CacheChange, CacheWatchItem, CursorErrorReason, Event, SubscribeCursorError};
+use felix_wire::CacheCondition;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, Sleep};
@@ -22,8 +23,9 @@ use crate::felix::Felix;
 use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
-    BINARY_EVENTS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES, Join, PROTOCOL,
-    RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE, ServerMessage, StartAt, TIME,
+    BINARY_EVENTS, CACHE_VERSIONS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES,
+    Join, PAST_END, PROTOCOL, RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE, ServerMessage,
+    StartAt, TIME,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
@@ -71,6 +73,24 @@ enum Write {
         key: String,
         payload: Option<Vec<u8>>,
         ttl: Option<Duration>,
+    },
+    /// Put a cache entry only if it meets `condition`.
+    CachePutIf {
+        cache: String,
+        name: String,
+        key: String,
+        payload: Vec<u8>,
+        ttl: Option<Duration>,
+        condition: CacheCondition,
+        id: u64,
+    },
+    /// Delete a cache entry only if it is at `version`.
+    CacheDeleteIf {
+        cache: String,
+        name: String,
+        key: String,
+        version: u64,
+        id: u64,
     },
 }
 
@@ -137,6 +157,10 @@ struct Session {
     read: bool,
     /// The session asked for [`SHARDS`].
     shards: bool,
+    /// The session asked for [`PAST_END`].
+    past_end: bool,
+    /// The session asked for [`CACHE_VERSIONS`].
+    cache_versions: bool,
     /// The session asked for [`TIME`].
     time: bool,
     /// Range reads sent to Felix whose answer is not yet sent on.
@@ -177,6 +201,8 @@ pub(crate) async fn run<C: BrowserConnection>(
         state,
         read,
         shards,
+        past_end,
+        cache_versions,
         time,
     }) = join(&mut conn, &gateway, client).await
     else {
@@ -204,6 +230,8 @@ pub(crate) async fn run<C: BrowserConnection>(
         state,
         read,
         shards,
+        past_end,
+        cache_versions,
         time,
         reads: Arc::default(),
         next_sub: 0,
@@ -420,6 +448,7 @@ impl Session {
                     slot: slot.clone(),
                     shard,
                     sub,
+                    past_end: self.past_end,
                 };
                 let task = tokio::spawn(relay_subscription(
                     target,
@@ -527,11 +556,24 @@ impl Session {
                 };
                 let felix = Arc::clone(&self.felix);
                 let replies = self.replies.clone();
+                let versioned = self.cache_versions;
                 tokio::spawn(async move {
-                    let reply = match felix.cache_get(&name, &key).await {
-                        Ok(payload) => ServerMessage::CacheValue {
+                    let read = if versioned {
+                        felix.cache_get_versioned(&name, &key).await.map(|entry| {
+                            let version = entry.as_ref().map(|entry| entry.version);
+                            (entry.map(|entry| entry.value.to_vec()), Some(version))
+                        })
+                    } else {
+                        felix
+                            .cache_get(&name, &key)
+                            .await
+                            .map(|value| (value, None))
+                    };
+                    let reply = match read {
+                        Ok((payload, version)) => ServerMessage::CacheValue {
                             id,
                             payload: payload.map(|bytes| BASE64.encode(bytes)),
+                            version,
                         },
                         Err(err) => with_id(id, cache_error(cache, ErrorCode::CacheFailed, err)),
                     };
@@ -543,10 +585,15 @@ impl Session {
                 stream,
                 key,
                 entity,
+                shard,
                 id,
             } => {
                 let refusal = if !self.state {
                     Some("state_get needs the state feature".to_string())
+                } else if shard.is_some() && !self.shards {
+                    Some("a shard needs the shards feature".to_string())
+                } else if shard.is_some() && !entity.is_empty() {
+                    Some("name a shard or an entity, not both".to_string())
                 } else if !valid_state_key(&key) || !(entity.is_empty() || valid_state_key(&entity))
                 {
                     Some(BAD_STATE_KEY.to_string())
@@ -566,12 +613,30 @@ impl Session {
                 let felix = Arc::clone(&self.felix);
                 let replies = self.replies.clone();
                 tokio::spawn(async move {
-                    let reply = match felix.state_get(&name, &entity, &key).await {
+                    let state = match shard {
+                        Some(shard) => match felix.shard_exists(&name, shard).await {
+                            Ok(Ok(())) => felix.state_get_on_shard(&name, shard, &key).await,
+                            Ok(Err(count)) => {
+                                let reason = format!(
+                                    "the stream has {count} shards, so shard {shard} does not exist"
+                                );
+                                let _ = replies.send(with_id(
+                                    id,
+                                    stream_error(stream, ErrorCode::BadRequest, reason),
+                                ));
+                                return;
+                            }
+                            Err(err) => Err(err),
+                        },
+                        None => felix.state_get(&name, &entity, &key).await,
+                    };
+                    let reply = match state {
                         Ok(state) => ServerMessage::StateValue {
                             id,
                             payload: state.value.map(|bytes| BASE64.encode(bytes)),
                             version: state.version,
                             as_of: state.as_of,
+                            shard,
                         },
                         Err(err) => with_id(id, stream_error(stream, ErrorCode::StateFailed, err)),
                     };
@@ -621,6 +686,7 @@ impl Session {
                 let felix = Arc::clone(&self.felix);
                 let replies = self.replies.clone();
                 let reads = Arc::clone(&self.reads);
+                let past_end = self.past_end;
                 tokio::spawn(async move {
                     let reply = match felix.read(&name, shard, from, end, max).await {
                         Ok(page) => ServerMessage::Records {
@@ -635,9 +701,10 @@ impl Session {
                                 .collect(),
                             next_offset: page.next_offset,
                         },
-                        Err(err) => {
-                            with_id(id, subscription_error(stream, ErrorCode::ReadFailed, err))
-                        }
+                        Err(err) => with_id(
+                            id,
+                            subscription_error(stream, ErrorCode::ReadFailed, err, past_end),
+                        ),
                     };
                     let _ = replies.send(reply);
                     reads.fetch_sub(1, Ordering::Relaxed);
@@ -703,6 +770,56 @@ impl Session {
                 Err(err) => Next::Reply(cache_error(cache, ErrorCode::BadRequest, err)),
             },
             ClientMessage::CacheDelete { cache, key } => self.write_cache(cache, key, None).await,
+            ClientMessage::CachePutIf {
+                cache,
+                key,
+                payload,
+                condition,
+                id,
+            } => {
+                let payload = match BASE64.decode(payload) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        return Next::Reply(with_id(
+                            id,
+                            cache_error(cache, ErrorCode::BadRequest, err),
+                        ));
+                    }
+                };
+                match self.admit_cache_write(&cache, &key, payload.len(), true) {
+                    Ok((name, ttl)) => {
+                        self.write(Write::CachePutIf {
+                            cache,
+                            name,
+                            key,
+                            payload,
+                            ttl,
+                            condition,
+                            id,
+                        })
+                        .await
+                    }
+                    Err(refusal) => Next::Reply(with_id(id, *refusal)),
+                }
+            }
+            ClientMessage::CacheDeleteIf {
+                cache,
+                key,
+                version,
+                id,
+            } => match self.admit_cache_write(&cache, &key, 0, true) {
+                Ok((name, _)) => {
+                    self.write(Write::CacheDeleteIf {
+                        cache,
+                        name,
+                        key,
+                        version,
+                        id,
+                    })
+                    .await
+                }
+                Err(refusal) => Next::Reply(with_id(id, *refusal)),
+            },
             ClientMessage::CacheWatch { cache } => {
                 let name = match scope.cache(&cache, CacheAction::Watch) {
                     Ok(bound) => bound.name,
@@ -740,28 +857,51 @@ impl Session {
     }
 
     async fn write_cache(&mut self, cache: String, key: String, payload: Option<Vec<u8>>) -> Next {
-        let felix = Arc::clone(&self.felix);
-        let bound = match felix.scope.cache(&cache, CacheAction::Write) {
-            Ok(_) if !valid_name(&key) => {
-                return Next::Reply(cache_error(cache, ErrorCode::BadRequest, BAD_NAME));
+        let bytes = payload.as_ref().map_or(0, Vec::len);
+        match self.admit_cache_write(&cache, &key, bytes, false) {
+            Ok((name, ttl)) => {
+                self.write(Write::Cache {
+                    cache,
+                    name,
+                    key,
+                    payload,
+                    ttl,
+                })
+                .await
             }
-            Ok(bound) => bound,
-            Err(refusal) => return Next::Reply(cache_error(cache, ErrorCode::BadRequest, refusal)),
-        };
-        if let Err(refused) = self.charge(&bound, &cache, payload.as_ref().map_or(0, Vec::len)) {
-            let code = self.refusal_code(refused, ErrorCode::CacheFailed);
-            return Next::Reply(limited(cache_error(cache, code, ""), refused));
+            Err(refusal) => Next::Reply(*refusal),
         }
-        let ttl = bound.resource.ttl();
-        let name = bound.name;
-        self.write(Write::Cache {
-            cache,
-            name,
-            key,
-            payload,
-            ttl,
-        })
-        .await
+    }
+
+    /// Check that a write of `bytes` to `key` of `cache` is allowed and
+    /// within the limits, and spend it. Gives the cache's Felix name and TTL,
+    /// or the error to answer with. A `conditional` write also needs the
+    /// `cache_versions` feature.
+    fn admit_cache_write(
+        &mut self,
+        cache: &str,
+        key: &str,
+        bytes: usize,
+        conditional: bool,
+    ) -> Result<(String, Option<Duration>), Box<ServerMessage>> {
+        let refuse = |code, reason: &str| Box::new(cache_error(cache.to_string(), code, reason));
+        if conditional && !self.cache_versions {
+            return Err(refuse(
+                ErrorCode::BadRequest,
+                "a conditional write needs the cache_versions feature",
+            ));
+        }
+        let felix = Arc::clone(&self.felix);
+        let bound = match felix.scope.cache(cache, CacheAction::Write) {
+            Ok(_) if !valid_name(key) => return Err(refuse(ErrorCode::BadRequest, BAD_NAME)),
+            Ok(bound) => bound,
+            Err(refusal) => return Err(refuse(ErrorCode::BadRequest, &refusal)),
+        };
+        if let Err(refused) = self.charge(&bound, cache, bytes) {
+            let code = self.refusal_code(refused, ErrorCode::CacheFailed);
+            return Err(Box::new(limited(*refuse(code, ""), refused)));
+        }
+        Ok((bound.name, bound.resource.ttl()))
     }
 
     /// Check one write of `bytes` to `bound` against the payload limit and
@@ -864,6 +1004,39 @@ async fn write_in_order(
                     Err(err) => cache_error(cache, ErrorCode::CacheFailed, err),
                 }
             }
+            Write::CachePutIf {
+                cache,
+                name,
+                key,
+                payload,
+                ttl,
+                condition,
+                id,
+            } => match felix
+                .cache_put_if(&name, &key, payload, ttl, condition)
+                .await
+            {
+                Ok(result) => ServerMessage::CachePutResult {
+                    id,
+                    applied: result.applied,
+                    version: result.version,
+                },
+                Err(err) => with_id(id, cache_error(cache, ErrorCode::CacheFailed, err)),
+            },
+            Write::CacheDeleteIf {
+                cache,
+                name,
+                key,
+                version,
+                id,
+            } => match felix.cache_delete_if(&name, &key, version).await {
+                Ok(result) => ServerMessage::CacheDeleteResult {
+                    id,
+                    applied: result.applied,
+                    version: result.version,
+                },
+                Err(err) => with_id(id, cache_error(cache, ErrorCode::CacheFailed, err)),
+            },
         };
         let _ = replies.send(reply);
     }
@@ -880,6 +1053,8 @@ struct Joined {
     state: bool,
     read: bool,
     shards: bool,
+    past_end: bool,
+    cache_versions: bool,
     time: bool,
 }
 
@@ -977,6 +1152,11 @@ async fn accept(
         state: join.features.iter().any(|feature| feature == STATE),
         read: join.features.iter().any(|feature| feature == READ),
         shards: join.features.iter().any(|feature| feature == SHARDS),
+        past_end: join.features.iter().any(|feature| feature == PAST_END),
+        cache_versions: join
+            .features
+            .iter()
+            .any(|feature| feature == CACHE_VERSIONS),
         time: join.features.iter().any(|feature| feature == TIME),
     })
 }
@@ -1084,6 +1264,8 @@ struct Target {
     slot: Option<String>,
     shard: Option<u32>,
     sub: Option<u32>,
+    /// The session asked for [`PAST_END`].
+    past_end: bool,
 }
 
 async fn relay_subscription(
@@ -1099,9 +1281,13 @@ async fn relay_subscription(
         slot,
         shard,
         sub,
+        past_end,
     } = target;
     let ended = |code, err| {
-        let mut message = subscription_error(stream.clone(), code, err);
+        // Only a subscribe that fails to open is past the end; a running one
+        // that resumed after a failover ends as `subscription_ended`.
+        let at_open = code == ErrorCode::SubscribeFailed;
+        let mut message = subscription_error(stream.clone(), code, err, past_end && at_open);
         with_slot(&mut message, slot.as_ref());
         with_shard(&mut message, shard);
         Outbound::Message(message)
@@ -1187,16 +1373,34 @@ fn with_shard(message: &mut ServerMessage, shard: Option<u32>) {
 }
 
 /// `trimmed`, naming the oldest offset left, when retention has passed the
-/// offset a subscription or read asked for; `code` otherwise.
-fn subscription_error(stream: String, code: ErrorCode, err: anyhow::Error) -> ServerMessage {
-    let trimmed = err
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<SubscribeCursorError>())
-        .find(|cursor| cursor.reason == CursorErrorReason::TooOld);
+/// offset a subscription or read asked for. With `past_end`, `past_end`
+/// naming the tail when the offset is beyond the log's end. `code` otherwise.
+fn subscription_error(
+    stream: String,
+    code: ErrorCode,
+    err: anyhow::Error,
+    past_end: bool,
+) -> ServerMessage {
+    let cursor = |reason| {
+        err.chain()
+            .filter_map(|cause| cause.downcast_ref::<SubscribeCursorError>())
+            .find(|cursor| cursor.reason == reason)
+            .copied()
+    };
+    let trimmed = cursor(CursorErrorReason::TooOld);
+    let beyond = cursor(CursorErrorReason::InFuture).filter(|_| past_end);
     let mut message = stream_error(stream, code, &err);
-    if let (Some(cursor), ServerMessage::Error { code, oldest, .. }) = (trimmed, &mut message) {
-        *code = ErrorCode::Trimmed;
-        *oldest = Some(cursor.available);
+    if let ServerMessage::Error {
+        code, oldest, tail, ..
+    } = &mut message
+    {
+        if let Some(cursor) = trimmed {
+            *code = ErrorCode::Trimmed;
+            *oldest = Some(cursor.available);
+        } else if let Some(cursor) = beyond {
+            *code = ErrorCode::PastEnd;
+            *tail = Some(cursor.available);
+        }
     }
     message
 }
@@ -1290,6 +1494,7 @@ fn error(code: ErrorCode, err: impl std::fmt::Display) -> ServerMessage {
         cache: None,
         code,
         oldest: None,
+        tail: None,
         retry_after_ms: None,
         message: format!("{err:#}"),
     }
@@ -1397,7 +1602,7 @@ mod tests {
             available: 120,
         })
         .context("subscribe to app.ops.lobby");
-        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, err);
+        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, err, false);
         let ServerMessage::Error {
             code,
             oldest,
@@ -1412,16 +1617,33 @@ mod tests {
             (ErrorCode::Trimmed, Some(120), Some("ops"))
         );
 
-        let future = anyhow::Error::new(SubscribeCursorError {
-            reason: CursorErrorReason::InFuture,
-            requested: 900,
-            available: 10,
-        });
-        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, future);
-        let ServerMessage::Error { code, oldest, .. } = message else {
+        let future = || {
+            anyhow::Error::new(SubscribeCursorError {
+                reason: CursorErrorReason::InFuture,
+                requested: 900,
+                available: 10,
+            })
+        };
+        let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, future(), false);
+        let ServerMessage::Error {
+            code, oldest, tail, ..
+        } = message
+        else {
             panic!("{message:?}");
         };
-        assert_eq!((code, oldest), (ErrorCode::SubscribeFailed, None));
+        assert_eq!(
+            (code, oldest, tail),
+            (ErrorCode::SubscribeFailed, None, None)
+        );
+
+        let message = subscription_error("ops".into(), ErrorCode::ReadFailed, future(), true);
+        let ServerMessage::Error {
+            code, oldest, tail, ..
+        } = message
+        else {
+            panic!("{message:?}");
+        };
+        assert_eq!((code, oldest, tail), (ErrorCode::PastEnd, None, Some(10)));
     }
 
     #[test]

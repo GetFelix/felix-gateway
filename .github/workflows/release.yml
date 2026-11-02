@@ -8,12 +8,28 @@ name: Release
 # version already published is skipped, so this also finishes a release that
 # failed part way. With `dry_run`, or for a tag that does not exist yet, it runs
 # every check and builds every part from the branch it was started on, and
-# publishes nothing. Pull requests get the same dry run for the version in the
-# tree.
+# publishes nothing. A pull request that touches the release machinery or a
+# version gets the same dry run for the version in the tree.
 on:
   push:
     tags: ["v*"]
+  # Only changes that can break the release need the dry run; the checks that
+  # gate merging live in ci.yml.
   pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/scripts/**
+      - docker/**
+      - .dockerignore
+      - .npmrc
+      - .felix-version
+      - CHANGELOG.md
+      - Cargo.toml
+      - Cargo.lock
+      - crates/*/Cargo.toml
+      - package.json
+      - package-lock.json
+      - packages/*/package.json
   workflow_dispatch:
     inputs:
       tag:

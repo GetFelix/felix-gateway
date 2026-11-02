@@ -214,25 +214,6 @@ impl Browser {
             .collect()
     }
 
-    /// Send `request` with a fresh id and return the id.
-    async fn request(&mut self, mut request: Value) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        request["id"] = json!(id);
-        self.send(request).await;
-        id
-    }
-
-    /// The next message answering request `id`.
-    async fn answer(&mut self, id: u64) -> Value {
-        loop {
-            let message = self.recv().await;
-            if message["id"].as_u64() == Some(id) {
-                return message;
-            }
-        }
-    }
-
     /// Publish without waiting for the ack; returns the request id.
     async fn publish(&mut self, stream: &str, payload: &str, ack: bool) -> u64 {
         let id = self.next_id;
@@ -629,6 +610,48 @@ async fn an_op_published_while_the_snapshot_is_read_reaches_a_browser_that_subsc
 
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
+async fn a_live_subscribe_and_a_replay_agree_where_the_events_end() {
+    // The join pattern in docs/protocol.md. Nothing else writes the studio's
+    // ops stream, so the tails below are exact. A replicated shard's log can end
+    // in a generation-start record, which a subscriber never receives; both
+    // subscribes must name the tail below it, or a browser waiting for the
+    // offset before the tail waits forever. The dev stream is not replicated,
+    // so this checks the agreement, not that case.
+    let (_gateway, addr) = start_gateway().await;
+    let mut browser = Browser::join(addr, "ana", "studio").await;
+    let live = browser.subscribe("ops", json!("live")).await;
+    let replay = browser.subscribe("ops", json!(0)).await;
+    assert_eq!(
+        live["live_offset"], replay["live_offset"],
+        "live {live}, replay {replay}"
+    );
+
+    let tag = run_tag("catch-up");
+    let mut writer = Browser::join(addr, "ana", "studio").await;
+    let mut last = None;
+    for i in 0..3 {
+        writer.publish("ops", &format!("{tag}/{i}"), true).await;
+        last = writer.recv_type("ack").await["offset"].as_u64();
+    }
+    let last = last.expect("acks carry offsets");
+
+    // The join path: the target comes from the replay's `subscribed`, and the
+    // event just below it arrives.
+    let mut joiner = Browser::join(addr, "ana", "studio").await;
+    let live = joiner.subscribe("ops", json!("live")).await;
+    assert_eq!(live["live_offset"].as_u64(), Some(last + 1), "{live}");
+    let replay = joiner.subscribe("ops", json!(0)).await;
+    assert_eq!(replay["live_offset"].as_u64(), Some(last + 1), "{replay}");
+    loop {
+        let event = joiner.recv_type("event").await;
+        if event["offset"].as_u64() == Some(last) {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
 async fn a_room_without_a_snapshot_answers_null() {
     // Nothing writes a snapshot of the studio during the tests.
     let (_gateway, addr) = start_gateway().await;
@@ -645,6 +668,167 @@ async fn a_room_without_a_snapshot_answers_null() {
         .send(json!({"type": "cache_get", "cache": "snap", "key": "a/b", "id": 4}))
         .await;
     assert_eq!(browser.recv().await["code"], "bad_request");
+}
+
+/// A session in the lobby that asked for `cache_versions`.
+async fn versioned_session(addr: SocketAddr) -> Browser {
+    let token = sign_in("ana").await;
+    let mut browser = Browser::connect_with(addr, "lobby", &token, json!(["cache_versions"])).await;
+    let hello = browser.recv_type("hello").await;
+    assert_eq!(hello["features"], json!(["cache_versions"]));
+    browser
+}
+
+impl Browser {
+    /// Send `request` with a fresh id and return the id.
+    async fn request(&mut self, mut request: Value) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        request["id"] = json!(id);
+        self.send(request).await;
+        id
+    }
+
+    /// The next message answering request `id`.
+    async fn answer(&mut self, id: u64) -> Value {
+        loop {
+            let message = self.recv().await;
+            if message["id"].as_u64() == Some(id) {
+                return message;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn of_two_conditional_writes_at_one_version_exactly_one_applies() {
+    let (_gateway, addr) = start_gateway().await;
+    let key = run_tag("cas").replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let mut ana = versioned_session(addr).await;
+    let mut ben = versioned_session(addr).await;
+    let put = |payload: &str, condition: Value| {
+        json!({
+            "type": "cache_put_if", "cache": "members", "key": key,
+            "payload": BASE64.encode(payload), "if": condition
+        })
+    };
+
+    // Both write to a key that is not there.
+    let a = ana.request(put("ana", json!("absent"))).await;
+    let b = ben.request(put("ben", json!("absent"))).await;
+    let (a, b) = (ana.answer(a).await, ben.answer(b).await);
+    let (winner, loser) = match (a["applied"].as_bool(), b["applied"].as_bool()) {
+        (Some(true), Some(false)) => (a, b),
+        (Some(false), Some(true)) => (b, a),
+        other => panic!("one write applies: {other:?} {a} {b}"),
+    };
+    assert_eq!(winner["type"], "cache_put_result");
+    let version = winner["version"].as_u64().expect("the version written");
+    assert_eq!(
+        loser["version"], winner["version"],
+        "the loser learns the winner's version"
+    );
+
+    // A read names the version a next write must be conditioned on.
+    let read = ana
+        .request(json!({"type": "cache_get", "cache": "members", "key": key}))
+        .await;
+    let read = ana.answer(read).await;
+    assert_eq!(read["version"].as_u64(), Some(version), "{read}");
+    let held = BASE64.decode(read["payload"].as_str().unwrap()).unwrap();
+    assert!(held == b"ana" || held == b"ben", "{read}");
+
+    // Both write at the version they read.
+    let a = ana.request(put("ana2", json!({"version": version}))).await;
+    let b = ben.request(put("ben2", json!({"version": version}))).await;
+    let (a, b) = (ana.answer(a).await, ben.answer(b).await);
+    let (winner, loser) = match (a["applied"].as_bool(), b["applied"].as_bool()) {
+        (Some(true), Some(false)) => (a, b),
+        (Some(false), Some(true)) => (b, a),
+        other => panic!("one write applies: {other:?} {a} {b}"),
+    };
+    let next = winner["version"].as_u64().unwrap();
+    assert!(next > version);
+    assert_eq!(loser["version"].as_u64(), Some(next));
+
+    // A delete at the old version is refused; at the current one it applies.
+    let stale = ana
+        .request(json!({
+            "type": "cache_delete_if", "cache": "members", "key": key, "version": version
+        }))
+        .await;
+    let stale = ana.answer(stale).await;
+    assert_eq!(
+        (
+            stale["type"].as_str(),
+            stale["applied"].as_bool(),
+            stale["version"].as_u64()
+        ),
+        (Some("cache_delete_result"), Some(false), Some(next)),
+        "{stale}"
+    );
+    let gone = ana
+        .request(json!({
+            "type": "cache_delete_if", "cache": "members", "key": key, "version": next
+        }))
+        .await;
+    let gone = ana.answer(gone).await;
+    assert_eq!(
+        (gone["applied"].as_bool(), &gone["version"]),
+        (Some(true), &Value::Null),
+        "{gone}"
+    );
+    let read = ben
+        .request(json!({"type": "cache_get", "cache": "members", "key": key}))
+        .await;
+    let read = ben.answer(read).await;
+    assert_eq!(
+        (&read["payload"], &read["version"]),
+        (&Value::Null, &Value::Null),
+        "{read}"
+    );
+
+    // A refused write is not an error, and one that cannot reach the cache is.
+    let bad = ana
+        .request(json!({
+            "type": "cache_put_if", "cache": "snap", "key": key,
+            "payload": BASE64.encode("x"), "if": "absent"
+        }))
+        .await;
+    let bad = ana.answer(bad).await;
+    assert_eq!(bad["code"], "bad_request", "{bad}");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_session_without_cache_versions_sees_no_versions_and_cannot_write_conditionally() {
+    let (_gateway, addr) = start_gateway().await;
+    let key = run_tag("plain").replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let mut browser = Browser::open(addr).await;
+    browser
+        .send(json!({
+            "type": "cache_put", "cache": "members", "key": key, "payload": BASE64.encode("v")
+        }))
+        .await;
+    let read = browser
+        .request(json!({"type": "cache_get", "cache": "members", "key": key}))
+        .await;
+    let read = browser.answer(read).await;
+    assert_eq!(read["type"], "cache_value");
+    assert!(read.get("version").is_none(), "{read}");
+
+    for request in [
+        json!({
+            "type": "cache_put_if", "cache": "members", "key": key,
+            "payload": BASE64.encode("v"), "if": "absent"
+        }),
+        json!({"type": "cache_delete_if", "cache": "members", "key": key, "version": 1}),
+    ] {
+        let id = browser.request(request).await;
+        let refused = browser.answer(id).await;
+        assert_eq!(refused["code"], "bad_request", "{refused}");
+    }
 }
 
 #[tokio::test]
@@ -882,6 +1066,196 @@ async fn offset_for_time_finds_where_a_time_falls_in_the_log() {
         .await;
     let refused = plain.answer(id).await;
     assert_eq!(refused["code"], "bad_request", "{refused}");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn state_get_names_a_shard_and_its_as_of_is_readable_there() {
+    let config = config();
+    if config.shared.is_some() {
+        return;
+    }
+    let (gateway, addr) = start_gateway().await;
+    let token = gateway
+        .scope_token(&sign_in("ana").await, "lobby")
+        .await
+        .expect("ana may open the lobby");
+    let client = Arc::new(
+        gateway
+            .connect_felix(Arc::new(Fixed(token)))
+            .await
+            .expect("connect to Felix"),
+    );
+    let tag = run_tag("as-of");
+    // Shard 1 gets three times the commits of shard 3, so the two logs end
+    // at different offsets.
+    let writers: Vec<_> = [(1, 450), (3, 150)]
+        .into_iter()
+        .map(|(shard, count)| {
+            let client = Arc::clone(&client);
+            let (tenant, namespace) = (config.tenant.clone(), config.namespace.clone());
+            let key = format!("{tag}/{shard}");
+            tokio::spawn(async move {
+                for i in 0..count {
+                    client
+                        .commit(
+                            &tenant,
+                            &namespace,
+                            &entity_on(shard),
+                            vec![
+                                CommitOp::publish(
+                                    "demo.shards.lobby",
+                                    format!("{key}/{i}").into_bytes(),
+                                ),
+                                CommitOp::put(
+                                    "demo.shards.lobby",
+                                    key.as_str(),
+                                    i.to_string().into_bytes(),
+                                ),
+                            ],
+                        )
+                        .await
+                        .expect("the commit lands");
+                }
+            })
+        })
+        .collect();
+
+    let token = sign_in("ana").await;
+    let features = json!(["state", "read", "shards", "past_end"]);
+    let mut browser = Browser::connect_with(addr, "lobby", &token, features).await;
+    browser.recv_type("hello").await;
+    // Whatever as_of a state read reports, the same shard's log holds it at
+    // once, with commits still landing.
+    let mut probes = 0;
+    while writers.iter().any(|writer| !writer.is_finished()) {
+        for shard in [1, 3] {
+            browser
+                .send(json!({
+                    "type": "state_get", "stream": "sharded", "key": format!("{tag}/{shard}"),
+                    "shard": shard, "id": 1
+                }))
+                .await;
+            let state = browser.recv_type("state_value").await;
+            assert_eq!(state["shard"], shard, "{state}");
+            let Some(as_of) = state["as_of"].as_u64().filter(|as_of| *as_of > 0) else {
+                continue;
+            };
+            browser
+                .send(json!({
+                    "type": "read", "stream": "sharded", "from": as_of - 1, "end": as_of + 1,
+                    "shard": shard, "id": 2
+                }))
+                .await;
+            let answer = browser.recv_type("records").await;
+            let reached = answer["records"]
+                .as_array()
+                .and_then(|records| records.last())
+                .and_then(|record| record["offset"].as_u64());
+            assert_eq!(reached, Some(as_of), "shard {shard}: {answer}");
+            probes += 1;
+        }
+    }
+    for writer in writers {
+        writer.await.unwrap();
+    }
+    assert!(probes > 0);
+
+    let mut as_of = Vec::new();
+    for shard in [1, 3] {
+        browser
+            .send(json!({
+                "type": "state_get", "stream": "sharded", "key": format!("{tag}/{shard}"),
+                "shard": shard, "id": 3
+            }))
+            .await;
+        as_of.push(browser.recv_type("state_value").await);
+    }
+    let (one, three) = (&as_of[0], &as_of[1]);
+    assert!(
+        one["as_of"].as_u64() > three["as_of"].as_u64(),
+        "{one} {three}"
+    );
+
+    // The entity the commits named reaches the same shard's state.
+    let entity = String::from_utf8(entity_on(1)).unwrap();
+    browser
+        .send(json!({
+            "type": "state_get", "stream": "sharded", "key": format!("{tag}/1"),
+            "entity": entity, "id": 4
+        }))
+        .await;
+    let by_entity = browser.recv_type("state_value").await;
+    assert_eq!(
+        (
+            &by_entity["payload"],
+            &by_entity["version"],
+            by_entity.get("shard")
+        ),
+        (&one["payload"], &one["version"], None),
+        "{by_entity}"
+    );
+
+    // Shard 1's as_of is past the end of shard 3's log, and says so.
+    browser
+        .send(json!({
+            "type": "read", "stream": "sharded", "from": one["as_of"], "shard": 3, "id": 5
+        }))
+        .await;
+    let past = browser.recv().await;
+    assert_eq!(
+        (past["code"].as_str(), past["id"].as_u64()),
+        (Some("past_end"), Some(5)),
+        "{past}"
+    );
+    assert!(past["tail"].as_u64() > three["as_of"].as_u64(), "{past}");
+    assert!(past["tail"].as_u64() <= one["as_of"].as_u64(), "{past}");
+
+    browser
+        .send(json!({
+            "type": "subscribe", "stream": "sharded", "from": one["as_of"], "shard": 3
+        }))
+        .await;
+    let past = browser.recv_type("error").await;
+    assert_eq!(past["code"], "past_end", "{past}");
+    assert_eq!(past["shard"], 3, "{past}");
+
+    let mut older = Browser::connect_with(addr, "lobby", &token, json!(["read"])).await;
+    older.recv_type("hello").await;
+    older
+        .send(json!({
+            "type": "read", "stream": "sharded", "from": one["as_of"], "shard": 3, "id": 5
+        }))
+        .await;
+    let failed = older.recv().await;
+    assert_eq!(failed["code"], "read_failed", "{failed}");
+    assert!(failed.get("tail").is_none(), "{failed}");
+
+    for (refused, id) in [
+        (json!({"shard": 1, "entity": entity}), 6),
+        (json!({"shard": 4}), 7),
+    ] {
+        let mut request = json!({"type": "state_get", "stream": "sharded", "key": "k", "id": id});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(refused.as_object().unwrap().clone());
+        browser.send(request).await;
+        let refusal = browser.recv().await;
+        assert_eq!(
+            (refusal["code"].as_str(), refusal["id"].as_u64()),
+            (Some("bad_request"), Some(id)),
+            "{refusal}"
+        );
+    }
+
+    // A session that did not ask for shards cannot name one.
+    let mut plain = Browser::connect_with(addr, "lobby", &token, json!(["state"])).await;
+    plain.recv_type("hello").await;
+    plain
+        .send(json!({"type": "state_get", "stream": "sharded", "key": "k", "shard": 1, "id": 8}))
+        .await;
+    assert_eq!(plain.recv().await["code"], "bad_request");
 }
 
 #[tokio::test]
