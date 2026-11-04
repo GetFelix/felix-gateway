@@ -1605,6 +1605,7 @@ mod tests {
             reason: CursorErrorReason::TooOld,
             requested: 3,
             available: 120,
+            trim_headers: None,
         })
         .context("subscribe to app.ops.lobby");
         let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, err, false);
@@ -1627,6 +1628,7 @@ mod tests {
                 reason: CursorErrorReason::InFuture,
                 requested: 900,
                 available: 10,
+                trim_headers: None,
             })
         };
         let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, future(), false);
