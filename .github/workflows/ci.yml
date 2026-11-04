@@ -129,3 +129,13 @@ jobs:
           done
           docker logs gateway
           exit 1
+
+  # Cheap: python only. Catches a misnamed or empty fragment before the release does.
+  changelog:
+    name: changelog fragments
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 .github/scripts/changelog-assemble.py --check
+      - run: python3 .github/scripts/test_changelog_assemble.py

@@ -58,10 +58,10 @@ that too.
 ## Pull requests
 
 - CI must pass before review.
-- Add a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for
-  anything a user or an operator would notice, under `Added`, `Changed`,
-  `Fixed` or `Removed`, ending with the pull request number. That section
-  becomes the release notes.
+- Record anything a user or an operator would notice, ending with the pull request number as a fragment in `changelog.d/`
+  (`<name>.<section>.md`, see [changelog.d/README.md](changelog.d/README.md)). Never edit
+  `CHANGELOG.md` directly: fragments are merged into it at release time, so pull requests
+  don't conflict on the changelog.
 - No AI attribution in commits or pull request descriptions.
 - List design calls under "Review notes" in the description.
 
@@ -71,8 +71,9 @@ A release is a `v*` tag on `main`, such as `v0.2.0`. To cut one:
 
 1. In one pull request, set the version in `Cargo.toml` (`workspace.package`)
    and `packages/gateway-client/package.json`, run `cargo check` and
-   `npm install` to update both lockfiles, and move the `Unreleased` notes in
-   `CHANGELOG.md` under the new version with the date.
+   `npm install` to update both lockfiles, and run
+   `python3 .github/scripts/changelog-assemble.py <version>` to move the fragments and the
+   `Unreleased` notes in `CHANGELOG.md` under the new version with the date.
 2. Run the Release workflow on the branch: without a tag it is a dry run that
    checks the versions and builds everything without publishing.
 3. After merging, tag `main` and push the tag. The workflow publishes the

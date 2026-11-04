@@ -113,6 +113,7 @@ jobs:
           path: .release-tools
           sparse-checkout: |
             CHANGELOG.md
+            changelog.d
             .github/scripts
           sparse-checkout-cone-mode: false
 
@@ -137,6 +138,21 @@ jobs:
         env:
           TAG: ${{ steps.plan.outputs.tag }}
         run: python3 .release-tools/.github/scripts/check-release-version.py "$TAG"
+
+      # Fragments left behind mean the assembler was not run, so their entries
+      # are missing from the notes extracted below. Pull request rehearsals
+      # carry fragments of their own, so only a real release is held to this.
+      - name: Changelog fragments are assembled
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          left=$(find .release-tools/changelog.d -maxdepth 1 -type f ! -name README.md ! -name '.*' 2>/dev/null || true)
+          if [ -n "$left" ]; then
+            echo "::error::changelog.d/ still has fragments; run .github/scripts/changelog-assemble.py ${VERSION} and commit the result before tagging"
+            echo "$left"
+            exit 1
+          fi
 
       - name: Release notes from CHANGELOG.md
         env:
