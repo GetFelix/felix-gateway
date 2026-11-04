@@ -1390,7 +1390,7 @@ fn subscription_error(
         err.chain()
             .filter_map(|cause| cause.downcast_ref::<SubscribeCursorError>())
             .find(|cursor| cursor.reason == reason)
-            .copied()
+            .cloned()
     };
     let trimmed = cursor(CursorErrorReason::TooOld);
     let beyond = cursor(CursorErrorReason::InFuture).filter(|_| past_end);
@@ -1605,6 +1605,7 @@ mod tests {
             reason: CursorErrorReason::TooOld,
             requested: 3,
             available: 120,
+            trim_headers: None,
         })
         .context("subscribe to app.ops.lobby");
         let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, err, false);
@@ -1627,6 +1628,7 @@ mod tests {
                 reason: CursorErrorReason::InFuture,
                 requested: 900,
                 available: 10,
+                trim_headers: None,
             })
         };
         let message = subscription_error("ops".into(), ErrorCode::SubscribeFailed, future(), false);
