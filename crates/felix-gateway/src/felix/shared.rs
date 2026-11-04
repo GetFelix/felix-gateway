@@ -1,6 +1,6 @@
 //! Shared connections: a few Felix connections opened as the gateway, with
 //! each session acting as its own user on one of them
-//! (`Client::with_identity`). The broker authenticates every stream with the
+//! (`Connection::with_identity`). The broker authenticates every stream with the
 //! user's delegated token and applies its subscription cap and publish budget
 //! per user, so a session reaches what its user may reach and no more.
 
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use felix_client::{
-    Client, ClientConfig, ClientIdentity, Event, RefreshingToken, StartPosition,
+    ClientConfig, ClientIdentity, Connection, Event, RefreshingToken, StartPosition,
     SubscriptionLagged, TokenProvider,
 };
 use tokio::sync::{Mutex, RwLock};
@@ -32,7 +32,7 @@ pub(crate) struct Pool {
 
 #[derive(Default)]
 struct Slot {
-    parent: Mutex<Option<Arc<Client>>>,
+    parent: Mutex<Option<Arc<Connection>>>,
     /// Sessions attached, to put the next one on the least used slot.
     sessions: AtomicUsize,
 }
@@ -76,7 +76,11 @@ impl Pool {
 
     /// The slot's parent client, connecting it if there is none or `stale`
     /// is the one there.
-    async fn parent(&self, index: usize, stale: Option<&Arc<Client>>) -> Result<Arc<Client>> {
+    async fn parent(
+        &self,
+        index: usize,
+        stale: Option<&Arc<Connection>>,
+    ) -> Result<Arc<Connection>> {
         let mut parent = self.slots[index].parent.lock().await;
         if let Some(client) = parent.as_ref()
             && !stale.is_some_and(|stale| Arc::ptr_eq(stale, client))
@@ -88,7 +92,7 @@ impl Pool {
         Ok(client)
     }
 
-    async fn connect(&self) -> Result<Client> {
+    async fn connect(&self) -> Result<Connection> {
         // Read at each connection, so a renewed certificate is used from the
         // next one on.
         let identity = ClientIdentity::from_pem_files(&self.client_cert, &self.client_key)?;
@@ -106,7 +110,7 @@ impl Pool {
         config.event_conn_pool = 1;
         config.cache_conn_pool = 1;
         let seeds = self.brokers.seeds().await?;
-        Client::connect_any(&seeds, &self.brokers.server_name, config)
+        Connection::connect_any(&seeds, &self.brokers.server_name, config)
             .await
             .context("connect to Felix as the gateway")
     }
@@ -155,7 +159,7 @@ impl Drop for Lease {
 /// One user's identity on a shared connection. Dropping it closes its
 /// streams and leaves the connection to everyone else.
 pub(crate) struct Identity {
-    pub(crate) client: Client,
+    pub(crate) client: Connection,
     _lease: Lease,
 }
 
