@@ -113,7 +113,6 @@ jobs:
           path: .release-tools
           sparse-checkout: |
             CHANGELOG.md
-            changelog.d
             .github/scripts
           sparse-checkout-cone-mode: false
 
@@ -147,7 +146,7 @@ jobs:
         env:
           VERSION: ${{ steps.plan.outputs.version }}
         run: |
-          left=$(find .release-tools/changelog.d -maxdepth 1 -type f ! -name README.md ! -name '.*' 2>/dev/null || true)
+          left=$(find changelog.d -maxdepth 1 -type f ! -name README.md ! -name '.*' 2>/dev/null || true)
           if [ -n "$left" ]; then
             echo "::error::changelog.d/ still has fragments; run .github/scripts/changelog-assemble.py ${VERSION} and commit the result before tagging"
             echo "$left"
