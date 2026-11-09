@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use felix_client::{ClientConfig, ClusterClient, StartPosition};
+use felix_client::{Client, ClientConfig, StartPosition};
 use felix_gateway::{Config, resolve_brokers};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
         client_config.client_sub_queue_policy = felix_client::ClientSubQueuePolicy::Block;
     }
     let client = Arc::new(
-        ClusterClient::connect(
+        Client::connect(
             &resolve_brokers(&config.brokers).await?,
             &config.server_name,
             client_config,
