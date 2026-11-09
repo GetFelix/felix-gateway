@@ -1,1 +1,0 @@
-- The release workflow now checks `changelog.d` in the tagged commit for leftover fragments, not the one on the branch it runs from.
