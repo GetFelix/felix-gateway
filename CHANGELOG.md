@@ -11,6 +11,19 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-09
+
+This release uses Felix 0.7.0 and needs a Felix 0.7 broker and control plane. It
+builds on the `felix-client` and `felix-wire` 0.7.0 crates, where `Client` is
+the cluster client. The browser protocol and the scope file format are
+unchanged.
+
+### Changed
+- Built on and tested against Felix 0.7.0: felix-client and felix-wire 0.7.0, and the dev stack runs the 0.7.0 images.
+
+### Fixed
+- The release workflow now checks `changelog.d` in the tagged commit for leftover fragments, not the one on the branch it runs from.
+
 ## [0.8.0] - 2026-11-02
 
 Tested against Felix 0.6.2. Four opt-in additions, each turned on by naming it
