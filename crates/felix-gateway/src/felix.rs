@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use felix_client::{
-    CacheConditionResult, CacheWatch, CacheWatchFilter, CacheWatchItem, ClientConfig,
-    ClusterCacheWatch, ClusterClient, ClusterSubscription, Event, StartPosition, StateValue,
-    StreamPage, TokenProvider, VersionedValue,
+    CacheConditionResult, CacheWatch, CacheWatchFilter, CacheWatchItem, Client, ClientConfig,
+    ClusterCacheWatch, ClusterSubscription, Event, StartPosition, StateValue, StreamPage,
+    TokenProvider, VersionedValue,
 };
 use felix_wire::{AckMode, CacheCondition};
 use rustls::RootCertStore;
@@ -128,7 +128,7 @@ impl Brokers {
 
     /// Connect with tokens from `tokens`, which decide what this connection
     /// may touch.
-    pub(crate) async fn connect(&self, tokens: Arc<dyn TokenProvider>) -> Result<ClusterClient> {
+    pub(crate) async fn connect(&self, tokens: Arc<dyn TokenProvider>) -> Result<Client> {
         let quic = felix_client::quic_client_config(self.roots.clone(), true)?;
         let mut config = ClientConfig::optimized_defaults(quic);
         config.auth_tenant_id = Some(self.tenant.clone());
@@ -140,7 +140,7 @@ impl Brokers {
         config.event_conn_pool = 1;
         config.cache_conn_pool = 1;
         let seeds = self.seeds().await?;
-        ClusterClient::connect(&seeds, &self.server_name, config)
+        Client::connect(&seeds, &self.server_name, config)
             .await
             .context("connect to Felix")
     }
@@ -149,7 +149,7 @@ impl Brokers {
 /// How a session reaches Felix.
 enum Link {
     /// A connection of its own.
-    Own(Arc<ClusterClient>),
+    Own(Arc<Client>),
     /// Its user's identity on a shared connection.
     Shared(shared::Session),
 }
@@ -218,12 +218,7 @@ impl Watch {
 }
 
 impl Felix {
-    pub(crate) fn new(
-        client: ClusterClient,
-        brokers: &Brokers,
-        scope: Scope,
-        principal: String,
-    ) -> Self {
+    pub(crate) fn new(client: Client, brokers: &Brokers, scope: Scope, principal: String) -> Self {
         Self::with_link(Link::Own(Arc::new(client)), brokers, scope, principal)
     }
 

@@ -39,7 +39,7 @@ use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
-use felix_client::{ClusterClient, TokenProvider};
+use felix_client::{Client, TokenProvider};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tower_http::services::ServeDir;
@@ -166,7 +166,7 @@ impl Gateway {
     ///
     /// # Errors
     /// When no broker accepts the connection.
-    pub async fn connect_felix(&self, tokens: Arc<dyn TokenProvider>) -> Result<ClusterClient> {
+    pub async fn connect_felix(&self, tokens: Arc<dyn TokenProvider>) -> Result<Client> {
         self.brokers.connect(tokens).await
     }
 
@@ -194,7 +194,7 @@ pub struct SharedIdentity(Arc<felix::Identity>);
 
 impl SharedIdentity {
     /// The client that acts as this identity.
-    pub fn client(&self) -> &felix_client::Client {
+    pub fn client(&self) -> &felix_client::Connection {
         &self.0.client
     }
 }
