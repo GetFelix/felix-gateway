@@ -1,0 +1,1 @@
+- Built on and tested against Felix 0.7.1: felix-client and felix-wire 0.7.1, and the dev stack runs the 0.7.1 images.
