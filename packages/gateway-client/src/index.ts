@@ -62,7 +62,10 @@ export type ServerMessage =
 
 /**
  * The sign-in, and the scope to open under the key the gateway's scope file
- * names, such as `{ room: "lobby", token }`.
+ * names, such as `{ room: "lobby", token }`. On a gateway that serves several
+ * namespaces, `namespace` picks one, such as
+ * `{ namespace: "payments", room: "lobby", token }`; `Hello.namespace` says
+ * which one the session opened.
  */
 export interface Join {
   token: string;

@@ -15,7 +15,7 @@ roles that let people open them are set up before the gateway starts.
 | `GATEWAY_OIDC_CLIENT_ID` | required | The client registered for the browser app at the identity provider. Browsers' ID tokens carry it as audience |
 | `GATEWAY_OIDC_ISSUER` | `http://127.0.0.1:9400` | The identity provider browsers sign in with, as its OpenID Connect issuer URL |
 | `GATEWAY_OIDC_SCOPES` | `openid profile` | The scopes a browser asks the provider for |
-| `GATEWAY_NAMESPACE` | `default` | The Felix namespace the scope's resources live in |
+| `GATEWAY_NAMESPACE` | `default` | The Felix namespace a `join` opens when it names none. Without `namespaces` in the scope file it is the only one the gateway serves |
 | `GATEWAY_LISTEN` | `127.0.0.1:8787` | Where browsers connect. The image sets `0.0.0.0:8787` |
 | `GATEWAY_FELIX_BROKERS` | `127.0.0.1:5000` | Comma-separated broker addresses as `host:port`. Names are resolved at each connection, so a broker that comes back on a new address is found again |
 | `GATEWAY_FELIX_SERVER_NAME` | `localhost` | The name the broker's certificate is checked against |
@@ -175,6 +175,7 @@ max_payload_bytes = 65536
 
 | Key | Meaning |
 |---|---|
+| `namespaces` | Top level, unset by default. The Felix namespaces a `join` may name, each 1 to 64 ASCII letters, digits, `-` or `_`. See [More than one namespace](#more-than-one-namespace) |
 | `allow_throttle` | Top level, default `false`. Whether `throttle` is allowed. It exists to demonstrate a slow browser, and it lets a browser hold its subscriptions' queues full, so keep it `false` on a public gateway |
 | `field` | 1 to 64 ASCII letters, digits, `-` or `_`, and not `type`, `token`, `protocol` or `features` |
 | `alias` | What messages call the resource. The same rule as `field`, unique within its kind |
@@ -189,6 +190,39 @@ max_payload_bytes = 65536
 | `write_burst` | The burst for `writes_per_s`, above 0. Default: one second's worth |
 
 Unknown keys are an error, so a typo fails at startup instead of being ignored.
+
+## More than one namespace
+
+One gateway can serve several namespaces of its tenant, such as one per team:
+
+```toml
+namespaces = ["payments", "web"]
+
+[scope]
+field = "room"
+# streams, caches and counters as above
+```
+
+A `join` names its namespace with `"namespace": "payments"` next to the
+scope's value. Every listed namespace has the same scope: the same aliases,
+and resources named the same way inside it. The gateway refuses a `join` that
+names a namespace not in the list, with `forbidden`, before it asks the
+control plane anything. A `join` that names none opens `GATEWAY_NAMESPACE`,
+which is refused too unless it is listed.
+
+Listing a namespace does not give anyone access to it. The gateway asks the
+token exchange for the scope's permissions in the namespace the `join` named,
+and Felix grants only what the person's roles hold there. Someone whose roles
+cover `payments` but not `web` is refused `web` with `forbidden`, exactly as
+for a scope they are not a member of.
+
+Without `namespaces` the gateway behaves as it always has: it serves
+`GATEWAY_NAMESPACE` only, a `join` that names no namespace opens it, and a
+`join` that names another one is refused. With `namespaces` set, `field`
+cannot be `namespace`, since `join` carries the namespace under that key.
+
+The write limits and session caps count across namespaces: a person has one
+`sessions_per_principal` budget on the gateway, wherever their sessions are.
 
 ## Write limits
 
@@ -285,7 +319,8 @@ Each action needs one Felix permission on the resource:
 | cache `write` | `cache.write` |
 | counter `add` | `cache.write`, since Felix keeps counters in caches |
 
-A join asks the token exchange for exactly those on the scope's resources, so
+A join asks the token exchange for exactly those on the scope's resources in
+the session's namespace, so
 a person needs a role that grants them, and the session's token can do nothing
 else. Felix grants a cache as a whole, never one key of it, which is why each
 scope has its own caches.

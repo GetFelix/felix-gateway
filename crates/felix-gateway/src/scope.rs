@@ -18,6 +18,9 @@ const PLACEHOLDER: &str = "{scope}";
 /// Keys of `join` that cannot name the scope.
 const RESERVED_FIELDS: [&str; 4] = ["type", "token", "protocol", "features"];
 
+/// The key `join` names its namespace under.
+const NAMESPACE_KEY: &str = "namespace";
+
 pub(crate) const BAD_NAME: &str = "a name is 1 to 64 ASCII letters, digits, '-' or '_'";
 
 /// The scope file: what one scope holds and what a session may do with it.
@@ -31,6 +34,10 @@ pub struct ScopeConfig {
     /// Write rates, payload sizes and session caps.
     #[serde(default)]
     pub(crate) limits: LimitsConfig,
+    /// The Felix namespaces a `join` may name. Unset serves only
+    /// `GATEWAY_NAMESPACE`, which a `join` may name or leave out.
+    #[serde(default)]
+    pub(crate) namespaces: Option<Vec<String>>,
     pub(crate) scope: ScopeSpec,
 }
 
@@ -177,6 +184,21 @@ impl ScopeConfig {
             valid_name(field) && !RESERVED_FIELDS.contains(&field.as_str()),
             "field {field:?}: {BAD_NAME}, and not one of {RESERVED_FIELDS:?}"
         );
+        if let Some(namespaces) = &config.namespaces {
+            ensure!(!namespaces.is_empty(), "namespaces: list at least one");
+            for (i, namespace) in namespaces.iter().enumerate() {
+                ensure!(valid_name(namespace), "namespace {namespace:?}: {BAD_NAME}");
+                ensure!(
+                    !namespaces[..i].contains(namespace),
+                    "namespace {namespace:?} is listed twice"
+                );
+            }
+            // `join` names its namespace under this key.
+            ensure!(
+                field != NAMESPACE_KEY,
+                "field {field:?}: with namespaces, `join` names the namespace under that key"
+            );
+        }
         check(&config.scope.streams)?;
         check(&config.scope.caches)?;
         check(&config.scope.counters)?;
@@ -198,6 +220,39 @@ impl ScopeConfig {
     pub fn stream_name(&self, alias: &str, scope: &str) -> Option<String> {
         let stream = self.scope.streams.iter().find(|s| s.alias == alias)?;
         Some(stream.name.replace(PLACEHOLDER, scope))
+    }
+
+    /// The namespace a `join` opens: the one it names under `namespace`, or
+    /// `default` (`GATEWAY_NAMESPACE`) when it names none. A namespace the
+    /// gateway does not serve is refused; serving it still leaves the grant
+    /// to Felix, since the session's token is narrowed to that namespace.
+    pub(crate) fn namespace(
+        &self,
+        fields: &serde_json::Map<String, serde_json::Value>,
+        default: &str,
+    ) -> Result<String, NamespaceRefused> {
+        // A scope whose field is `namespace` carries its value there, so a
+        // join to it cannot pick a namespace.
+        let named = match fields.get(NAMESPACE_KEY) {
+            Some(_) if self.scope.field == NAMESPACE_KEY => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|name| valid_name(name))
+                    .ok_or(NamespaceRefused::Invalid)?,
+            ),
+            None => None,
+        };
+        let namespace = named.unwrap_or(default);
+        let served = match &self.namespaces {
+            Some(namespaces) => namespaces.iter().any(|served| served == namespace),
+            None => namespace == default,
+        };
+        if served {
+            Ok(namespace.to_string())
+        } else {
+            Err(NamespaceRefused::NotServed(namespace.to_string()))
+        }
     }
 
     /// How long an entry of each cache with a TTL lasts, in milliseconds.
@@ -260,6 +315,15 @@ fn check<A: Action>(resources: &[Resource<A>]) -> Result<()> {
     Ok(())
 }
 
+/// Why a `join` cannot open the namespace it names.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NamespaceRefused {
+    /// Not a string, or not a valid name.
+    Invalid,
+    /// A valid name this gateway does not serve.
+    NotServed(String),
+}
+
 /// Scope values and keys end up inside Felix stream, cache and RBAC names, so
 /// they are kept to an alphabet with no separators or wildcards.
 pub(crate) fn valid_name(name: &str) -> bool {
@@ -289,16 +353,24 @@ pub(crate) struct Bound<'a, A> {
 #[derive(Debug, Clone)]
 pub(crate) struct Scope {
     config: Arc<ScopeConfig>,
+    /// The Felix namespace the scope's resources live in.
+    namespace: String,
     value: String,
 }
 
 impl Scope {
-    /// `None` unless `value` passes [`valid_name`].
-    pub(crate) fn parse(config: &Arc<ScopeConfig>, value: &str) -> Option<Self> {
+    /// `None` unless `value` passes [`valid_name`]. `namespace` is one
+    /// [`ScopeConfig::namespace`] chose.
+    pub(crate) fn parse(config: &Arc<ScopeConfig>, namespace: &str, value: &str) -> Option<Self> {
         valid_name(value).then(|| Self {
             config: Arc::clone(config),
+            namespace: namespace.to_string(),
             value: value.to_string(),
         })
+    }
+
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
     }
 
     pub(crate) fn config(&self) -> &ScopeConfig {
@@ -355,10 +427,11 @@ impl Scope {
         })
     }
 
-    /// Every permission a session in this scope asks for. Each scope has its
-    /// own resources because Felix authorizes a cache as a whole, never one
-    /// key of it.
-    pub(crate) fn permissions(&self, tenant: &str, namespace: &str) -> Vec<Permission> {
+    /// Every permission a session in this scope asks for, all in its
+    /// namespace. Each scope has its own resources because Felix authorizes a
+    /// cache as a whole, never one key of it.
+    pub(crate) fn permissions(&self, tenant: &str) -> Vec<Permission> {
+        let namespace = self.namespace.as_str();
         let mut permissions = Vec::new();
         let spec = &self.config.scope;
         self.add_permissions(&mut permissions, &spec.streams, tenant, namespace);
@@ -431,24 +504,26 @@ pub(crate) mod tests {
 
     pub(crate) fn lobby() -> Scope {
         let config = Arc::new(ScopeConfig::parse(EXAMPLE).unwrap());
-        Scope::parse(&config, "lobby").unwrap()
+        Scope::parse(&config, "default", "lobby").unwrap()
     }
 
     #[test]
     fn values_that_could_reach_another_resource_are_refused() {
         let config = Arc::new(ScopeConfig::parse(EXAMPLE).unwrap());
         for bad in ["", "a.b", "a/b", "a:b", "*", "lobby*", &"x".repeat(65)] {
-            assert!(Scope::parse(&config, bad).is_none(), "{bad:?}");
+            assert!(Scope::parse(&config, "default", bad).is_none(), "{bad:?}");
         }
         assert_eq!(
-            Scope::parse(&config, "studio-2_b").unwrap().value(),
+            Scope::parse(&config, "default", "studio-2_b")
+                .unwrap()
+                .value(),
             "studio-2_b"
         );
     }
 
     #[test]
     fn a_scope_asks_for_its_own_resources_only() {
-        let permissions = lobby().permissions("t", "default");
+        let permissions = lobby().permissions("t");
         let shown: Vec<(&str, Option<&str>)> = permissions
             .iter()
             .map(|p| (p.grant.as_str(), p.optional.as_deref()))
@@ -469,6 +544,82 @@ pub(crate) mod tests {
         );
     }
 
+    fn join(namespace: Option<serde_json::Value>) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("room".into(), "lobby".into());
+        if let Some(namespace) = namespace {
+            fields.insert("namespace".into(), namespace);
+        }
+        fields
+    }
+
+    #[test]
+    fn without_namespaces_a_join_opens_the_gateways_namespace_only() {
+        let config = ScopeConfig::parse(EXAMPLE).unwrap();
+        assert_eq!(
+            config.namespace(&join(None), "default"),
+            Ok("default".into())
+        );
+        assert_eq!(
+            config.namespace(&join(Some("default".into())), "default"),
+            Ok("default".into())
+        );
+        assert_eq!(
+            config.namespace(&join(Some("other".into())), "default"),
+            Err(NamespaceRefused::NotServed("other".into()))
+        );
+        for bad in [serde_json::json!(1), "a/b".into(), "*".into()] {
+            assert_eq!(
+                config.namespace(&join(Some(bad)), "default"),
+                Err(NamespaceRefused::Invalid)
+            );
+        }
+        // A scope whose field is `namespace` keeps its value there.
+        let named = ScopeConfig::parse(&EXAMPLE.replace("\"room\"", "\"namespace\"")).unwrap();
+        let mut fields = serde_json::Map::new();
+        fields.insert("namespace".into(), "lobby".into());
+        assert_eq!(named.namespace(&fields, "default"), Ok("default".into()));
+    }
+
+    #[test]
+    fn with_namespaces_a_join_opens_a_listed_one_and_asks_for_grants_there() {
+        let text = format!("namespaces = [\"team-a\", \"team-b\"]\n{EXAMPLE}");
+        let config = Arc::new(ScopeConfig::parse(&text).unwrap());
+        for namespace in ["team-a", "team-b"] {
+            let chosen = config
+                .namespace(&join(Some(namespace.into())), "default")
+                .unwrap();
+            let scope = Scope::parse(&config, &chosen, "lobby").unwrap();
+            assert_eq!(scope.namespace(), namespace);
+            let permissions = scope.permissions("t");
+            let prefix = format!(":t/{namespace}/");
+            assert!(permissions.iter().all(|p| p.grant.contains(&prefix)));
+        }
+        assert_eq!(
+            config.namespace(&join(Some("team-c".into())), "default"),
+            Err(NamespaceRefused::NotServed("team-c".into()))
+        );
+        // Naming none opens GATEWAY_NAMESPACE, which must be listed too.
+        assert_eq!(
+            config.namespace(&join(None), "default"),
+            Err(NamespaceRefused::NotServed("default".into()))
+        );
+        assert_eq!(config.namespace(&join(None), "team-b"), Ok("team-b".into()));
+    }
+
+    #[test]
+    fn a_namespaces_list_that_breaks_a_rule_is_refused() {
+        for list in ["[]", "[\"a\", \"a\"]", "[\"a/b\"]", "[\"\"]"] {
+            let text = format!("namespaces = {list}\n{EXAMPLE}");
+            assert!(ScopeConfig::parse(&text).is_err(), "{list}");
+        }
+        let field = format!(
+            "namespaces = [\"a\"]\n{}",
+            EXAMPLE.replace("\"room\"", "\"namespace\"")
+        );
+        assert!(ScopeConfig::parse(&field).is_err());
+    }
+
     #[test]
     fn a_shared_resource_is_the_same_in_every_scope() {
         let text = format!(
@@ -477,12 +628,12 @@ pub(crate) mod tests {
         );
         let config = Arc::new(ScopeConfig::parse(&text).unwrap());
         for value in ["lobby", "studio"] {
-            let scope = Scope::parse(&config, value).unwrap();
+            let scope = Scope::parse(&config, "default", value).unwrap();
             let bound = scope.cache("directory", CacheAction::Read).unwrap();
             assert_eq!(bound.name, "app.directory");
             assert!(
                 scope
-                    .permissions("t", "default")
+                    .permissions("t")
                     .iter()
                     .any(|p| p.grant == "cache.read:cache:t/default/app.directory")
             );

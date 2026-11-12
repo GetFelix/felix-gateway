@@ -42,6 +42,9 @@ browser client.
 - Counter adds.
 - Sign-in through any OpenID Connect provider. Each connection's Felix token
   covers one scope and only the actions the scope file lists.
+- Several namespaces of a tenant from one gateway, such as one per team. A
+  `join` names its namespace, the gateway serves only the ones the scope file
+  lists, and Felix grants each person only the namespaces their roles reach.
 - Optional resources, for people who may join a scope without every grant,
   such as a spectator who cannot publish a player's input.
 - Sender stamping: on a stream marked `stamp_sender`, every record carries its
@@ -129,6 +132,11 @@ alias = "seq"
 name = "app.seq.{scope}"
 actions = ["add"]
 ```
+
+To serve several namespaces of the tenant from one gateway, list them at the
+top of the scope file with `namespaces = ["payments", "web"]`; a `join` then
+names one with `"namespace": "payments"`. Without the list the gateway serves
+`GATEWAY_NAMESPACE` only, as before.
 
 Write limits are on by default; the `[limits]` table changes them.
 The gateway never creates resources or grants; set those up in Felix first.

@@ -1,6 +1,7 @@
 // Seeds the development stack: bootstrap a tenant that trusts the stand-in
 // identity provider, create each room's streams, caches and counter as named
-// in dev/scope.toml, and give each room a role whose members may open it.
+// in dev/scope.toml in each namespace, and give each room a role whose members
+// may open it.
 // Writes the brokers' credential and the gateway's to the state directory.
 import { createHash } from "node:crypto";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
@@ -11,12 +12,16 @@ const BOOTSTRAP_TOKEN = "dev-bootstrap";
 const IDP = "http://idp:9400";
 const STATE = "/state";
 const TENANT = "demo";
-const NAMESPACE = "default";
 // The gateway's GATEWAY_OIDC_CLIENT_ID; browsers' ID tokens carry it as audience.
 const CLIENT_ID = "felix-gateway";
-// Ana is in both rooms, so the tests can show that a session in one room
-// cannot reach the other even for someone allowed in both.
-const MEMBERS = { lobby: ["ana", "ben", "cleo"], studio: ["ana"] };
+// Rooms and their members, by namespace. Ana is in both rooms, so the tests
+// can show that a session in one room cannot reach the other even for someone
+// allowed in both. Only Ana is in `other`, for the tests of a gateway serving
+// two namespaces: Ben's lobby grant is in `default` only.
+const NAMESPACES = {
+  default: { lobby: ["ana", "ben", "cleo"], studio: ["ana"] },
+  other: { lobby: ["ana"] },
+};
 
 async function request(method, url, { token, headers = {}, body } = {}) {
   const response = await fetch(url, {
@@ -56,15 +61,16 @@ async function exchange(subject, body) {
   return (await request("POST", url, { token: id_token, body })).felix_token;
 }
 
-const object = (kind, name) => `${kind}:${TENANT}/${NAMESPACE}/${name}`;
+const object = (ns, kind, name) => `${kind}:${TENANT}/${ns}/${name}`;
 const tenant = `${CONTROL_PLANE}/v1/tenants/${TENANT}`;
-const namespace = `${tenant}/namespaces/${NAMESPACE}`;
+// The default namespace keeps the role names it always had.
+const roomRole = (ns, room) => (ns === "default" ? `role:room-${room}` : `role:${ns}-room-${room}`);
 
 // A room's role holds exactly what a session in it needs; the gateway asks the
 // token exchange for no more than the scope file's grants.
-function roomPolicies(room) {
-  const role = `role:room-${room}`;
-  const grant = (kind, name, action) => ({ subject: role, object: object(kind, name), action });
+function roomPolicies(ns, room) {
+  const role = roomRole(ns, room);
+  const grant = (kind, name, action) => ({ subject: role, object: object(ns, kind, name), action });
   return [
     ...[`demo.ops.${room}`, `demo.presence.${room}`, `demo.shards.${room}`].flatMap((stream) => [
       grant("stream", stream, "stream.publish"),
@@ -98,8 +104,10 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
       // Gateways act for users on shared connections. Their own broker token
       // is connection-only, so they need no broker grant.
       { subject: "role:gateway", object: `tenant:${TENANT}`, action: "token.delegate" },
-      { subject: "role:admin", object: object("stream", "*"), action: "stream.manage" },
-      { subject: "role:admin", object: object("cache", "*"), action: "cache.manage" },
+      ...Object.keys(NAMESPACES).flatMap((ns) => [
+        { subject: "role:admin", object: object(ns, "stream", "*"), action: "stream.manage" },
+        { subject: "role:admin", object: object(ns, "cache", "*"), action: "cache.manage" },
+      ]),
       // The admin finalizes the fleet features the first broker's cluster needs.
       { subject: "role:admin", object: "cluster:*", action: "node.manage" },
       { subject: "role:broker", object: "cluster:*", action: "node.view" },
@@ -117,10 +125,6 @@ await request("POST", `${BOOTSTRAP}/internal/bootstrap/tenants/${TENANT}/initial
 });
 
 const admin = await exchange("demo-admin", { audience: "felix-controlplane" });
-await request("POST", `${tenant}/namespaces`, {
-  token: admin,
-  body: { namespace: NAMESPACE, display_name: NAMESPACE },
-});
 const stream = (name, durable, shards = 1) => ({
   stream: name,
   kind: "Stream",
@@ -131,49 +135,64 @@ const stream = (name, durable, shards = 1) => ({
   delivery: durable ? "AtLeastOnce" : "AtMostOnce",
   durable,
 });
-// The one cache every room shares.
-console.log("cache demo.directory");
-await request("POST", `${namespace}/caches`, {
-  token: admin,
-  body: {
-    cache: "demo.directory",
-    display_name: "demo.directory",
-    shards: 1,
-    replication_factor: 1,
-    consistency: "Leader",
-  },
-});
-for (const [room, members] of Object.entries(MEMBERS)) {
-  for (const [name, durable, shards] of [
-    [`demo.ops.${room}`, true, 1],
-    [`demo.presence.${room}`, false, 1],
-    // Four shards, for the tests that follow one shard of a stream.
-    [`demo.shards.${room}`, true, 4],
-  ]) {
-    console.log(`stream ${name}`);
-    await request("POST", `${namespace}/streams`, {
-      token: admin,
-      body: stream(name, durable, shards),
-    });
-  }
-  // Caches per room, because Felix grants a cache as a whole. One shard each:
-  // a prefix watch reads a single shard.
-  for (const cache of [`demo.seq.${room}`, `demo.snap.${room}`, `demo.members.${room}`]) {
-    console.log(`cache ${cache}`);
-    await request("POST", `${namespace}/caches`, {
-      token: admin,
-      body: { cache, display_name: cache, shards: 1, replication_factor: 1, consistency: "Leader" },
-    });
-  }
-  console.log(`role:room-${room} for ${members.join(", ")}`);
-  for (const policy of roomPolicies(room)) {
-    await request("POST", `${tenant}/rbac/policies`, { token: admin, body: policy });
-  }
-  for (const name of members) {
-    await request("POST", `${tenant}/rbac/groupings`, {
-      token: admin,
-      body: { user: principal(name), role: `role:room-${room}` },
-    });
+for (const [ns, rooms] of Object.entries(NAMESPACES)) {
+  console.log(`namespace ${ns}`);
+  await request("POST", `${tenant}/namespaces`, {
+    token: admin,
+    body: { namespace: ns, display_name: ns },
+  });
+  const namespace = `${tenant}/namespaces/${ns}`;
+  // The one cache every room shares.
+  console.log("cache demo.directory");
+  await request("POST", `${namespace}/caches`, {
+    token: admin,
+    body: {
+      cache: "demo.directory",
+      display_name: "demo.directory",
+      shards: 1,
+      replication_factor: 1,
+      consistency: "Leader",
+    },
+  });
+  for (const [room, members] of Object.entries(rooms)) {
+    for (const [name, durable, shards] of [
+      [`demo.ops.${room}`, true, 1],
+      [`demo.presence.${room}`, false, 1],
+      // Four shards, for the tests that follow one shard of a stream.
+      [`demo.shards.${room}`, true, 4],
+    ]) {
+      console.log(`stream ${name}`);
+      await request("POST", `${namespace}/streams`, {
+        token: admin,
+        body: stream(name, durable, shards),
+      });
+    }
+    // Caches per room, because Felix grants a cache as a whole. One shard each:
+    // a prefix watch reads a single shard.
+    for (const cache of [`demo.seq.${room}`, `demo.snap.${room}`, `demo.members.${room}`]) {
+      console.log(`cache ${cache}`);
+      await request("POST", `${namespace}/caches`, {
+        token: admin,
+        body: {
+          cache,
+          display_name: cache,
+          shards: 1,
+          replication_factor: 1,
+          consistency: "Leader",
+        },
+      });
+    }
+    const role = roomRole(ns, room);
+    console.log(`${role} for ${members.join(", ")}`);
+    for (const policy of roomPolicies(ns, room)) {
+      await request("POST", `${tenant}/rbac/policies`, { token: admin, body: policy });
+    }
+    for (const name of members) {
+      await request("POST", `${tenant}/rbac/groupings`, {
+        token: admin,
+        body: { user: principal(name), role },
+      });
+    }
   }
 }
 

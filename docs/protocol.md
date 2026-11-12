@@ -92,6 +92,7 @@ up.
 | `protocol` | The protocol version. Optional; leaving it out means 1 |
 | `features` | Optional features to turn on. Optional; leaving it out asks for none |
 | `room` | The scope's value, under the scope file's `field`: 1 to 64 ASCII letters, digits, `-` or `_` |
+| `namespace` | The Felix namespace to open the scope in. Optional; leaving it out opens the gateway's own (`GATEWAY_NAMESPACE`). A gateway serves the namespaces its scope file lists under `namespaces`, or only its own when there is no list. When the scope file's `field` is `namespace`, this key is the scope's value instead |
 | `token` | The ID token from signing in |
 
 The first message on every connection, and the only one allowed before
@@ -101,15 +102,22 @@ then closes the connection:
 
 | Code | Meaning |
 |---|---|
-| `forbidden` | The signed-in person may not open this scope, or it does not exist |
+| `forbidden` | The signed-in person may not open this scope, or it does not exist, or the gateway does not serve the namespace the `join` names |
 | `signed_out` | The ID token is missing, expired or from a provider the tenant does not trust |
 | `unavailable` | The control plane or the brokers could not be reached, or, on a gateway with shared connections, the control plane would not accept the gateway's own token or would not delegate the token to the gateway. Reconnect as after any drop |
 | `unsupported` | The `join` asked for a protocol version this gateway does not speak |
-| `bad_request` | The first message was not a `join`, or the scope's value is not allowed |
+| `bad_request` | The first message was not a `join`, or the scope's value or the namespace is not allowed |
 | `rate_limited` | Only with the `rate_limited` feature: the person or the client address already holds as many sessions as the gateway allows. Without the feature this is `unavailable`. Retry once another session has closed |
 
 A resource marked `optional` in the scope file may be missing from the
 person's grants without refusing the join; `hello` lists it under `missing`.
+
+A session is in one namespace. Its Felix token is narrowed to the scope's
+resources in that namespace, so a grant in one namespace opens nothing in
+another, and the gateway never asks for more than the person's grants allow.
+A page that shows scopes from several namespaces opens one connection for each.
+A gateway from before namespaces ignores `namespace` and opens its own, so a
+page that names one checks `namespace` in `hello`.
 
 Messages sent after `join` and before `hello` wait for the answer, so a page
 can send its first `subscribe` right after `join`. A connection that sends
@@ -402,7 +410,8 @@ A message sent while a page unloads may never leave it, so a closing tab can
 send `POST /members/leave` with `navigator.sendBeacon`, which the browser
 delivers after the page is gone. The body is
 `{"room": "lobby", "token": "<ID token>", "cache": "members", "key": "3f9a0c12d4e5b6a7"}`,
-with the scope under the scope file's `field`. The gateway exchanges the token
+with the scope under the scope file's `field`, and `namespace` when the
+session's `join` named one. The gateway exchanges the token
 exactly as for `join` before it deletes anything, and answers 204, 400 for a
 bad scope or key or a cache that does not allow `write`, 403 with the
 refusal as an `error` message, or 429 when its sender is over the write
@@ -640,7 +649,7 @@ The answer to `join`: the session is open on this scope.
 |---|---|
 | `protocol` | The version the session speaks |
 | `features` | The features of the `join` the gateway accepted |
-| `namespace` | The Felix namespace the scope's resources live in |
+| `namespace` | The Felix namespace the session opened: the one the `join` named, or the gateway's own |
 | `room` | The scope's value, under the scope file's `field` |
 | `cache_ttl_ms` | How long an entry lasts without a write, for each cache with a `ttl_s` |
 | `missing` | Present only when not empty: aliases of `optional` resources this sign-in does not reach |

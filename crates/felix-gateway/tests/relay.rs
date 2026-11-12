@@ -1504,6 +1504,97 @@ async fn a_member_of_one_room_is_refused_another() {
     Browser::join(addr, "ben", "lobby").await;
 }
 
+/// The test scope file serving both namespaces `dev/seed.mjs` creates.
+fn two_namespaces() -> Config {
+    let mut config = config();
+    let path = std::env::var("GATEWAY_SCOPE_FILE").unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    let text = format!("namespaces = [\"default\", \"other\"]\n{text}");
+    config.scope = Arc::new(ScopeConfig::parse(&text).unwrap());
+    config
+}
+
+/// Open a connection and join `room` in `namespace`, without waiting.
+async fn connect_in(gateway: SocketAddr, namespace: &str, room: &str, token: &str) -> Browser {
+    let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{gateway}/ws"))
+        .await
+        .expect("open WebSocket");
+    let mut browser = Browser { socket, next_id: 0 };
+    browser
+        .send(json!({"type": "join", "namespace": namespace, "room": room, "token": token}))
+        .await;
+    browser
+}
+
+/// Join `room` in `namespace` as `user`, and wait for `hello` to name it.
+async fn join_in(gateway: SocketAddr, namespace: &str, user: &str, room: &str) -> Browser {
+    let mut browser = connect_in(gateway, namespace, room, &sign_in(user).await).await;
+    let hello = browser.recv().await;
+    assert_eq!(hello["type"], "hello", "{hello}");
+    assert_eq!(
+        (&hello["namespace"], &hello["room"]),
+        (&json!(namespace), &json!(room))
+    );
+    browser
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn one_gateway_serves_two_namespaces_apart() {
+    let (_gateway, addr) = serve(two_namespaces()).await;
+    let mut home = join_in(addr, "default", "ana", "lobby").await;
+    let mut other = join_in(addr, "other", "ana", "lobby").await;
+    // A join that names no namespace opens GATEWAY_NAMESPACE, as it always did.
+    Browser::open(addr).await;
+    home.subscribe("ops", json!("live")).await;
+    other.subscribe("ops", json!("live")).await;
+
+    // The same stream alias and room are two streams, one per namespace.
+    let tag = run_tag("namespaces");
+    other.publish("ops", &format!("{tag}-other"), false).await;
+    home.publish("ops", &format!("{tag}-home"), false).await;
+    let (events, _) = home.events(&tag, 1).await;
+    assert_eq!(events[0].1, format!("{tag}-home"));
+    let (events, _) = other.events(&tag, 1).await;
+    assert_eq!(events[0].1, format!("{tag}-other"));
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_member_granted_one_namespace_is_refused_the_other() {
+    let (gateway, addr) = serve(two_namespaces()).await;
+    // Ben's lobby grant is in `default` only.
+    let ben = sign_in("ben").await;
+    assert!(matches!(
+        gateway.scope_token_in(&ben, "other", "lobby").await,
+        Err(Refused::Forbidden)
+    ));
+    let mut refused = connect_in(addr, "other", "lobby", &ben).await;
+    assert_eq!(refused.refusal().await["code"], "forbidden");
+    join_in(addr, "default", "ben", "lobby").await;
+
+    // A namespace the scope file does not list is refused even to Ana.
+    let ana = sign_in("ana").await;
+    let mut unlisted = connect_in(addr, "third", "lobby", &ana).await;
+    assert_eq!(unlisted.refusal().await["code"], "forbidden");
+    let mut invalid = connect_in(addr, "a/b", "lobby", &ana).await;
+    assert_eq!(invalid.refusal().await["code"], "bad_request");
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_gateway_without_namespaces_serves_only_its_own() {
+    let (gateway, addr) = start_gateway().await;
+    let ana = sign_in("ana").await;
+    let mut other = connect_in(addr, "other", "lobby", &ana).await;
+    assert_eq!(other.refusal().await["code"], "forbidden");
+    assert!(matches!(
+        gateway.scope_token_in(&ana, "other", "lobby").await,
+        Err(Refused::Forbidden)
+    ));
+    join_in(addr, &config().namespace, "ana", "lobby").await;
+}
+
 #[tokio::test]
 #[ignore = "needs a Felix broker"]
 async fn a_join_without_a_valid_sign_in_or_room_is_refused() {

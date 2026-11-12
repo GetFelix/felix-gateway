@@ -28,7 +28,8 @@ use crate::protocol::{
     ServerMessage, StartAt, TIME,
 };
 use crate::scope::{
-    Action, BAD_NAME, Bound, CacheAction, CounterAction, Scope, StreamAction, valid_name,
+    Action, BAD_NAME, Bound, CacheAction, CounterAction, NamespaceRefused, Scope, StreamAction,
+    valid_name,
 };
 use crate::throttle::Throttle;
 use crate::transport::{BrowserConnection, Incoming};
@@ -1104,11 +1105,15 @@ async fn accept(
         ));
     }
     let field = &gateway.scope.scope.field;
+    let namespace = gateway
+        .scope
+        .namespace(&join.fields, &gateway.namespace)
+        .map_err(namespace_refusal)?;
     let scope = join
         .fields
         .get(field)
         .and_then(|value| value.as_str())
-        .and_then(|value| Scope::parse(&gateway.scope, value))
+        .and_then(|value| Scope::parse(&gateway.scope, &namespace, value))
         .ok_or_else(|| error(ErrorCode::BadRequest, format!("{field}: {BAD_NAME}")))?;
     let rate_limited = join.features.iter().any(|feature| feature == RATE_LIMITED);
     // The address cap is checked before the token exchange, and the principal
@@ -1137,7 +1142,7 @@ async fn accept(
             .filter(|feature| FEATURES.contains(&feature.as_str()))
             .cloned()
             .collect(),
-        namespace: gateway.brokers.namespace().to_string(),
+        namespace: felix.scope.namespace().to_string(),
         scope: BTreeMap::from([(field.clone(), felix.scope.value().to_string())]),
         cache_ttl_ms: gateway.scope.cache_ttl_ms(),
         missing,
@@ -1164,6 +1169,17 @@ async fn accept(
             .any(|feature| feature == CACHE_VERSIONS),
         time: join.features.iter().any(|feature| feature == TIME),
     })
+}
+
+/// The message a join or leave naming a namespace it cannot open is answered with.
+pub(crate) fn namespace_refusal(refused: NamespaceRefused) -> ServerMessage {
+    match refused {
+        NamespaceRefused::Invalid => error(ErrorCode::BadRequest, format!("namespace: {BAD_NAME}")),
+        NamespaceRefused::NotServed(namespace) => error(
+            ErrorCode::Forbidden,
+            format!("this gateway does not serve namespace {namespace:?}"),
+        ),
+    }
 }
 
 /// Exchange `token` for a grant that reaches `scope`. The error is the
