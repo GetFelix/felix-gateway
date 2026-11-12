@@ -208,7 +208,8 @@ scope's value. Every listed namespace has the same scope: the same aliases,
 and resources named the same way inside it. The gateway refuses a `join` that
 names a namespace not in the list, with `forbidden`, before it asks the
 control plane anything. A `join` that names none opens `GATEWAY_NAMESPACE`,
-which is refused too unless it is listed.
+which is refused too unless it is listed; the gateway logs a warning at
+startup when it is not.
 
 Listing a namespace does not give anyone access to it. The gateway asks the
 token exchange for the scope's permissions in the namespace the `join` named,

@@ -83,6 +83,14 @@ impl Gateway {
     pub fn new(config: &Config) -> Result<Self> {
         let brokers = Arc::new(Brokers::new(config)?);
         let control_plane = ControlPlane::new(&config.control_plane, &config.tenant);
+        if let Some(namespaces) = &config.scope.namespaces
+            && !namespaces.contains(&config.namespace)
+        {
+            tracing::warn!(
+                namespace = %config.namespace,
+                "GATEWAY_NAMESPACE is not in the scope file's namespaces, so a join that names no namespace is refused"
+            );
+        }
         let shared = match &config.shared {
             Some(shared) => {
                 let actor = Arc::new(Actor::new(
@@ -162,8 +170,9 @@ impl Gateway {
     /// `id_token` would get.
     ///
     /// # Errors
-    /// As for a join: the sign-in is refused, the gateway does not serve the
-    /// namespace, or the scope's value is not valid.
+    /// As for a join: the sign-in is refused, the namespace is not valid or
+    /// not served, or the scope's value is not valid. Each is
+    /// [`Refused::Forbidden`].
     pub async fn scope_token_in(
         &self,
         id_token: &str,
