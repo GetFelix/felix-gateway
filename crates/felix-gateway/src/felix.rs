@@ -33,7 +33,6 @@ pub(crate) struct Brokers {
     server_name: String,
     roots: Option<Arc<RootCertStore>>,
     tenant: String,
-    namespace: String,
     /// Which broker the next connection tries first.
     next: AtomicUsize,
     shards: Arc<ShardCounts>,
@@ -44,32 +43,32 @@ pub(crate) struct Brokers {
 /// shard.
 const SHARD_COUNT_TTL: Duration = Duration::from_secs(30);
 
-/// Shard counts by stream, shared by every session.
+/// Shard counts by namespace and stream, shared by every session.
 #[derive(Default)]
 struct ShardCounts {
-    seen: Mutex<HashMap<String, (u32, Instant)>>,
+    seen: Mutex<HashMap<(String, String), (u32, Instant)>>,
 }
 
 impl ShardCounts {
-    fn fresh(&self, stream: &str) -> Option<u32> {
+    fn fresh(&self, namespace: &str, stream: &str) -> Option<u32> {
         let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        seen.get(stream)
+        seen.get(&(namespace.to_owned(), stream.to_owned()))
             .filter(|(_, at)| at.elapsed() < SHARD_COUNT_TTL)
             .map(|(count, _)| *count)
     }
 
-    async fn lookup<F, Fut>(&self, stream: &str, fetch: F) -> Result<u32>
+    async fn lookup<F, Fut>(&self, namespace: &str, stream: &str, fetch: F) -> Result<u32>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<u32>>,
     {
-        if let Some(count) = self.fresh(stream) {
+        if let Some(count) = self.fresh(namespace, stream) {
             return Ok(count);
         }
-        self.refresh(stream, fetch).await
+        self.refresh(namespace, stream, fetch).await
     }
 
-    async fn refresh<F, Fut>(&self, stream: &str, fetch: F) -> Result<u32>
+    async fn refresh<F, Fut>(&self, namespace: &str, stream: &str, fetch: F) -> Result<u32>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<u32>>,
@@ -77,7 +76,10 @@ impl ShardCounts {
         let count = fetch().await?;
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         seen.retain(|_, (_, at)| at.elapsed() < SHARD_COUNT_TTL);
-        seen.insert(stream.to_owned(), (count, Instant::now()));
+        seen.insert(
+            (namespace.to_owned(), stream.to_owned()),
+            (count, Instant::now()),
+        );
         Ok(count)
     }
 }
@@ -101,14 +103,9 @@ impl Brokers {
             server_name: config.server_name.clone(),
             roots,
             tenant: config.tenant.clone(),
-            namespace: config.namespace.clone(),
             next: AtomicUsize::new(0),
             shards: Arc::default(),
         })
-    }
-
-    pub(crate) fn namespace(&self) -> &str {
-        &self.namespace
     }
 
     pub(crate) fn tenant(&self) -> &str {
@@ -244,7 +241,7 @@ impl Felix {
         Self {
             link,
             tenant: brokers.tenant.clone(),
-            namespace: brokers.namespace.clone(),
+            namespace: scope.namespace().to_string(),
             shards: Arc::clone(&brokers.shards),
             scope,
             principal,
@@ -316,14 +313,14 @@ impl Felix {
         }
         let count = self
             .shards
-            .lookup(stream, || self.shard_count(stream))
+            .lookup(&self.namespace, stream, || self.shard_count(stream))
             .await?;
         if shard < count {
             return Ok(Ok(()));
         }
         let count = self
             .shards
-            .refresh(stream, || self.shard_count(stream))
+            .refresh(&self.namespace, stream, || self.shard_count(stream))
             .await?;
         Ok(if shard < count { Ok(()) } else { Err(count) })
     }
@@ -747,7 +744,7 @@ mod tests {
         let calls = AtomicU32::new(0);
         for _ in 0..4 {
             let count = counts
-                .lookup("events", || async {
+                .lookup("default", "events", || async {
                     calls.fetch_add(1, Ordering::Relaxed);
                     Ok(4)
                 })
@@ -762,10 +759,27 @@ mod tests {
     async fn shard_count_is_looked_up_again_after_the_ttl() {
         let counts = ShardCounts::default();
         counts.seen.lock().unwrap().insert(
-            "events".into(),
+            ("default".into(), "events".into()),
             (2, Instant::now() - SHARD_COUNT_TTL - Duration::from_secs(1)),
         );
-        let count = counts.lookup("events", || async { Ok(5) }).await.unwrap();
+        let count = counts
+            .lookup("default", "events", || async { Ok(5) })
+            .await
+            .unwrap();
         assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn shard_counts_of_one_stream_name_in_two_namespaces_are_apart() {
+        let counts = ShardCounts::default();
+        counts
+            .lookup("a", "events", || async { Ok(4) })
+            .await
+            .unwrap();
+        let count = counts
+            .lookup("b", "events", || async { Ok(1) })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

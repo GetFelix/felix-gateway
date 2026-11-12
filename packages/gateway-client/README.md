@@ -16,6 +16,10 @@ client.subscribe("ops", "live");
 await client.publish("ops", new TextEncoder().encode("hello"));
 ```
 
+A gateway that serves several namespaces takes the one to open in the join,
+`{ namespace: "payments", room: "lobby", token }`, and `hello.namespace` names
+the one the session got. A page showing two namespaces opens a client for each.
+
 Two sessions that write one cache key with `cachePut` overwrite each other.
 Join with the `cache_versions` feature to avoid that: `cacheGetVersioned` reads
 a key with its version, and `cachePutIf` writes it only if the key is still at

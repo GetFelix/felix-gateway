@@ -106,16 +106,14 @@ pub(crate) struct ControlPlane {
     http: reqwest::Client,
     url: String,
     tenant: String,
-    namespace: String,
 }
 
 impl ControlPlane {
-    pub(crate) fn new(url: &str, tenant: &str, namespace: &str) -> Self {
+    pub(crate) fn new(url: &str, tenant: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
             url: url.to_string(),
             tenant: tenant.to_string(),
-            namespace: namespace.to_string(),
         }
     }
 
@@ -134,7 +132,7 @@ impl ControlPlane {
         scope: &Scope,
         actor: Option<&Actor>,
     ) -> Result<Grant, Refused> {
-        let permissions = scope.permissions(&self.tenant, &self.namespace);
+        let permissions = scope.permissions(&self.tenant);
         let (actions, objects) = split(&permissions);
         let mut request = json!({ "requested": actions, "resources": objects });
         let mut fresh = false;
@@ -519,7 +517,7 @@ mod tests {
 
     #[test]
     fn the_narrowing_names_each_action_and_object_once() {
-        let permissions = lobby().permissions("t", "default");
+        let permissions = lobby().permissions("t");
         let (actions, objects) = split(&permissions);
         assert_eq!(
             actions.into_iter().collect::<Vec<_>>(),
@@ -543,7 +541,7 @@ mod tests {
 
     #[test]
     fn a_token_missing_a_required_grant_does_not_cover_the_scope() {
-        let permissions = lobby().permissions("t", "default");
+        let permissions = lobby().permissions("t");
         let all: Vec<&str> = permissions.iter().map(|p| p.grant.as_str()).collect();
         let covered = |token: &str| claims(token).and_then(|claims| missing(&claims, &permissions));
         assert_eq!(covered(&token(&all)), Some(vec![]));
@@ -555,7 +553,7 @@ mod tests {
 
     #[test]
     fn a_token_without_an_optional_grant_reports_it_missing() {
-        let permissions = lobby().permissions("t", "default");
+        let permissions = lobby().permissions("t");
         let without_input: Vec<&str> = permissions
             .iter()
             .filter(|p| p.optional.is_none())
@@ -673,7 +671,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
-        ControlPlane::new(&format!("http://{addr}"), "t", "default")
+        ControlPlane::new(&format!("http://{addr}"), "t")
     }
 
     /// A user's exchange: the next refusal, or a token holding every

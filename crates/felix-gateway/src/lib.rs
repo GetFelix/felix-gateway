@@ -52,7 +52,7 @@ pub use scope::ScopeConfig;
 use access::{Actor, ControlPlane};
 use felix::{Brokers, Pool};
 use limits::Limiter;
-use scope::{BAD_NAME, CacheAction, Scope, valid_name};
+use scope::{BAD_NAME, CacheAction, NamespaceRefused, Scope, valid_name};
 use transport::websocket::WebSocketConnection;
 
 /// A gateway ready to serve browsers. Each session reaches Felix with its own
@@ -68,6 +68,8 @@ pub struct Gateway {
     oidc: Arc<Value>,
     web_dir: Option<PathBuf>,
     scope: Arc<ScopeConfig>,
+    /// `GATEWAY_NAMESPACE`: what a join that names no namespace opens.
+    namespace: String,
     heartbeat: Heartbeat,
 }
 
@@ -80,8 +82,15 @@ impl Gateway {
     /// connections, cannot be read.
     pub fn new(config: &Config) -> Result<Self> {
         let brokers = Arc::new(Brokers::new(config)?);
-        let control_plane =
-            ControlPlane::new(&config.control_plane, &config.tenant, &config.namespace);
+        let control_plane = ControlPlane::new(&config.control_plane, &config.tenant);
+        if let Some(namespaces) = &config.scope.namespaces
+            && !namespaces.contains(&config.namespace)
+        {
+            tracing::warn!(
+                namespace = %config.namespace,
+                "GATEWAY_NAMESPACE is not in the scope file's namespaces, so a join that names no namespace is refused"
+            );
+        }
         let shared = match &config.shared {
             Some(shared) => {
                 let actor = Arc::new(Actor::new(
@@ -116,6 +125,7 @@ impl Gateway {
             })),
             web_dir: config.web_dir.clone(),
             scope: Arc::clone(&config.scope),
+            namespace: config.namespace.clone(),
             heartbeat: config.heartbeat,
         })
     }
@@ -147,12 +157,33 @@ impl Gateway {
         self.metrics.snapshot()
     }
 
-    /// The Felix token a session joining `scope` with `id_token` would get.
+    /// The Felix token a session joining `scope` with `id_token` would get,
+    /// in `GATEWAY_NAMESPACE`.
     ///
     /// # Errors
     /// As for a join: the sign-in is refused, or the scope's value is not valid.
     pub async fn scope_token(&self, id_token: &str, scope: &str) -> Result<String, Refused> {
-        let Some(scope) = Scope::parse(&self.scope, scope) else {
+        self.scope_token_in(id_token, &self.namespace, scope).await
+    }
+
+    /// The Felix token a session joining `scope` in `namespace` with
+    /// `id_token` would get.
+    ///
+    /// # Errors
+    /// As for a join: the sign-in is refused, the namespace is not valid or
+    /// not served, or the scope's value is not valid. Each is
+    /// [`Refused::Forbidden`].
+    pub async fn scope_token_in(
+        &self,
+        id_token: &str,
+        namespace: &str,
+        scope: &str,
+    ) -> Result<String, Refused> {
+        let fields = Map::from_iter([("namespace".to_string(), Value::from(namespace))]);
+        let Ok(namespace) = self.scope.namespace(&fields, &self.namespace) else {
+            return Err(Refused::Forbidden);
+        };
+        let Some(scope) = Scope::parse(&self.scope, &namespace, scope) else {
             return Err(Refused::Forbidden);
         };
         let grant = self
@@ -232,13 +263,14 @@ struct Leave {
     token: String,
     cache: String,
     key: String,
-    /// The scope's value is under the scope file's field.
+    /// The scope's value is under the scope file's field, and the namespace,
+    /// when the session's join named one, under `namespace`.
     #[serde(flatten)]
     fields: Map<String, Value>,
 }
 
 /// Delete the cache entry named by the body, `{<field>, "token", "cache",
-/// "key"}`. A closing tab sends this with `navigator.sendBeacon`, which
+/// "key"}`, plus `"namespace"` as the session's join had it. A closing tab sends this with `navigator.sendBeacon`, which
 /// outlives the page; a WebSocket message sent while the page unloads may
 /// never leave it. The beacon carries the sign-in and is exchanged like a
 /// join, so it can only touch a scope its sender may open.
@@ -253,21 +285,30 @@ async fn leave(State(gateway): State<Gateway>, body: String) -> impl IntoRespons
             ),
         );
     };
+    let refused = |refusal: protocol::ServerMessage| {
+        let body = serde_json::to_string(&refusal).expect("server messages serialize");
+        (StatusCode::FORBIDDEN, body)
+    };
+    let namespace = match gateway.scope.namespace(&leave.fields, &gateway.namespace) {
+        Ok(namespace) => namespace,
+        Err(NamespaceRefused::Invalid) => {
+            return (StatusCode::BAD_REQUEST, format!("namespace: {BAD_NAME}"));
+        }
+        Err(refusal @ NamespaceRefused::NotServed(_)) => {
+            return refused(relay::namespace_refusal(refusal));
+        }
+    };
     let scope = leave
         .fields
         .get(&gateway.scope.scope.field)
         .and_then(Value::as_str)
-        .and_then(|value| Scope::parse(&gateway.scope, value));
+        .and_then(|value| Scope::parse(&gateway.scope, &namespace, value));
     let (Some(scope), true) = (scope, valid_name(&leave.key)) else {
         return (StatusCode::BAD_REQUEST, BAD_NAME.to_string());
     };
     let cache = match scope.cache(&leave.cache, CacheAction::Write) {
         Ok(cache) => cache.name,
         Err(refusal) => return (StatusCode::BAD_REQUEST, refusal),
-    };
-    let refused = |refusal: protocol::ServerMessage| {
-        let body = serde_json::to_string(&refusal).expect("server messages serialize");
-        (StatusCode::FORBIDDEN, body)
     };
     let grant = match relay::exchange(&scope, &leave.token, &gateway).await {
         Ok(grant) => grant,
