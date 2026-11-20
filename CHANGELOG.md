@@ -11,6 +11,14 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-19
+
+### Changed
+- Built on and tested against Felix 0.7.3: felix-client and felix-wire 0.7.3, and the dev stack runs the 0.7.3 images. Idempotent producers resume about 8.5 s after a leader election without the control plane, instead of 18 to 36 s.
+
+### Fixed
+- `dev/up.sh` waits one broker heartbeat after the fleet accepts the `atomic_commit` finalize before it reports ready (#78). The tests no longer start against a broker that still refuses commits.
+
 ## [0.10.0] - 2026-11-19
 
 ### Added
