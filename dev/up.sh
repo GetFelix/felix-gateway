@@ -101,7 +101,7 @@ finalize_atomic_commit() {
   # and a broker only learns it on its next heartbeat (5 s), so wait for both.
   for _ in $(seq 1 30); do
     if curl -fsS -H "authorization: Bearer $token" http://127.0.0.1:8443/v1/fleet/features 2>/dev/null |
-      grep -Eq '"enabled" *: *\[[^]]*"atomic_commit"'; then
+      tr -d ' \n' | grep -Eq '"enabled":\[[^]]*"atomic_commit"'; then
       sleep 6
       return 0
     fi
