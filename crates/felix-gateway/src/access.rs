@@ -118,7 +118,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The control plane did not answer: no connection, no reply in time, or a
-/// 5xx. Marks the failures a kept credential may stand in for. Any answer
+/// 502, 503 or 504 from whatever fronts it. Marks the failures a kept credential may stand in for. Any answer
 /// that decides something, even a refusal, is not this.
 #[derive(Debug)]
 struct Unreachable(String);
@@ -130,6 +130,15 @@ impl std::fmt::Display for Unreachable {
 }
 
 impl std::error::Error for Unreachable {}
+
+/// Statuses a proxy or load balancer answers with when nothing behind it
+/// does. A 500 is the control plane's own answer, so it is not one of them.
+fn gateway_down(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
 
 fn unreachable(cause: impl std::fmt::Display) -> anyhow::Error {
     Unreachable(cause.to_string()).into()
@@ -145,7 +154,7 @@ pub(crate) struct ControlPlane {
 }
 
 impl ControlPlane {
-    pub(crate) fn new(url: &str, tenant: &str) -> Self {
+    pub(crate) fn new(url: &str, tenant: &str, rejoin_max: Duration) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
@@ -154,7 +163,7 @@ impl ControlPlane {
                 .expect("a client with only timeouts set"),
             url: url.to_string(),
             tenant: tenant.to_string(),
-            rejoin: Arc::default(),
+            rejoin: Arc::new(Rejoin::new(rejoin_max)),
         }
     }
 
@@ -271,7 +280,7 @@ impl ControlPlane {
         match response.status() {
             StatusCode::UNAUTHORIZED => return Err(Refused::SignedOut),
             StatusCode::FORBIDDEN => return Err(Refused::Forbidden),
-            status if status.is_server_error() => {
+            status if gateway_down(status) => {
                 return Err(Refused::Unavailable(unreachable(format!(
                     "the token exchange answered {status}"
                 ))));
@@ -316,7 +325,7 @@ impl ControlPlane {
                 let key = key.clone();
                 async move {
                     let token = control_plane.refresh(&refresh_token).await?;
-                    control_plane.rejoin.refreshed(&key, &token, None);
+                    control_plane.rejoin.refreshed(&key, &token, None, now());
                     Ok(token)
                 }
             },
@@ -406,7 +415,7 @@ impl ControlPlane {
                 let body = response.text().await.unwrap_or_default();
                 return Err(Delegation::Forbidden(body));
             }
-            status if status.is_server_error() => {
+            status if gateway_down(status) => {
                 return Err(Delegation::Failed(unreachable(format!(
                     "the token delegation answered {status}"
                 ))));
@@ -455,7 +464,7 @@ impl ControlPlane {
                         })?;
                 control_plane
                     .rejoin
-                    .refreshed(&key, &scope_token, Some(&delegated));
+                    .refreshed(&key, &scope_token, Some(&delegated), now());
                 Ok(delegated)
             }
         }))
@@ -794,7 +803,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
-        ControlPlane::new(&format!("http://{addr}"), "t")
+        ControlPlane::new(&format!("http://{addr}"), "t", Duration::from_secs(900))
     }
 
     /// A user's exchange: the next refusal, or a token holding every
@@ -1182,7 +1191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_server_error_counts_as_unreachable_but_a_conflict_does_not() {
+    async fn only_a_bad_gateway_unavailable_or_timeout_counts_as_unreachable() {
         let (fake, control_plane, _, _) = actor("5xx", now() + 3600).await;
         let scope = lobby();
         let id = id_token(600, "ana");
@@ -1194,14 +1203,20 @@ mod tests {
             .push((StatusCode::SERVICE_UNAVAILABLE, "unavailable"));
         assert!(control_plane.exchange(&id, &scope, None).await.is_ok());
 
-        fake.user_refusals
-            .lock()
-            .unwrap()
-            .push((StatusCode::CONFLICT, "conflict"));
-        assert!(matches!(
-            control_plane.exchange(&id, &scope, None).await,
-            Err(Refused::Unavailable(_))
-        ));
+        // Other answers are the control plane's own, so they open no fallback,
+        // and one that is not a decision about the person keeps what is kept.
+        for status in [StatusCode::CONFLICT, StatusCode::INTERNAL_SERVER_ERROR] {
+            fake.user_refusals.lock().unwrap().push((status, "failed"));
+            assert!(
+                matches!(
+                    control_plane.exchange(&id, &scope, None).await,
+                    Err(Refused::Unavailable(_))
+                ),
+                "{status}"
+            );
+        }
+        let down = taken_down(&control_plane).await;
+        assert!(down.exchange(&id, &scope, None).await.is_ok());
     }
 
     #[tokio::test]
@@ -1240,9 +1255,41 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_grant_is_capped_from_when_it_was_issued() {
+        let scope = lobby();
+        let rejoin = Rejoin::new(Duration::from_secs(100));
+        let key = Rejoin::key("id", &scope);
+        let grant = Grant {
+            felix_token: jwt(json!({ "sub": "ana", "exp": 10_000 })),
+            refresh_token: Some("r".into()),
+            principal: "ana".into(),
+            missing: vec![],
+            key: String::new(),
+            delegated: None,
+        };
+        rejoin.remember(&key, &jwt(json!({ "exp": 10_000 })), &grant, 1_000);
+        assert!(rejoin.recall(&key, 1_060).is_some());
+        assert!(
+            rejoin
+                .recall(&key, 1_100 - rejoin::MIN_REMAINING + 1)
+                .is_none()
+        );
+
+        // A refresh re-checks the person, so the cap counts from it.
+        rejoin.remember(&key, &jwt(json!({ "exp": 10_000 })), &grant, 1_000);
+        rejoin.refreshed(&key, &grant.felix_token, None, 1_090);
+        assert!(rejoin.recall(&key, 1_150).is_some());
+        assert!(
+            rejoin
+                .recall(&key, 1_190 - rejoin::MIN_REMAINING + 1)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_kept_grant_is_good_until_the_earlier_of_its_two_expiries() {
         let scope = lobby();
-        let rejoin = Rejoin::default();
+        let rejoin = Rejoin::new(Duration::from_secs(900));
         let grant = |felix_exp| Grant {
             felix_token: jwt(json!({ "sub": "ana", "exp": felix_exp })),
             refresh_token: Some("r".into()),

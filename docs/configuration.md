@@ -24,6 +24,7 @@ roles that let people open them are set up before the gateway starts.
 | `GATEWAY_WEB_DIR` | unset | A built web app to serve on every path the gateway does not route itself |
 | `GATEWAY_PING_INTERVAL_S` | `5` | Seconds between the WebSocket pings sent to each browser. 0 sends none, which also turns off `GATEWAY_PING_TIMEOUT_S` and the `browser_rtt` metric |
 | `GATEWAY_PING_TIMEOUT_S` | `30` | Seconds a session may send nothing, not even a pong, before the gateway closes it. Longer than the interval, or 0 for never |
+| `GATEWAY_REJOIN_MAX_S` | `900` | Seconds after the control plane issued a Felix token that the gateway may still let the same sign-in rejoin while the control plane is unreachable. 0 turns rejoining off. See [When the control plane is down](#when-the-control-plane-is-down) |
 | `RUST_LOG` | `info` | Log filter, as `tracing-subscriber` reads it |
 
 `/oidc` returns the issuer, client ID and scopes, so the browser app needs no
@@ -320,7 +321,8 @@ answer in 10, or a 5xx), a join is handled this way:
 
 - The same ID token for the same scope (and namespace) that the control plane
   accepted earlier gets the Felix token it was given then, as long as that
-  token and the ID token each have at least 30 seconds left. The gateway
+  token, the ID token and the `GATEWAY_REJOIN_MAX_S` cap each have at least 30
+  seconds left. The gateway
   keeps a SHA-256 of the ID token, never the token.
 - Any other join is refused at once with `unavailable` and the message
   "new sign-ins wait for the control plane". A new person, a new scope, or an
@@ -336,14 +338,16 @@ kept token is renewed each time a session refreshes its own, which re-checks
 the person's permissions.
 
 **How long a revoked person can keep rejoining.** Only while the control
-plane is unreachable, and no longer than the earlier of two times: the expiry
-of the Felix token the gateway last got for that sign-in, and the expiry of
-the ID token. After a successful exchange or refresh that is the Felix
-token's whole lifetime, as set by the control plane, at most. A person
-removed while the control plane is down can therefore rejoin for up to that
-long, and a session already open keeps working for that long regardless,
-because the brokers accept the token until it expires. If the control plane
-is reachable, a removal takes effect at the next join or refresh, as before.
+plane is unreachable, and no longer than the earliest of three times: the
+expiry of the Felix token the gateway last got for that sign-in, the expiry of
+the ID token, and `GATEWAY_REJOIN_MAX_S` (15 minutes by default) after the
+control plane last issued that token, at sign-in or at a refresh. So the worst
+case is `GATEWAY_REJOIN_MAX_S` minus the 30-second margin from the moment the
+control plane last said yes, and a person removed right after that moment can
+rejoin for that long. A session already open keeps working until its Felix
+token expires regardless, because the brokers accept it until then. If the
+control plane is reachable, a removal takes effect at the next join or
+refresh, as before.
 
 The gateway keeps up to 10,000 of these in memory. A restart forgets them, so
 a gateway that restarts during an outage refuses every join until the control

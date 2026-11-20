@@ -4,13 +4,15 @@
 //! Nothing is granted that the control plane had not already granted. An entry
 //! is the answer to one exchange of one ID token for one scope, found again
 //! only by presenting that same ID token for that same scope, and it stops
-//! counting at the earlier of the ID token's and the Felix token's expiry.
+//! counting at the earliest of the ID token's expiry, the Felix token's expiry
+//! and a cap after the control plane issued it.
 //! Reuse happens only when the control plane cannot be reached. Any answer
 //! from it, a refusal included, deletes the entry. See
 //! `docs/configuration.md#when-the-control-plane-is-down`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -32,20 +34,30 @@ struct Held {
     delegated: Option<(String, u64)>,
     felix_exp: u64,
     id_exp: u64,
+    /// When the control plane last issued the token, which the cap counts from.
+    obtained: u64,
 }
 
-impl Held {
-    fn expires(&self) -> u64 {
-        self.felix_exp.min(self.id_exp)
-    }
-}
-
-#[derive(Default)]
 pub(crate) struct Rejoin {
     entries: Mutex<HashMap<String, Held>>,
+    /// The longest a grant may be reused after the control plane issued it.
+    max: u64,
 }
 
 impl Rejoin {
+    pub(crate) fn new(max: Duration) -> Self {
+        Self {
+            entries: Mutex::default(),
+            max: max.as_secs(),
+        }
+    }
+
+    fn expires(&self, held: &Held) -> u64 {
+        held.felix_exp
+            .min(held.id_exp)
+            .min(held.obtained.saturating_add(self.max))
+    }
+
     /// What an ID token and scope are looked up by. The token itself is not
     /// kept.
     pub(crate) fn key(id_token: &str, scope: &Scope) -> String {
@@ -73,13 +85,14 @@ impl Rejoin {
             delegated: None,
             felix_exp,
             id_exp,
+            obtained: now,
         };
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.retain(|_, held| held.expires() > now);
+        entries.retain(|_, held| self.expires(held) > now);
         if entries.len() >= MAX_ENTRIES
             && let Some(soonest) = entries
                 .iter()
-                .min_by_key(|(_, held)| held.expires())
+                .min_by_key(|(_, held)| self.expires(held))
                 .map(|(key, _)| key.clone())
         {
             entries.remove(&soonest);
@@ -105,7 +118,13 @@ impl Rejoin {
     /// Note the tokens a session's refresh obtained. The refresh ran RBAC
     /// again, so this is as current as a new exchange. The ID token's expiry
     /// is unchanged.
-    pub(crate) fn refreshed(&self, key: &str, felix_token: &str, delegated: Option<&str>) {
+    pub(crate) fn refreshed(
+        &self,
+        key: &str,
+        felix_token: &str,
+        delegated: Option<&str>,
+        now: u64,
+    ) {
         let Some(felix_exp) = claims(felix_token).and_then(|c| c.exp) else {
             return;
         };
@@ -117,6 +136,7 @@ impl Rejoin {
         {
             held.felix_token = felix_token.to_string();
             held.felix_exp = felix_exp;
+            held.obtained = now;
             held.delegated =
                 delegated.and_then(|token| Some((token.to_string(), claims(token)?.exp?)));
         }
@@ -137,7 +157,7 @@ impl Rejoin {
     pub(crate) fn recall(&self, key: &str, now: u64) -> Option<Grant> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let held = entries.get(key)?;
-        if held.expires() < now + MIN_REMAINING {
+        if self.expires(held) < now + MIN_REMAINING {
             entries.remove(key);
             return None;
         }
