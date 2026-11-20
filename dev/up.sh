@@ -89,7 +89,7 @@ finalize_atomic_commit() {
     code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "authorization: Bearer $token" \
       http://127.0.0.1:8443/v1/fleet/features/atomic_commit/finalize 2>/dev/null || true)
     case "$code" in
-      2??) return 0 ;;
+      2??) break ;;
       401 | 403)
         echo "the control plane refused to finalize atomic_commit (HTTP $code)" >&2
         return 1
@@ -97,8 +97,10 @@ finalize_atomic_commit() {
     esac
     sleep 2
   done
-  echo "the fleet did not finalize atomic_commit" >&2
-  return 1
+  [[ "${code:-}" == 2* ]] || { echo "the fleet did not finalize atomic_commit" >&2; return 1; }
+  # A broker learns the enabled set on its next heartbeat (5 s); the control
+  # plane accepting the finalize does not mean the brokers serve commits yet.
+  sleep 6
 }
 
 for _ in $(seq 1 90); do
