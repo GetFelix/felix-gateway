@@ -234,31 +234,39 @@ name on every reconnect) and gives each publish a `seq`:
   at or below it is answered with an `ack` and not sent again. The `ack`
   carries the record's `offset` when the `seq` is the latest acknowledged, and
   `null` for an older one.
-- A `seq` is acknowledged only after Felix acknowledged it, or one above it. A
-  publish that fails stays unsettled, because it may be in the log. Until it
-  settles, a later `seq` on that stream is not sent: the gateway first sends
-  the unsettled one again from its own copy under the same sequence, so it
-  lands once, and fails the later one if that fails. A `seq` below the
-  unsettled one that was never acknowledged is refused as out of order. After
-  an `error` the browser closes the connection and resends everything not
-  acknowledged, in `seq` order.
+- A `seq` is acknowledged only after Felix acknowledged it or one above it. A
+  publish that fails without an answer stays unsettled, because it may be in
+  the log. Until it settles, a later `seq` on that stream is not sent: the
+  gateway first sends the unsettled one again from its own copy under the same
+  sequence, so it lands once, and fails the later one if that fails. A `seq`
+  below the unsettled one that was never acknowledged is refused as out of
+  order. After an `error` the browser closes the connection and resends
+  everything not acknowledged, in `seq` order.
+- A publish Felix refuses for good (not permitted, no such stream, too large)
+  fails with its reason and is not kept unsettled, so later `seq` numbers go
+  on. A resend of it is sent again and never answered as already done.
+- A publish that stays unsettled after 6 attempts or 2 minutes is let go the
+  same way. Whether it landed can no longer be told, so a resend of it may
+  land twice. So may a resend after a refusal from Felix that the producer
+  cannot recover from, such as a forgotten producer.
 - Resend with the same payload: a different one for a `seq` in doubt is
   refused rather than sent.
+- Each stream has its own producer, so letting one go, or replacing it, only
+  affects that stream. A stream whose unsettled publish has failed three times
+  on a producer that cannot reach Felix gets a new producer on the next
+  connection, which may land that publish twice.
 - A session is its person, namespace and `session` name together, so another
   person who uses the same name does not meet it. The gateway keeps it for 10
-  minutes after its last publish, at most 32 per person and 4096 in all. A
-  page back after longer, or after the gateway restarted, starts over, and a
-  resend of a publish that committed before may land again. Pages should
-  still deduplicate by their own id.
+  minutes after its last publish. At most 32 per person and 4096 in all are
+  kept: at a limit a session that is open, or has a publish unsettled, is
+  never dropped to make room, and a `join` that needs a new one is refused
+  with `unavailable`. A page back after longer than 10 minutes, or after the
+  gateway restarted, starts over, and a resend of a publish that committed
+  before may land again. Pages should still deduplicate by their own id.
 - When a connection closes, its Felix client is let go unless a publish is
   unsettled. Then it is kept, with the token it was opened with, until the
-  publish settles, the connection of the same session resends it, or the
-  session expires. A later connection of the session uses that producer for
-  as long as something is unsettled and a producer of its own after.
-- A stream whose unsettled publish has failed three times in a row on a
-  producer that cannot reach Felix is given a new producer, which may land
-  that publish twice. So may a refusal from Felix that the producer cannot
-  recover from, such as a forgotten producer.
+  publish settles, a connection of the same session resends it, or the
+  session expires.
 - A publish without a `seq` behaves as before, and so do all other messages.
   Fire-and-forget publishes (`"ack": false`) take a `seq` too.
 

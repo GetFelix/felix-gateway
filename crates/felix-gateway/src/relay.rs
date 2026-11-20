@@ -1181,11 +1181,17 @@ async fn accept(
             if !valid_name(session) {
                 return Err(error(ErrorCode::BadRequest, format!("session: {BAD_NAME}")));
             }
-            Some(gateway.producers.entry(&Key {
+            let key = Key {
                 principal: grant.principal.clone(),
                 namespace: namespace.clone(),
                 session: session.clone(),
-            }))
+            };
+            Some(
+                gateway
+                    .producers
+                    .entry(&key)
+                    .map_err(|full| error(ErrorCode::Unavailable, full))?,
+            )
         }
         _ => None,
     };
