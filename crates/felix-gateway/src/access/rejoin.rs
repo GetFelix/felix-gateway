@@ -65,13 +65,20 @@ impl Rejoin {
 
     /// What an ID token and scope are looked up by. The token itself is not
     /// kept.
+    ///
+    /// The key starts with a hash of the ID token alone, then a hash of the
+    /// scope, so [`Self::forget`] can find every scope one ID token holds.
     pub(crate) fn key(id_token: &str, scope: &Scope) -> String {
+        let hex = |hash: Sha256| -> String {
+            hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        };
+        let token = hex(Sha256::new().chain_update(id_token.as_bytes()));
         let mut hash = Sha256::new();
-        for part in [id_token, scope.namespace(), scope.value()] {
+        for part in [scope.namespace(), scope.value()] {
             hash.update((part.len() as u64).to_be_bytes());
             hash.update(part.as_bytes());
         }
-        hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        format!("{token}:{}", hex(hash))
     }
 
     /// Keep the answer to an exchange. A token without an `exp`, or an ID token
@@ -157,12 +164,15 @@ impl Rejoin {
         }
     }
 
-    /// Drop what is kept for `key`: the control plane answered, so what it
-    /// granted before no longer stands in for it.
+    /// Drop what is kept for `key`, and for every other scope the same ID
+    /// token holds: the control plane refused the sign-in, so what it granted
+    /// before no longer stands in for it.
     pub(crate) fn forget(&self, key: &str) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         self.forgets.fetch_add(1, Ordering::SeqCst);
-        entries.remove(key);
+        let token = key.split_once(':').map_or(key, |(token, _)| token);
+        entries
+            .retain(|other, _| other.split_once(':').map_or(other.as_str(), |(t, _)| t) != token);
     }
 
     /// The grant kept for `key`, if it is still good for at least

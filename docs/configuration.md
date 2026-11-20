@@ -332,9 +332,9 @@ answer in 10, or a 5xx), a join is handled this way:
   when the token does. The browser's next join is refused if the control plane
   is still down.
 
-A 401 or 403 from a sign-in or a refresh deletes what the gateway kept, so
-reuse stops the moment the control plane can say no. A sign-in that began
-before the refusal is not kept either. A 500, a 409 or another 4xx fails the
+A 401 or 403 from a sign-in or a refresh deletes what the gateway kept for
+that ID token in every scope it was used for, so reuse stops the moment the
+control plane can say no. A sign-in that began before the refusal is not kept either. A 500, a 409 or another 4xx fails the
 join and keeps what was kept. A successful refresh renews the kept token and
 its cap, since it re-checks the person's permissions.
 

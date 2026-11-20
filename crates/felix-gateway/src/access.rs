@@ -1305,6 +1305,33 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn a_refusal_ends_reuse_in_every_scope_the_id_token_held() {
+        let (fake, control_plane, _, _) = actor("every-scope", now() + 3600).await;
+        let id = id_token(600, "ana");
+        let other_scope = crate::scope::tests::lobby_named("other");
+        control_plane.exchange(&id, &lobby(), None).await.unwrap();
+        control_plane
+            .exchange(&id, &other_scope, None)
+            .await
+            .unwrap();
+        let someone_else = id_token(601, "bob");
+        control_plane
+            .exchange(&someone_else, &lobby(), None)
+            .await
+            .unwrap();
+
+        fake.user_refusals
+            .lock()
+            .unwrap()
+            .push((StatusCode::FORBIDDEN, "forbidden"));
+        assert!(control_plane.exchange(&id, &lobby(), None).await.is_err());
+
+        let down = taken_down(&control_plane).await;
+        assert!(down.exchange(&id, &other_scope, None).await.is_err());
+        assert!(down.exchange(&someone_else, &lobby(), None).await.is_ok());
+    }
+
     #[test]
     fn an_exchange_that_began_before_a_refusal_is_not_kept() {
         let scope = lobby();
