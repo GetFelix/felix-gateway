@@ -11,6 +11,34 @@ release notes the Felix version it was tested against.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-19
+
+### Added
+- One gateway can serve several namespaces of its tenant (#70). List them with
+  `namespaces = [...]` at the top of the scope file, and a `join` names one with
+  `"namespace"`. The gateway refuses a namespace it does not list, and the
+  session's Felix token is narrowed to the scope in that namespace, so Felix
+  grants each person only the namespaces their roles reach. A scope file without
+  `namespaces` serves `GATEWAY_NAMESPACE` only, as before.
+- A publish resent after a reconnect is no longer appended twice (#74). With the
+  `idempotent_publish` feature, a `join` names a `session` that the page keeps
+  across reconnects and each `publish` carries a `seq`. The gateway publishes
+  through Felix's idempotent producer and answers a resent `seq` it already
+  acknowledged without sending it. The npm client's `publish` takes the `seq`.
+
+### Changed
+- Built on and tested against Felix 0.7.2: felix-client and felix-wire 0.7.2, and the dev stack runs the 0.7.2 images.
+
+### Fixed
+- A session that was already signed in can rejoin while the control plane is
+  down (#73). The gateway keeps the Felix token the control plane issued for an
+  ID token and scope, and reuses it only when the control plane cannot be
+  reached (no connection, a timeout, or a 502, 503 or 504) and only until the
+  earliest of the Felix token's expiry, the ID token's expiry and
+  `GATEWAY_REJOIN_MAX_S` (default 900) after the control plane issued it. Any other join is refused at once instead of waiting for the control
+  plane: control-plane requests now time out after 3 seconds to connect and 10
+  in all. See "When the control plane is down" in docs/configuration.md.
+
 ## [0.9.0] - 2026-11-09
 
 This release uses Felix 0.7.0 and needs a Felix 0.7 broker and control plane. It
