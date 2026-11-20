@@ -1,0 +1,1 @@
+- `dev/up.sh` waits until the fleet reports `atomic_commit` enabled, and a heartbeat longer, before it reports ready (#78). The tests no longer start against a broker that still refuses commits.
