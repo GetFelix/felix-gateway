@@ -71,6 +71,8 @@ pub struct Gateway {
     /// `GATEWAY_NAMESPACE`: what a join that names no namespace opens.
     namespace: String,
     heartbeat: Heartbeat,
+    /// What resumable sessions have published, kept across reconnects.
+    producers: Arc<felix::producers::Registry<felix::Producer>>,
 }
 
 impl Gateway {
@@ -128,6 +130,7 @@ impl Gateway {
             scope: Arc::clone(&config.scope),
             namespace: config.namespace.clone(),
             heartbeat: config.heartbeat,
+            producers: Arc::new(felix::producers::Registry::new(felix::producers::IDLE)),
         })
     }
 

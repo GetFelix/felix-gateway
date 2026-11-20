@@ -23,6 +23,7 @@ pub const FEATURES: &[&str] = &[
     CACHE_VERSIONS,
     PRINCIPAL,
     TIME,
+    IDEMPOTENT_PUBLISH,
 ];
 
 /// The feature under which a write or join refused by a limit is answered
@@ -66,6 +67,10 @@ pub const PRINCIPAL: &str = "principal";
 /// offset a wall-clock time falls at, with `offset_for_time`.
 pub const TIME: &str = "time";
 
+/// The feature under which a `join` may name a `session` and a `publish` may
+/// carry a `seq`, so a publish resent after a reconnect is not appended twice.
+pub const IDEMPOTENT_PUBLISH: &str = "idempotent_publish";
+
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
@@ -93,6 +98,10 @@ pub struct Join {
     pub protocol: u32,
     #[serde(default)]
     pub features: Vec<String>,
+    /// With [`IDEMPOTENT_PUBLISH`]: a name for this browser session that stays
+    /// the same across its reconnects.
+    #[serde(default)]
+    pub session: Option<String>,
     #[serde(flatten)]
     pub fields: Map<String, Value>,
 }
@@ -129,6 +138,12 @@ pub enum ClientMessage {
         payload: String,
         ack: bool,
         id: u64,
+        /// With [`IDEMPOTENT_PUBLISH`] and a `session`: this publish's number
+        /// in the session, rising from one publish to the next on a stream.
+        /// A publish resent with a number already acknowledged is answered
+        /// without being appended again.
+        #[serde(default)]
+        seq: Option<u64>,
     },
     /// Add `delta` to a counter. The gateway answers with a
     /// [`ServerMessage::Counter`] carrying the same `id` and the new sum.

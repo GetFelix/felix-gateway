@@ -136,7 +136,7 @@ impl Pool {
             }
         };
         Ok(Identity {
-            client,
+            client: Arc::new(client),
             _lease: lease,
         })
     }
@@ -159,7 +159,7 @@ impl Drop for Lease {
 /// One user's identity on a shared connection. Dropping it closes its
 /// streams and leaves the connection to everyone else.
 pub(crate) struct Identity {
-    pub(crate) client: Connection,
+    pub(crate) client: Arc<Connection>,
     _lease: Lease,
 }
 
