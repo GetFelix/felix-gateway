@@ -135,6 +135,40 @@ impl Browser {
         browser
     }
 
+    /// Join `lobby` as `ana` with the `idempotent_publish` feature, as the
+    /// session named `session`.
+    async fn resume(gateway: SocketAddr, session: &str) -> Self {
+        let token = sign_in("ana").await;
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{gateway}/ws"))
+            .await
+            .expect("open WebSocket");
+        let mut browser = Self { socket, next_id: 0 };
+        browser
+            .send(json!({
+                "type": "join", "protocol": 1, "features": ["idempotent_publish"],
+                "room": "lobby", "token": token, "session": session,
+            }))
+            .await;
+        let hello = browser.recv().await;
+        assert_eq!(hello["type"], "hello", "{hello}");
+        assert_eq!(hello["features"], json!(["idempotent_publish"]));
+        browser
+    }
+
+    /// Publish `payload` as number `seq` of the session, and wait for its ack.
+    async fn publish_seq(&mut self, payload: &str, seq: u64) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(json!({
+            "type": "publish", "stream": "ops", "payload": BASE64.encode(payload),
+            "ack": true, "id": id, "seq": seq,
+        }))
+        .await;
+        let ack = self.recv_type("ack").await;
+        assert_eq!(ack["id"], id, "{ack}");
+        ack
+    }
+
     async fn open(gateway: SocketAddr) -> Self {
         Self::join(gateway, "ana", "lobby").await
     }
@@ -2130,4 +2164,57 @@ async fn a_shard_needs_the_shards_feature() {
         (Some("bad_request"), Some(1)),
         "{refused}"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_publish_resent_after_a_reconnect_lands_once() {
+    let (_gateway, addr) = start_gateway().await;
+    let tag = run_tag("resend");
+
+    let mut first = Browser::resume(addr, &tag).await;
+    let mut offsets = Vec::new();
+    for seq in [10, 11, 15] {
+        let ack = first.publish_seq(&format!("{tag}/{seq}"), seq).await;
+        offsets.push(ack["offset"].as_u64().expect("acks carry offsets"));
+    }
+    drop(first);
+
+    // The page never saw its acks, so after reconnecting it resends all three
+    // and then sends a new one.
+    let mut second = Browser::resume(addr, &tag).await;
+    for (seq, offset) in [10, 11, 15].into_iter().zip(&offsets) {
+        let ack = second.publish_seq(&format!("{tag}/{seq}"), seq).await;
+        // Only the latest one is still known by offset.
+        if seq == 15 {
+            assert_eq!(ack["offset"].as_u64(), Some(*offset), "{ack}");
+        }
+    }
+    second.publish_seq(&format!("{tag}/16"), 16).await;
+
+    let mut reader = Browser::open(addr).await;
+    reader.subscribe("ops", json!(offsets[0])).await;
+    let (events, _) = reader.events(&tag, 4).await;
+    let landed: Vec<&str> = events.iter().map(|(_, payload)| payload.as_str()).collect();
+    assert_eq!(
+        landed,
+        [10, 11, 15, 16].map(|seq| format!("{tag}/{seq}")),
+        "one record per publish"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a Felix broker"]
+async fn a_seq_without_a_session_is_refused() {
+    let (_gateway, addr) = start_gateway().await;
+    let mut browser = Browser::open(addr).await;
+    browser
+        .send(json!({
+            "type": "publish", "stream": "ops", "payload": BASE64.encode("x"),
+            "ack": true, "id": 1, "seq": 1,
+        }))
+        .await;
+    let error = browser.recv_type("error").await;
+    assert_eq!(error["code"], "bad_request", "{error}");
+    assert_eq!(error["id"], 1);
 }

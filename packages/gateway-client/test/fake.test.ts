@@ -159,6 +159,19 @@ describe("FakeGateway", () => {
     expect(events.map((event) => event.offset)).toEqual([1]);
   });
 
+  it("appends a publish resent with its seq only once", async () => {
+    const scope = new FakeScope();
+    const gateway = new FakeGateway(scope);
+    gateway.losingAcks = true;
+    await expect(gateway.publish("ops", bytes(1), true, 7)).rejects.toMatchObject({
+      code: "publish_failed",
+    });
+    gateway.losingAcks = false;
+    await gateway.publish("ops", bytes(1), true, 7);
+    await gateway.publish("ops", bytes(2), true, 8);
+    expect(scope.log("ops")).toEqual([bytes(1), bytes(2)]);
+  });
+
   it("keeps caches and counters shared between connections", async () => {
     const scope = new FakeScope();
     const a = new FakeGateway(scope);

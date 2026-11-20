@@ -19,13 +19,14 @@ use tokio::task::JoinHandle;
 use tokio::time::{Interval, Sleep};
 
 use crate::access::{Grant, Refused};
-use crate::felix::Felix;
+use crate::felix::producers::{Entry, Key, Outcome};
+use crate::felix::{Felix, Producer};
 use crate::limits::{self, SessionLimits, WriteCost};
 use crate::metrics::{Metrics, Refusal};
 use crate::protocol::{
     BINARY_EVENTS, CACHE_VERSIONS, CacheEntry, ClientMessage, ErrorCode, EventFrame, FEATURES,
-    Join, PAST_END, PRINCIPAL, PROTOCOL, RATE_LIMITED, READ, Record, SHARDS, SLOTS, STATE,
-    ServerMessage, StartAt, TIME,
+    IDEMPOTENT_PUBLISH, Join, PAST_END, PRINCIPAL, PROTOCOL, RATE_LIMITED, READ, Record, SHARDS,
+    SLOTS, STATE, ServerMessage, StartAt, TIME,
 };
 use crate::scope::{
     Action, BAD_NAME, Bound, CacheAction, CounterAction, NamespaceRefused, Scope, StreamAction,
@@ -66,6 +67,8 @@ enum Write {
         payload: Vec<u8>,
         ack: bool,
         id: u64,
+        /// The browser's number for it, when the session resumes.
+        seq: Option<u64>,
     },
     /// Put (`Some`) or delete (`None`) a cache entry.
     Cache {
@@ -164,6 +167,9 @@ struct Session {
     cache_versions: bool,
     /// The session asked for [`TIME`].
     time: bool,
+    /// Present when the session asked for [`IDEMPOTENT_PUBLISH`] and named a
+    /// session in its `join`.
+    resume: Option<Arc<Entry<Producer>>>,
     /// Range reads sent to Felix whose answer is not yet sent on.
     reads: Arc<AtomicUsize>,
     /// The number the next subscription's frames carry.
@@ -205,6 +211,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         past_end,
         cache_versions,
         time,
+        resume,
     }) = join(&mut conn, &gateway, client).await
     else {
         return;
@@ -221,6 +228,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         Arc::clone(&felix),
         Arc::clone(&gateway.metrics),
         replies_tx.clone(),
+        resume.clone(),
     ));
     let mut session = Session {
         felix,
@@ -234,6 +242,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         past_end,
         cache_versions,
         time,
+        resume,
         reads: Arc::default(),
         next_sub: 0,
         throttle: Arc::new(Throttle::default()),
@@ -469,7 +478,18 @@ impl Session {
                 payload,
                 ack,
                 id,
+                seq,
             } => {
+                if seq.is_some() && self.resume.is_none() {
+                    return Next::Reply(with_id(
+                        id,
+                        stream_error(
+                            stream,
+                            ErrorCode::BadRequest,
+                            "a seq needs the idempotent_publish feature and a session in the join",
+                        ),
+                    ));
+                }
                 let bound = match scope.stream(&stream, StreamAction::Publish) {
                     Ok(bound) => bound,
                     Err(refusal) => {
@@ -505,6 +525,7 @@ impl Session {
                     payload,
                     ack,
                     id,
+                    seq,
                 })
                 .await
             }
@@ -969,6 +990,7 @@ async fn write_in_order(
     felix: Arc<Felix>,
     metrics: Arc<Metrics>,
     replies: mpsc::UnboundedSender<ServerMessage>,
+    resume: Option<Arc<Entry<Producer>>>,
 ) {
     while let Some(write) = queue.recv().await {
         let reply = match write {
@@ -978,11 +1000,24 @@ async fn write_in_order(
                 payload,
                 ack,
                 id,
+                seq,
             } => {
                 let started = Instant::now();
-                match felix.publish(&name, payload, ack).await {
-                    Ok(offset) if ack => {
-                        metrics.record_felix_ack(&stream, started.elapsed());
+                let published = match (seq, &resume) {
+                    (Some(seq), Some(entry)) => felix
+                        .publish_once(entry, &name, seq, payload)
+                        .await
+                        .map(|outcome| match outcome {
+                            Outcome::Landed(offset) => (offset, true),
+                            Outcome::Resent(offset) => (offset, false),
+                        }),
+                    _ => felix.publish(&name, payload, ack).await.map(|o| (o, true)),
+                };
+                match published {
+                    Ok((offset, sent)) if ack => {
+                        if sent {
+                            metrics.record_felix_ack(&stream, started.elapsed());
+                        }
                         ServerMessage::Ack { id, offset }
                     }
                     Ok(_) => continue,
@@ -1057,6 +1092,7 @@ struct Joined {
     past_end: bool,
     cache_versions: bool,
     time: bool,
+    resume: Option<Arc<Entry<Producer>>>,
 }
 
 /// Wait for the browser's `join`, exchange its sign-in for a token that
@@ -1133,6 +1169,22 @@ async fn accept(
         .admit_principal(&grant.principal, std::time::Instant::now())
         .map_err(session_refused)?;
     let missing = grant.missing.clone();
+    let resume = match (
+        &join.session,
+        join.features.iter().any(|f| f == IDEMPOTENT_PUBLISH),
+    ) {
+        (Some(session), true) => {
+            if !valid_name(session) {
+                return Err(error(ErrorCode::BadRequest, format!("session: {BAD_NAME}")));
+            }
+            Some(gateway.producers.entry(&Key {
+                principal: grant.principal.clone(),
+                namespace: namespace.clone(),
+                session: session.clone(),
+            }))
+        }
+        _ => None,
+    };
     let felix = connect(scope, grant, gateway).await?;
     let hello = ServerMessage::Hello {
         protocol: PROTOCOL,
@@ -1168,6 +1220,7 @@ async fn accept(
             .iter()
             .any(|feature| feature == CACHE_VERSIONS),
         time: join.features.iter().any(|feature| feature == TIME),
+        resume,
     })
 }
 

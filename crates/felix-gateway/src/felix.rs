@@ -2,18 +2,19 @@
 //! own with its own scope token, or acts as its user on a connection the
 //! gateway shares, with that user's delegated token (`shared`).
 
+pub(crate) mod producers;
 mod shared;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use felix_client::{
     CacheConditionResult, CacheWatch, CacheWatchFilter, CacheWatchItem, Client, ClientConfig,
-    ClusterCacheWatch, ClusterSubscription, Event, StartPosition, StateValue, StreamPage,
-    TokenProvider, VersionedValue,
+    ClusterCacheWatch, ClusterSubscription, Event, IdempotentProducer, StartPosition, StateValue,
+    StreamPage, TokenProvider, VersionedValue,
 };
 use felix_wire::{AckMode, CacheCondition};
 use rustls::RootCertStore;
@@ -26,6 +27,9 @@ use crate::scope::Scope;
 
 use shared::SharedSubscription;
 pub(crate) use shared::{Identity, Pool};
+
+/// What a session's resumable publishes go through.
+pub(crate) type Producer = IdempotentProducer;
 
 /// Where the brokers are and how to trust them, read once at startup.
 pub(crate) struct Brokers {
@@ -155,6 +159,8 @@ enum Link {
 /// Resources are named by their Felix names, resolved from the scope.
 pub(crate) struct Felix {
     link: Link,
+    /// Tells this connection from the others a session's producer has seen.
+    link_id: u64,
     tenant: String,
     namespace: String,
     shards: Arc<ShardCounts>,
@@ -238,8 +244,10 @@ impl Felix {
     }
 
     fn with_link(link: Link, brokers: &Brokers, scope: Scope, principal: String) -> Self {
+        static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
         Self {
             link,
+            link_id: NEXT_LINK.fetch_add(1, Ordering::Relaxed),
             tenant: brokers.tenant.clone(),
             namespace: scope.namespace().to_string(),
             shards: Arc::clone(&brokers.shards),
@@ -300,6 +308,54 @@ impl Felix {
                         .await
                 })
                 .await
+            }
+        }
+    }
+
+    /// Publish number `seq` of a browser session so that it lands once,
+    /// however often the browser resends it. See [`producers`].
+    pub(crate) async fn publish_once(
+        &self,
+        entry: &producers::Entry<IdempotentProducer>,
+        stream: &str,
+        seq: u64,
+        payload: Vec<u8>,
+    ) -> Result<producers::Outcome> {
+        match &self.link {
+            Link::Own(client) => {
+                entry
+                    .publish(
+                        self.link_id,
+                        stream,
+                        seq,
+                        async || client.idempotent_producer().await,
+                        async |producer: &IdempotentProducer| {
+                            producer
+                                .publish(&self.tenant, &self.namespace, stream, payload)
+                                .await
+                        },
+                    )
+                    .await
+            }
+            Link::Shared(session) => {
+                let identity = session.identity().await;
+                let result = entry
+                    .publish(
+                        self.link_id,
+                        stream,
+                        seq,
+                        async || identity.client.idempotent_producer().await,
+                        async |producer: &IdempotentProducer| {
+                            producer
+                                .publish(&self.tenant, &self.namespace, stream, payload)
+                                .await
+                        },
+                    )
+                    .await;
+                if result.is_err() {
+                    session.renew(&identity).await;
+                }
+                result
             }
         }
     }

@@ -47,6 +47,7 @@ the gateway accepted. A browser uses a feature only if `hello` lists it.
   | `cache_versions` | `cache_value` carries the entry's version, and [`cache_put_if`](#cache_put_if) and [`cache_delete_if`](#cache_delete_if) write only if the entry is still at the version the browser read. Needs a Felix broker from 0.6.0-preview.3 on; against an older one the session's `cache_get` and conditional writes fail with `cache_failed` |
   | `principal` | `hello` names the session's Felix principal (the identity Felix knows it by) in `principal` |
   | `time` | [`offset_for_time`](#offset_for_time) finds the offset of a stream's shard at a wall-clock time |
+  | `idempotent_publish` | A `join` may name a `session`, and a [`publish`](#publish) may carry a `seq`, so a publish resent after a reconnect is [not appended twice](#resending-a-publish) |
 
 - A `join` asking for another version is refused with `unsupported`.
 - A message type the gateway does not know is answered with an `unsupported`
@@ -94,6 +95,7 @@ up.
 | `room` | The scope's value, under the scope file's `field`: 1 to 64 ASCII letters, digits, `-` or `_` |
 | `namespace` | The Felix namespace to open the scope in. Optional; leaving it out opens the gateway's own (`GATEWAY_NAMESPACE`). A gateway serves the namespaces its scope file lists under `namespaces`, or only its own when there is no list. When the scope file's `field` is `namespace`, this key is the scope's value instead |
 | `token` | The ID token from signing in |
+| `session` | Only with the `idempotent_publish` feature, optional: a name for this browser session, following the rule for `counter_add` keys, that the page keeps across its reconnects. It must not be the scope's `field` name. Without the feature it is ignored |
 
 The first message on every connection, and the only one allowed before
 `hello`. The gateway exchanges the ID token for a narrowed Felix token and
@@ -177,11 +179,12 @@ above still keys on stream and slot alone. A `shard` itself does not need
 | `payload` | The record, base64. The gateway passes the bytes through unread, after the sender's stamp on a `stamp_sender` stream |
 | `ack` | `true` to be told when Felix has the record. `false` publishes fire-and-forget, which suits cursors |
 | `id` | An integer chosen by the browser. It comes back on the `ack` or `error` for this publish |
+| `seq` | Only with the `idempotent_publish` feature and a `session` in the `join`, optional: this publish's number in the session, rising from one publish to the next on a stream. See [Resending a publish](#resending-a-publish). Without the feature and a session a `seq` is refused with `bad_request` |
 
 A connection's publishes and cache writes reach Felix one at a time, in the
-order the browser sent them. The gateway never resends a publish. When one
-fails the browser decides whether to retry, since only the application knows
-whether a record is safe to deduplicate.
+order the browser sent them. The gateway never resends a publish by itself.
+When one fails the browser decides whether to retry. A browser that numbers
+its publishes can retry safely; see [Resending a publish](#resending-a-publish).
 
 A publish over one of the gateway's [limits](#limits) is answered at once
 with an `error` carrying its `id`, even with `"ack": false`, and never
@@ -210,6 +213,41 @@ function unstamp(payload: Uint8Array): { sender: string; record: Uint8Array } {
 Only records the gateway published carry a stamp. A record written by another
 client to a `stamp_sender` stream has none, so `unstamp` would misread it; a
 stream that also takes unstamped writers needs a marker of its own.
+
+#### Resending a publish
+
+A page that resends its unacknowledged edits after a reconnect would otherwise
+append each one that had already committed a second time. With the
+`idempotent_publish` feature, the page names its session in `join` (the same
+name on every reconnect) and gives each publish a `seq`:
+
+```json
+{"type": "join", "features": ["idempotent_publish"], "room": "lobby", "token": "eyJ...", "session": "9f3a61c2"}
+{"type": "publish", "stream": "ops", "payload": "haNzaWTP...", "ack": true, "id": 7, "seq": 42}
+```
+
+- A `seq` is a number the browser picks. It must rise from one publish to the
+  next on a stream, in the order they are sent, and may skip. Resend in `seq`
+  order after a reconnect.
+- The gateway publishes through Felix's idempotent producer and remembers, for
+  the session and each stream, the highest `seq` Felix acknowledged. A publish
+  at or below it is answered with an `ack` and not sent again. The `ack`
+  carries the record's `offset` when the `seq` is the latest acknowledged, and
+  `null` for an older one.
+- A publish whose answer was lost, such as when its leader failed, is sent
+  again under the same sequence by the same producer, so it lands once whether
+  or not the first attempt committed. Resend it with the same payload: a
+  different one is refused rather than sent.
+- A session is its person, namespace and `session` name together, so another
+  person who uses the same name does not meet it. The gateway keeps it for 10
+  minutes after its last publish. A page back after longer, or after the
+  gateway restarted, starts over, and a resend of a publish that committed
+  before may land again. Pages should still deduplicate by their own id.
+- A session that has failed the same publish three times in a row, on a
+  producer that cannot reach Felix, is given a new producer. The publish then
+  may land twice.
+- A publish without a `seq` behaves as before, and so do all other messages.
+  Fire-and-forget publishes (`"ack": false`) take a `seq` too.
 
 ### `counter_add`
 

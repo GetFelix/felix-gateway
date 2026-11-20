@@ -114,6 +114,14 @@ describe("GatewayClient", () => {
     await expect(offset).resolves.toBe(41);
   });
 
+  it("sends a seq with a publish only when given one", async () => {
+    const { client, socket } = await connect();
+    void client.publish("ops", bytes(1), true, 7);
+    void client.publish("ops", bytes(2));
+    expect(socket.sent[1]).toMatchObject({ type: "publish", seq: 7 });
+    expect(socket.sent[2]).not.toHaveProperty("seq");
+  });
+
   it("resolves an unacknowledged publish at once", async () => {
     const { client, socket } = await connect();
     await expect(client.publish("ops", bytes(1), false)).resolves.toBeNull();

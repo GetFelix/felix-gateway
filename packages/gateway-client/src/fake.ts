@@ -28,6 +28,8 @@ export class FakeScope {
   /** The first offset each stream still holds; a subscribe from earlier is `trimmed`. */
   readonly retainedFrom = new Map<string, number>();
   readonly connections = new Set<FakeGateway>();
+  /** The highest `seq` each stream has appended, so a resend is not appended again. */
+  readonly seqs = new Map<string, number>();
 
   /** The records of `stream`, which a test may read or fill directly. */
   log(stream: string): Uint8Array[] {
@@ -148,7 +150,12 @@ export class FakeGateway implements Gateway {
     this.onEvent({ stream, offset, skippedBefore: 0, payload });
   }
 
-  async publish(stream: string, payload: Uint8Array, ack = true): Promise<number | null> {
+  async publish(stream: string, payload: Uint8Array, ack = true, seq?: number) {
+    if (seq !== undefined) {
+      const last = this.scope.seqs.get(stream);
+      if (last !== undefined && seq <= last) return null;
+      this.scope.seqs.set(stream, seq);
+    }
     const offset = this.scope.append(stream, payload);
     if (this.losingAcks) throw new GatewayError("publish_failed", "connection lost");
     return ack ? offset : null;

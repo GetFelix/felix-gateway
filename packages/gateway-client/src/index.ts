@@ -65,7 +65,9 @@ export type ServerMessage =
  * names, such as `{ room: "lobby", token }`. On a gateway that serves several
  * namespaces, `namespace` picks one, such as
  * `{ namespace: "payments", room: "lobby", token }`; `Hello.namespace` says
- * which one the session opened.
+ * which one the session opened. With the `idempotent_publish` feature,
+ * `session` names this page's session and stays the same across its
+ * reconnects, so `publish` can pass a `seq`.
  */
 export interface Join {
   token: string;
@@ -229,9 +231,21 @@ export class GatewayClient {
    * Publish one record. With `ack`, resolves once the broker has it, with its
    * log offset when the broker acknowledged after writing. Without, resolves
    * as soon as the request is sent.
+   *
+   * With the `idempotent_publish` feature and a `session` in the join, `seq`
+   * numbers the publish within the session and stream, rising and possibly
+   * skipping. Resend a publish with the same `seq` after a reconnect and the
+   * gateway does not append it again; the answer then has no offset unless it
+   * was the latest one acknowledged.
    */
-  publish(stream: string, payload: Uint8Array, ack = true): Promise<number | null> {
-    const message = { type: "publish", stream, payload: toBase64(payload), ack };
+  publish(stream: string, payload: Uint8Array, ack = true, seq?: number): Promise<number | null> {
+    const message = {
+      type: "publish",
+      stream,
+      payload: toBase64(payload),
+      ack,
+      ...(seq === undefined ? {} : { seq }),
+    };
     if (!ack) {
       this.#send({ ...message, id: this.#nextId++ });
       return Promise.resolve(null);
