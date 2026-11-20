@@ -193,12 +193,13 @@ impl ControlPlane {
         actor: Option<&Actor>,
     ) -> Result<Grant, Refused> {
         let key = Rejoin::key(id_token, scope);
+        let seen = self.rejoin.forgotten();
         match self
             .exchange_with_control_plane(id_token, scope, actor, &key)
             .await
         {
             Ok(grant) => {
-                self.rejoin.remember(&key, id_token, &grant, now());
+                self.rejoin.remember(&key, id_token, &grant, now(), seen);
                 Ok(grant)
             }
             Err(Refused::Unavailable(err)) if err.is::<Unreachable>() => {
@@ -324,7 +325,7 @@ impl ControlPlane {
                 let refresh_token = Arc::clone(&refresh_token);
                 let key = key.clone();
                 async move {
-                    let token = control_plane.refresh(&refresh_token).await?;
+                    let token = control_plane.refresh(&key, &refresh_token).await?;
                     control_plane.rejoin.refreshed(&key, &token, None, now());
                     Ok(token)
                 }
@@ -334,7 +335,7 @@ impl ControlPlane {
 
     // RefreshingToken runs one fetch at a time, so the lock is never held by
     // two refreshes; it only carries each single-use token to the next call.
-    async fn refresh(&self, refresh_token: &Mutex<Option<String>>) -> Result<String> {
+    async fn refresh(&self, key: &str, refresh_token: &Mutex<Option<String>>) -> Result<String> {
         let current = refresh_token
             .lock()
             .expect("refresh token lock")
@@ -343,7 +344,7 @@ impl ControlPlane {
                 "this session rejoined on a credential kept while the control plane was down, \
                  so it cannot be renewed; sign in again",
             )?;
-        let answer: TokenResponse = self
+        let response = self
             .http
             .post(format!(
                 "{}/v1/tenants/{}/token/refresh",
@@ -352,7 +353,17 @@ impl ControlPlane {
             .json(&json!({ "refresh_token": current }))
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
+            .context("refresh the scope token")?;
+        // A refusal is a decision about the person, so what was kept for a
+        // rejoin stops standing in for it.
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            self.rejoin.forget(key);
+        }
+        let answer: TokenResponse = response
+            .error_for_status()
             .context("refresh the scope token")?
             .json()
             .await
@@ -453,7 +464,7 @@ impl ControlPlane {
             let actor = Arc::clone(&actor);
             let key = key.clone();
             async move {
-                let scope_token = control_plane.refresh(&refresh_token).await?;
+                let scope_token = control_plane.refresh(&key, &refresh_token).await?;
                 let delegated =
                     actor
                         .delegate(&scope_token)
@@ -715,6 +726,8 @@ mod tests {
         /// Bodies the gateway's own exchanges answer 403 with before they
         /// succeed.
         gateway_refusals: Mutex<Vec<&'static str>>,
+        /// Statuses `/token/refresh` answers with before it succeeds.
+        refresh_refusals: Mutex<Vec<StatusCode>>,
         exchanges: AtomicUsize,
         /// `exp` of the gateway tokens the exchange mints.
         gateway_exp: AtomicU64,
@@ -774,10 +787,13 @@ mod tests {
                 post(
                     |State(fake): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                         fake.record("refresh", &headers, &body);
-                        Json(json!({
+                        if let Some(status) = fake.refresh_refusals.lock().unwrap().pop() {
+                            return Err(status);
+                        }
+                        Ok(Json(json!({
                             "felix_token": jwt(json!({ "sub": "ana", "exp": now() + 900, "n": 2 })),
                             "refresh_token": "r2",
-                        }))
+                        })))
                     },
                 ),
             )
@@ -1254,6 +1270,63 @@ mod tests {
         assert_ne!(again.felix_token, first);
     }
 
+    #[tokio::test]
+    async fn a_refused_refresh_ends_reuse_but_a_failed_one_does_not() {
+        let (fake, control_plane, _, _) = actor("refresh-refused", now() + 3600).await;
+        let scope = lobby();
+        let id = id_token(600, "ana");
+        let grant = control_plane.exchange(&id, &scope, None).await.unwrap();
+        let expired = || jwt(json!({ "sub": "ana", "exp": now() - 1 }));
+        let refresh = |grant: &Grant| Grant {
+            felix_token: expired(),
+            refresh_token: Some("r1".into()),
+            principal: "ana".into(),
+            missing: vec![],
+            key: grant.key.clone(),
+            delegated: None,
+        };
+        let down = taken_down(&control_plane).await;
+
+        fake.refresh_refusals
+            .lock()
+            .unwrap()
+            .push(StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(control_plane.tokens(refresh(&grant)).token().await.is_err());
+        assert!(down.exchange(&id, &scope, None).await.is_ok());
+
+        fake.refresh_refusals
+            .lock()
+            .unwrap()
+            .push(StatusCode::FORBIDDEN);
+        assert!(control_plane.tokens(refresh(&grant)).token().await.is_err());
+        assert!(matches!(
+            down.exchange(&id, &scope, None).await,
+            Err(Refused::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn an_exchange_that_began_before_a_refusal_is_not_kept() {
+        let scope = lobby();
+        let rejoin = Rejoin::new(Duration::from_secs(900));
+        let key = Rejoin::key("id", &scope);
+        let grant = Grant {
+            felix_token: jwt(json!({ "sub": "ana", "exp": 10_000 })),
+            refresh_token: Some("r".into()),
+            principal: "ana".into(),
+            missing: vec![],
+            key: String::new(),
+            delegated: None,
+        };
+        let id = jwt(json!({ "exp": 10_000 }));
+        let began = rejoin.forgotten();
+        rejoin.forget(&key);
+        rejoin.remember(&key, &id, &grant, 1_000, began);
+        assert_eq!(rejoin.len(), 0);
+        rejoin.remember(&key, &id, &grant, 1_000, rejoin.forgotten());
+        assert_eq!(rejoin.len(), 1);
+    }
+
     #[test]
     fn a_kept_grant_is_capped_from_when_it_was_issued() {
         let scope = lobby();
@@ -1267,7 +1340,13 @@ mod tests {
             key: String::new(),
             delegated: None,
         };
-        rejoin.remember(&key, &jwt(json!({ "exp": 10_000 })), &grant, 1_000);
+        rejoin.remember(
+            &key,
+            &jwt(json!({ "exp": 10_000 })),
+            &grant,
+            1_000,
+            rejoin.forgotten(),
+        );
         assert!(rejoin.recall(&key, 1_060).is_some());
         assert!(
             rejoin
@@ -1276,7 +1355,13 @@ mod tests {
         );
 
         // A refresh re-checks the person, so the cap counts from it.
-        rejoin.remember(&key, &jwt(json!({ "exp": 10_000 })), &grant, 1_000);
+        rejoin.remember(
+            &key,
+            &jwt(json!({ "exp": 10_000 })),
+            &grant,
+            1_000,
+            rejoin.forgotten(),
+        );
         rejoin.refreshed(&key, &grant.felix_token, None, 1_090);
         assert!(rejoin.recall(&key, 1_150).is_some());
         assert!(
@@ -1302,7 +1387,13 @@ mod tests {
         let key = Rejoin::key("id", &scope);
         let at = 1_000;
 
-        rejoin.remember(&key, &id(at + 500), &grant(at + 900), at);
+        rejoin.remember(
+            &key,
+            &id(at + 500),
+            &grant(at + 900),
+            at,
+            rejoin.forgotten(),
+        );
         assert!(
             rejoin.recall(&key, at + 400).is_some(),
             "the ID token ends first"
@@ -1313,7 +1404,13 @@ mod tests {
                 .is_none()
         );
 
-        rejoin.remember(&key, &id(at + 900), &grant(at + 500), at);
+        rejoin.remember(
+            &key,
+            &id(at + 900),
+            &grant(at + 500),
+            at,
+            rejoin.forgotten(),
+        );
         assert!(
             rejoin.recall(&key, at + 400).is_some(),
             "the Felix token ends first"
@@ -1324,13 +1421,19 @@ mod tests {
                 .is_none()
         );
 
-        rejoin.remember(&key, &jwt(json!({})), &grant(at + 500), at);
+        rejoin.remember(
+            &key,
+            &jwt(json!({})),
+            &grant(at + 500),
+            at,
+            rejoin.forgotten(),
+        );
         assert_eq!(rejoin.len(), 0, "an ID token with no expiry is never kept");
         let no_exp = Grant {
             felix_token: jwt(json!({ "sub": "ana" })),
             ..grant(0)
         };
-        rejoin.remember(&key, &id(at + 500), &no_exp, at);
+        rejoin.remember(&key, &id(at + 500), &no_exp, at, rejoin.forgotten());
         assert_eq!(rejoin.len(), 0, "nor is a Felix token with none");
     }
 }

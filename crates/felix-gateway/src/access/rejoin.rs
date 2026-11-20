@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -42,6 +43,9 @@ pub(crate) struct Rejoin {
     entries: Mutex<HashMap<String, Held>>,
     /// The longest a grant may be reused after the control plane issued it.
     max: u64,
+    /// Counts every [`Self::forget`], so an exchange that began before one is
+    /// not kept after it.
+    forgets: AtomicU64,
 }
 
 impl Rejoin {
@@ -49,6 +53,7 @@ impl Rejoin {
         Self {
             entries: Mutex::default(),
             max: max.as_secs(),
+            forgets: AtomicU64::new(0),
         }
     }
 
@@ -71,7 +76,12 @@ impl Rejoin {
 
     /// Keep the answer to an exchange. A token without an `exp`, or an ID token
     /// without one, is not kept: nothing bounds how long it could be reused.
-    pub(crate) fn remember(&self, key: &str, id_token: &str, grant: &Grant, now: u64) {
+    /// Read before asking the control plane, and pass to [`Self::remember`].
+    pub(crate) fn forgotten(&self) -> u64 {
+        self.forgets.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn remember(&self, key: &str, id_token: &str, grant: &Grant, now: u64, seen: u64) {
         let (Some(felix_exp), Some(id_exp)) = (
             claims(&grant.felix_token).and_then(|c| c.exp),
             claims(id_token).and_then(|c| c.exp),
@@ -88,6 +98,11 @@ impl Rejoin {
             obtained: now,
         };
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        // A refusal landed while this exchange was in flight: its answer may
+        // predate the revocation, so it is not kept.
+        if self.forgets.load(Ordering::SeqCst) != seen {
+            return;
+        }
         entries.retain(|_, held| self.expires(held) > now);
         if entries.len() >= MAX_ENTRIES
             && let Some(soonest) = entries
@@ -145,10 +160,9 @@ impl Rejoin {
     /// Drop what is kept for `key`: the control plane answered, so what it
     /// granted before no longer stands in for it.
     pub(crate) fn forget(&self, key: &str) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        self.forgets.fetch_add(1, Ordering::SeqCst);
+        entries.remove(key);
     }
 
     /// The grant kept for `key`, if it is still good for at least

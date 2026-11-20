@@ -332,10 +332,11 @@ answer in 10, or a 5xx), a join is handled this way:
   when the token does. The browser's next join is refused if the control plane
   is still down.
 
-Any answer from the control plane, a refusal included, replaces what the
-gateway kept, so reuse stops the moment the control plane can say no. The
-kept token is renewed each time a session refreshes its own, which re-checks
-the person's permissions.
+A 401 or 403 from a sign-in or a refresh deletes what the gateway kept, so
+reuse stops the moment the control plane can say no. A sign-in that began
+before the refusal is not kept either. A 500, a 409 or another 4xx fails the
+join and keeps what was kept. A successful refresh renews the kept token and
+its cap, since it re-checks the person's permissions.
 
 **How long a revoked person can keep rejoining.** Only while the control
 plane is unreachable, and no longer than the earliest of three times: the
