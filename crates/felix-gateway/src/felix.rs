@@ -321,6 +321,7 @@ impl Felix {
         seq: u64,
         payload: Vec<u8>,
     ) -> Result<producers::Outcome> {
+        let (tenant, namespace) = (&self.tenant, &self.namespace);
         match &self.link {
             Link::Own(client) => {
                 entry
@@ -328,11 +329,10 @@ impl Felix {
                         self.link_id,
                         stream,
                         seq,
-                        async || client.idempotent_producer().await,
-                        async |producer: &IdempotentProducer| {
-                            producer
-                                .publish(&self.tenant, &self.namespace, stream, payload)
-                                .await
+                        payload,
+                        || client.idempotent_producer(),
+                        |producer: Arc<IdempotentProducer>, payload| async move {
+                            producer.publish(tenant, namespace, stream, payload).await
                         },
                     )
                     .await
@@ -344,11 +344,10 @@ impl Felix {
                         self.link_id,
                         stream,
                         seq,
-                        async || identity.client.idempotent_producer().await,
-                        async |producer: &IdempotentProducer| {
-                            producer
-                                .publish(&self.tenant, &self.namespace, stream, payload)
-                                .await
+                        payload,
+                        || identity.client.idempotent_producer(),
+                        |producer: Arc<IdempotentProducer>, payload| async move {
+                            producer.publish(tenant, namespace, stream, payload).await
                         },
                     )
                     .await;
@@ -358,6 +357,11 @@ impl Felix {
                 result
             }
         }
+    }
+
+    /// Which connection this is, as [`producers::Entry::publish`] takes it.
+    pub(crate) fn link_id(&self) -> u64 {
+        self.link_id
     }
 
     /// Whether `stream` has a shard `shard`. A count from the last 30 seconds

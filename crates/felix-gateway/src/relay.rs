@@ -216,6 +216,7 @@ pub(crate) async fn run<C: BrowserConnection>(
     else {
         return;
     };
+    let link = felix.link_id();
     let felix = Arc::new(felix);
     let (events_tx, mut events_rx) = mpsc::channel(EVENT_QUEUE);
     // Unbounded so the writer never waits on the browser, which is what lets
@@ -242,7 +243,7 @@ pub(crate) async fn run<C: BrowserConnection>(
         past_end,
         cache_versions,
         time,
-        resume,
+        resume: resume.clone(),
         reads: Arc::default(),
         next_sub: 0,
         throttle: Arc::new(Throttle::default()),
@@ -328,6 +329,9 @@ pub(crate) async fn run<C: BrowserConnection>(
     // cache delete lands; only their replies are lost.
     drop(writes);
     let _ = writer.await;
+    if let Some(entry) = resume {
+        entry.release(link).await;
+    }
 }
 
 /// When to ping the browser, and when its silence has gone on too long. Any
