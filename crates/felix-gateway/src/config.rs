@@ -56,6 +56,10 @@ pub struct Config {
     /// `GATEWAY_PING_INTERVAL_S` and `GATEWAY_PING_TIMEOUT_S`: how often a
     /// browser is pinged, and how long a silent one is kept.
     pub heartbeat: Heartbeat,
+    /// `GATEWAY_REJOIN_MAX_S`: the longest a session's kept grant may stand in
+    /// for the control plane after the control plane issued it, while the
+    /// control plane is unreachable. Default 900. 0 turns rejoining off.
+    pub rejoin_max: Duration,
 }
 
 /// How the gateway notices a browser that has gone without closing, such as
@@ -228,6 +232,14 @@ impl Config {
             )?),
             shared: SharedConfig::from_vars(set)?,
             heartbeat: Heartbeat::from_vars(set)?,
+            rejoin_max: match set("GATEWAY_REJOIN_MAX_S") {
+                Some(value) => Duration::from_secs(
+                    value
+                        .parse()
+                        .context("GATEWAY_REJOIN_MAX_S must be a whole number of seconds")?,
+                ),
+                None => Duration::from_secs(900),
+            },
         })
     }
 }

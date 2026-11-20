@@ -82,7 +82,8 @@ impl Gateway {
     /// connections, cannot be read.
     pub fn new(config: &Config) -> Result<Self> {
         let brokers = Arc::new(Brokers::new(config)?);
-        let control_plane = ControlPlane::new(&config.control_plane, &config.tenant);
+        let control_plane =
+            ControlPlane::new(&config.control_plane, &config.tenant, config.rejoin_max);
         if let Some(namespaces) = &config.scope.namespaces
             && !namespaces.contains(&config.namespace)
         {

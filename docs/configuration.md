@@ -24,6 +24,7 @@ roles that let people open them are set up before the gateway starts.
 | `GATEWAY_WEB_DIR` | unset | A built web app to serve on every path the gateway does not route itself |
 | `GATEWAY_PING_INTERVAL_S` | `5` | Seconds between the WebSocket pings sent to each browser. 0 sends none, which also turns off `GATEWAY_PING_TIMEOUT_S` and the `browser_rtt` metric |
 | `GATEWAY_PING_TIMEOUT_S` | `30` | Seconds a session may send nothing, not even a pong, before the gateway closes it. Longer than the interval, or 0 for never |
+| `GATEWAY_REJOIN_MAX_S` | `900` | Seconds after the control plane issued a Felix token that the gateway may still let the same sign-in rejoin while the control plane is unreachable. 0 turns rejoining off. See [When the control plane is down](#when-the-control-plane-is-down) |
 | `RUST_LOG` | `info` | Log filter, as `tracing-subscriber` reads it |
 
 `/oidc` returns the issuer, client ID and scopes, so the browser app needs no
@@ -307,6 +308,52 @@ budget on every connection (see [Shared connections](#shared-connections)),
 so a person within the gateway's rates can still get `publish_failed` or
 `subscribe_failed` from the broker. Without shared connections each session's
 own connection has the broker's per-connection limits.
+
+## When the control plane is down
+
+Every join exchanges the browser's ID token at the control plane for a Felix
+token narrowed to the scope. The brokers keep serving without the control
+plane, so the gateway lets a session that signed in before rejoin through an
+outage instead of waiting for it.
+
+When the control plane cannot be reached (no connection in 3 seconds, no
+answer in 10, or a 5xx), a join is handled this way:
+
+- The same ID token for the same scope (and namespace) that the control plane
+  accepted earlier gets the Felix token it was given then, as long as that
+  token, the ID token and the `GATEWAY_REJOIN_MAX_S` cap each have at least 30
+  seconds left. The gateway
+  keeps a SHA-256 of the ID token, never the token.
+- Any other join is refused at once with `unavailable` and the message
+  "new sign-ins wait for the control plane". A new person, a new scope, or an
+  ID token the gateway has not seen succeed does not get in this way: nothing
+  is granted that the control plane had not already granted.
+- A session that rejoined this way cannot renew its Felix token, so it ends
+  when the token does. The browser's next join is refused if the control plane
+  is still down.
+
+A 401 or 403 from a sign-in or a refresh deletes what the gateway kept for
+that ID token in every scope it was used for, so reuse stops the moment the
+control plane can say no. A sign-in that began before the refusal is not kept either. A 500, a 409 or another 4xx fails the
+join and keeps what was kept. A successful refresh renews the kept token and
+its cap, since it re-checks the person's permissions.
+
+**How long a revoked person can keep rejoining.** Only while the control
+plane is unreachable, and no longer than the earliest of three times: the
+expiry of the Felix token the gateway last got for that sign-in, the expiry of
+the ID token, and `GATEWAY_REJOIN_MAX_S` (15 minutes by default) after the
+control plane last issued that token, at sign-in or at a refresh. So the worst
+case is `GATEWAY_REJOIN_MAX_S` minus the 30-second margin from the moment the
+control plane last said yes, and a person removed right after that moment can
+rejoin for that long. A session already open keeps working until its Felix
+token expires regardless, because the brokers accept it until then. If the
+control plane is reachable, a removal takes effect at the next join or
+refresh, as before.
+
+The gateway keeps up to 10,000 of these in memory. A restart forgets them, so
+a gateway that restarts during an outage refuses every join until the control
+plane returns. With shared connections the delegated token is kept the same
+way.
 
 ## Felix permissions
 

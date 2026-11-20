@@ -22,6 +22,9 @@ use serde_json::{Value, json};
 
 use crate::scope::{Permission, Scope};
 
+mod rejoin;
+use rejoin::Rejoin;
+
 /// Why a sign-in was not exchanged for a scope token.
 #[derive(Debug)]
 pub enum Refused {
@@ -37,11 +40,18 @@ pub enum Refused {
 /// A scope token and the refresh token that replaces it.
 pub(crate) struct Grant {
     pub(crate) felix_token: String,
-    refresh_token: String,
+    /// `None` for a grant that was kept from an earlier exchange: it cannot
+    /// be renewed, so a session on it ends when the token does.
+    refresh_token: Option<String>,
     /// Who the token is for: its `sub` claim.
     pub(crate) principal: String,
     /// Aliases of the optional resources the token does not reach.
     pub(crate) missing: Vec<String>,
+    /// What [`Rejoin`] knows this grant by.
+    key: String,
+    /// The token already delegated to the gateway, on a grant kept from an
+    /// earlier exchange.
+    pub(crate) delegated: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -100,21 +110,67 @@ enum Delegation {
     Failed(anyhow::Error),
 }
 
+/// How long to wait for the control plane to accept a connection. A control
+/// plane that is down should refuse a new sign-in in seconds, not minutes.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a whole control-plane request may take.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The control plane did not answer: no connection, no reply in time, or a
+/// 502, 503 or 504 from whatever fronts it. Marks the failures a kept credential may stand in for. Any answer
+/// that decides something, even a refusal, is not this.
+#[derive(Debug)]
+struct Unreachable(String);
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the control plane cannot be reached ({})", self.0)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// Statuses a proxy or load balancer answers with when nothing behind it
+/// does. A 500 is the control plane's own answer, so it is not one of them.
+fn gateway_down(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn unreachable(cause: impl std::fmt::Display) -> anyhow::Error {
+    Unreachable(cause.to_string()).into()
+}
+
 /// The Felix control plane, as the gateway uses it.
 #[derive(Clone)]
 pub(crate) struct ControlPlane {
     http: reqwest::Client,
     url: String,
     tenant: String,
+    rejoin: Arc<Rejoin>,
 }
 
 impl ControlPlane {
-    pub(crate) fn new(url: &str, tenant: &str) -> Self {
+    pub(crate) fn new(url: &str, tenant: &str, rejoin_max: Duration) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("a client with only timeouts set"),
             url: url.to_string(),
             tenant: tenant.to_string(),
+            rejoin: Arc::new(Rejoin::new(rejoin_max)),
         }
+    }
+
+    /// Note the delegated token a session on `grant` connected with, so a
+    /// rejoin while the control plane is down can use it.
+    pub(crate) fn remember_delegated(&self, grant: &Grant, delegated: &str) {
+        self.rejoin.remember_delegated(&grant.key, delegated);
     }
 
     /// Exchange `id_token` for a token that reaches `scope` and nothing else.
@@ -126,11 +182,56 @@ impl ControlPlane {
     /// With shared connections, `actor` is the gateway: its control-plane
     /// token goes along as the RFC 8693 `actor_token`, because Felix only
     /// delegates a token minted for the gateway that asks.
+    ///
+    /// While the control plane cannot be reached, the same ID token for the
+    /// same scope gets the grant it was given before, if that is still
+    /// within its lifetime; anything else is refused as `Unavailable`.
     pub(crate) async fn exchange(
         &self,
         id_token: &str,
         scope: &Scope,
         actor: Option<&Actor>,
+    ) -> Result<Grant, Refused> {
+        let key = Rejoin::key(id_token, scope);
+        let seen = self.rejoin.forgotten();
+        match self
+            .exchange_with_control_plane(id_token, scope, actor, &key)
+            .await
+        {
+            Ok(grant) => {
+                self.rejoin.remember(&key, id_token, &grant, now(), seen);
+                Ok(grant)
+            }
+            Err(Refused::Unavailable(err)) if err.is::<Unreachable>() => {
+                match self.rejoin.recall(&key, now()) {
+                    Some(grant) => {
+                        tracing::warn!(
+                            principal = %grant.principal,
+                            "the control plane cannot be reached; rejoining on the credential it issued earlier"
+                        );
+                        Ok(grant)
+                    }
+                    None => Err(Refused::Unavailable(err.context(
+                        "new sign-ins wait for the control plane; only a session it already \
+                         signed in can rejoin while it is down",
+                    ))),
+                }
+            }
+            Err(refused) => {
+                if matches!(refused, Refused::SignedOut | Refused::Forbidden) {
+                    self.rejoin.forget(&key);
+                }
+                Err(refused)
+            }
+        }
+    }
+
+    async fn exchange_with_control_plane(
+        &self,
+        id_token: &str,
+        scope: &Scope,
+        actor: Option<&Actor>,
+        key: &str,
     ) -> Result<Grant, Refused> {
         let permissions = scope.permissions(&self.tenant);
         let (actions, objects) = split(&permissions);
@@ -155,7 +256,7 @@ impl ControlPlane {
                 .json(&request)
                 .send()
                 .await
-                .map_err(|err| Refused::Unavailable(err.into()))?;
+                .map_err(|err| Refused::Unavailable(unreachable(err)))?;
             if actor.is_none() || response.status() != StatusCode::FORBIDDEN {
                 break response;
             }
@@ -180,6 +281,11 @@ impl ControlPlane {
         match response.status() {
             StatusCode::UNAUTHORIZED => return Err(Refused::SignedOut),
             StatusCode::FORBIDDEN => return Err(Refused::Forbidden),
+            status if gateway_down(status) => {
+                return Err(Refused::Unavailable(unreachable(format!(
+                    "the token exchange answered {status}"
+                ))));
+            }
             // 409 included: a Raft control plane answers it until every
             // member understands actor tokens.
             status if !status.is_success() => {
@@ -197,9 +303,11 @@ impl ControlPlane {
         let missing = missing(&claims, &permissions).ok_or(Refused::Forbidden)?;
         Ok(Grant {
             felix_token: answer.felix_token,
-            refresh_token: answer.refresh_token,
+            refresh_token: Some(answer.refresh_token),
             principal: claims.sub,
             missing,
+            key: key.to_string(),
+            delegated: None,
         })
     }
 
@@ -209,21 +317,34 @@ impl ControlPlane {
     pub(crate) fn tokens(&self, grant: Grant) -> Arc<dyn TokenProvider> {
         let control_plane = self.clone();
         let refresh_token = Arc::new(Mutex::new(grant.refresh_token));
+        let key = grant.key;
         Arc::new(RefreshingToken::with_initial(
             grant.felix_token,
             move || {
                 let control_plane = control_plane.clone();
                 let refresh_token = Arc::clone(&refresh_token);
-                async move { control_plane.refresh(&refresh_token).await }
+                let key = key.clone();
+                async move {
+                    let token = control_plane.refresh(&key, &refresh_token).await?;
+                    control_plane.rejoin.refreshed(&key, &token, None, now());
+                    Ok(token)
+                }
             },
         ))
     }
 
     // RefreshingToken runs one fetch at a time, so the lock is never held by
     // two refreshes; it only carries each single-use token to the next call.
-    async fn refresh(&self, refresh_token: &Mutex<String>) -> Result<String> {
-        let current = refresh_token.lock().expect("refresh token lock").clone();
-        let answer: TokenResponse = self
+    async fn refresh(&self, key: &str, refresh_token: &Mutex<Option<String>>) -> Result<String> {
+        let current = refresh_token
+            .lock()
+            .expect("refresh token lock")
+            .clone()
+            .context(
+                "this session rejoined on a credential kept while the control plane was down, \
+                 so it cannot be renewed; sign in again",
+            )?;
+        let response = self
             .http
             .post(format!(
                 "{}/v1/tenants/{}/token/refresh",
@@ -232,12 +353,22 @@ impl ControlPlane {
             .json(&json!({ "refresh_token": current }))
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
+            .context("refresh the scope token")?;
+        // A refusal is a decision about the person, so what was kept for a
+        // rejoin stops standing in for it.
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            self.rejoin.forget(key);
+        }
+        let answer: TokenResponse = response
+            .error_for_status()
             .context("refresh the scope token")?
             .json()
             .await
             .context("read the refreshed scope token")?;
-        *refresh_token.lock().expect("refresh token lock") = answer.refresh_token;
+        *refresh_token.lock().expect("refresh token lock") = Some(answer.refresh_token);
         Ok(answer.felix_token)
     }
 }
@@ -256,7 +387,7 @@ impl ControlPlane {
             .json(&request)
             .send()
             .await
-            .context("exchange the gateway's credential")?;
+            .map_err(unreachable)?;
         if response.status() == StatusCode::FORBIDDEN {
             return Err(OwnRefusal::Forbidden(
                 response.text().await.unwrap_or_default(),
@@ -288,12 +419,17 @@ impl ControlPlane {
             }))
             .send()
             .await
-            .map_err(|err| Delegation::Failed(err.into()))?;
+            .map_err(|err| Delegation::Failed(unreachable(err)))?;
         match response.status() {
             StatusCode::UNAUTHORIZED => return Err(Delegation::ActorRefused),
             StatusCode::FORBIDDEN => {
                 let body = response.text().await.unwrap_or_default();
                 return Err(Delegation::Forbidden(body));
+            }
+            status if gateway_down(status) => {
+                return Err(Delegation::Failed(unreachable(format!(
+                    "the token delegation answered {status}"
+                ))));
             }
             status if !status.is_success() => {
                 return Err(Delegation::Failed(anyhow::anyhow!(
@@ -321,19 +457,26 @@ impl ControlPlane {
     ) -> Arc<dyn TokenProvider> {
         let control_plane = self.clone();
         let refresh_token = Arc::new(Mutex::new(grant.refresh_token));
+        let key = grant.key;
         Arc::new(RefreshingToken::with_initial(delegated, move || {
             let control_plane = control_plane.clone();
             let refresh_token = Arc::clone(&refresh_token);
             let actor = Arc::clone(&actor);
+            let key = key.clone();
             async move {
-                let scope_token = control_plane.refresh(&refresh_token).await?;
-                actor
-                    .delegate(&scope_token)
-                    .await
-                    .map_err(|refused| match refused {
-                        Refused::Unavailable(err) => err,
-                        other => anyhow::anyhow!("delegate the refreshed token: {other:?}"),
-                    })
+                let scope_token = control_plane.refresh(&key, &refresh_token).await?;
+                let delegated =
+                    actor
+                        .delegate(&scope_token)
+                        .await
+                        .map_err(|refused| match refused {
+                            Refused::Unavailable(err) => err,
+                            other => anyhow::anyhow!("delegate the refreshed token: {other:?}"),
+                        })?;
+                control_plane
+                    .rejoin
+                    .refreshed(&key, &scope_token, Some(&delegated), now());
+                Ok(delegated)
             }
         }))
     }
@@ -583,6 +726,8 @@ mod tests {
         /// Bodies the gateway's own exchanges answer 403 with before they
         /// succeed.
         gateway_refusals: Mutex<Vec<&'static str>>,
+        /// Statuses `/token/refresh` answers with before it succeeds.
+        refresh_refusals: Mutex<Vec<StatusCode>>,
         exchanges: AtomicUsize,
         /// `exp` of the gateway tokens the exchange mints.
         gateway_exp: AtomicU64,
@@ -642,10 +787,13 @@ mod tests {
                 post(
                     |State(fake): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                         fake.record("refresh", &headers, &body);
-                        Json(json!({
+                        if let Some(status) = fake.refresh_refusals.lock().unwrap().pop() {
+                            return Err(status);
+                        }
+                        Ok(Json(json!({
                             "felix_token": jwt(json!({ "sub": "ana", "exp": now() + 900, "n": 2 })),
                             "refresh_token": "r2",
-                        }))
+                        })))
                     },
                 ),
             )
@@ -671,7 +819,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
-        ControlPlane::new(&format!("http://{addr}"), "t")
+        ControlPlane::new(&format!("http://{addr}"), "t", Duration::from_secs(900))
     }
 
     /// A user's exchange: the next refusal, or a token holding every
@@ -700,7 +848,7 @@ mod tests {
             })
             .collect();
         Ok(Json(json!({
-            "felix_token": jwt(json!({ "sub": "ana", "perms": perms })),
+            "felix_token": jwt(json!({ "sub": "ana", "perms": perms, "exp": now() + 900 })),
             "refresh_token": "r1",
         })))
     }
@@ -749,9 +897,11 @@ mod tests {
         let (fake, control_plane, actor, _) = actor("refresh", now() + 3600).await;
         let grant = Grant {
             felix_token: "ana-scope-token".into(),
-            refresh_token: "r1".into(),
+            refresh_token: Some("r1".into()),
             principal: "ana".into(),
             missing: vec![],
+            key: "k".into(),
+            delegated: None,
         };
         // Already expired, so the first use refreshes.
         let initial = jwt(json!({ "sub": "ana", "iat": now() - 900, "exp": now() - 1 }));
@@ -959,5 +1109,358 @@ mod tests {
                 .await,
             Err(Refused::Unavailable(_))
         ));
+    }
+
+    /// An ID token that is good for `seconds` more.
+    fn id_token(seconds: u64, who: &str) -> String {
+        jwt(json!({ "sub": who, "exp": now() + seconds }))
+    }
+
+    /// The same control plane's client, pointed at an address nobody listens on.
+    async fn taken_down(control_plane: &ControlPlane) -> ControlPlane {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        ControlPlane {
+            url,
+            ..control_plane.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_sign_in_rejoins_while_the_control_plane_is_down() {
+        let (_, control_plane, _, _) = actor("rejoin", now() + 3600).await;
+        let scope = lobby();
+        let id = id_token(600, "ana");
+        let first = control_plane.exchange(&id, &scope, None).await.unwrap();
+
+        let down = taken_down(&control_plane).await;
+        let again = down.exchange(&id, &scope, None).await.unwrap();
+        assert_eq!(again.felix_token, first.felix_token);
+        assert_eq!(again.principal, "ana");
+        assert!(
+            again.refresh_token.is_none(),
+            "a kept grant cannot be renewed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_sign_in_is_refused_at_once_while_the_control_plane_is_down() {
+        let (_, control_plane, _, _) = actor("new-sign-in", now() + 3600).await;
+        let scope = lobby();
+        control_plane
+            .exchange(&id_token(600, "ana"), &scope, None)
+            .await
+            .unwrap();
+
+        let down = taken_down(&control_plane).await;
+        let started = std::time::Instant::now();
+        // Another ID token, even for the same person, has not been validated.
+        let Err(Refused::Unavailable(err)) =
+            down.exchange(&id_token(601, "ana"), &scope, None).await
+        else {
+            panic!("a new sign-in needs the control plane");
+        };
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            format!("{err:#}").contains("new sign-ins wait for the control plane"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kept_grant_is_for_one_scope() {
+        let (_, control_plane, _, _) = actor("one-scope", now() + 3600).await;
+        let id = id_token(600, "ana");
+        control_plane.exchange(&id, &lobby(), None).await.unwrap();
+        let other = crate::scope::tests::lobby_named("other");
+
+        let down = taken_down(&control_plane).await;
+        assert!(matches!(
+            down.exchange(&id, &other, None).await,
+            Err(Refused::Unavailable(_))
+        ));
+        assert!(down.exchange(&id, &lobby(), None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_from_the_control_plane_ends_reuse() {
+        let (fake, control_plane, _, _) = actor("revoked", now() + 3600).await;
+        let scope = lobby();
+        let id = id_token(600, "ana");
+        control_plane.exchange(&id, &scope, None).await.unwrap();
+
+        fake.user_refusals
+            .lock()
+            .unwrap()
+            .push((StatusCode::FORBIDDEN, "forbidden"));
+        assert!(matches!(
+            control_plane.exchange(&id, &scope, None).await,
+            Err(Refused::Forbidden)
+        ));
+
+        let down = taken_down(&control_plane).await;
+        assert!(matches!(
+            down.exchange(&id, &scope, None).await,
+            Err(Refused::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_a_bad_gateway_unavailable_or_timeout_counts_as_unreachable() {
+        let (fake, control_plane, _, _) = actor("5xx", now() + 3600).await;
+        let scope = lobby();
+        let id = id_token(600, "ana");
+        control_plane.exchange(&id, &scope, None).await.unwrap();
+
+        fake.user_refusals
+            .lock()
+            .unwrap()
+            .push((StatusCode::SERVICE_UNAVAILABLE, "unavailable"));
+        assert!(control_plane.exchange(&id, &scope, None).await.is_ok());
+
+        // Other answers are the control plane's own, so they open no fallback,
+        // and one that is not a decision about the person keeps what is kept.
+        for status in [StatusCode::CONFLICT, StatusCode::INTERNAL_SERVER_ERROR] {
+            fake.user_refusals.lock().unwrap().push((status, "failed"));
+            assert!(
+                matches!(
+                    control_plane.exchange(&id, &scope, None).await,
+                    Err(Refused::Unavailable(_))
+                ),
+                "{status}"
+            );
+        }
+        let down = taken_down(&control_plane).await;
+        assert!(down.exchange(&id, &scope, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_session_that_rejoined_on_a_kept_grant_cannot_refresh() {
+        let (_, control_plane, _, _) = actor("no-refresh", now() + 3600).await;
+        let scope = lobby();
+        let id = id_token(600, "ana");
+        control_plane.exchange(&id, &scope, None).await.unwrap();
+        let down = taken_down(&control_plane).await;
+        let grant = down.exchange(&id, &scope, None).await.unwrap();
+        let tokens = down.tokens(Grant {
+            felix_token: jwt(json!({ "sub": "ana", "exp": now() - 1 })),
+            ..grant
+        });
+        let err = tokens.token().await.unwrap_err();
+        assert!(format!("{err:#}").contains("cannot be renewed"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_extends_what_a_rejoin_may_use() {
+        let (_, control_plane, _, _) = actor("refresh-extends", now() + 3600).await;
+        let scope = lobby();
+        let id = id_token(600, "ana");
+        let grant = control_plane.exchange(&id, &scope, None).await.unwrap();
+        let first = grant.felix_token.clone();
+        let tokens = control_plane.tokens(Grant {
+            felix_token: jwt(json!({ "sub": "ana", "exp": now() - 1 })),
+            ..grant
+        });
+        let refreshed = tokens.token().await.unwrap();
+
+        let down = taken_down(&control_plane).await;
+        let again = down.exchange(&id, &scope, None).await.unwrap();
+        assert_eq!(again.felix_token, refreshed);
+        assert_ne!(again.felix_token, first);
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_ends_reuse_but_a_failed_one_does_not() {
+        let (fake, control_plane, _, _) = actor("refresh-refused", now() + 3600).await;
+        let scope = lobby();
+        let id = id_token(600, "ana");
+        let grant = control_plane.exchange(&id, &scope, None).await.unwrap();
+        let expired = || jwt(json!({ "sub": "ana", "exp": now() - 1 }));
+        let refresh = |grant: &Grant| Grant {
+            felix_token: expired(),
+            refresh_token: Some("r1".into()),
+            principal: "ana".into(),
+            missing: vec![],
+            key: grant.key.clone(),
+            delegated: None,
+        };
+        let down = taken_down(&control_plane).await;
+
+        fake.refresh_refusals
+            .lock()
+            .unwrap()
+            .push(StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(control_plane.tokens(refresh(&grant)).token().await.is_err());
+        assert!(down.exchange(&id, &scope, None).await.is_ok());
+
+        fake.refresh_refusals
+            .lock()
+            .unwrap()
+            .push(StatusCode::FORBIDDEN);
+        assert!(control_plane.tokens(refresh(&grant)).token().await.is_err());
+        assert!(matches!(
+            down.exchange(&id, &scope, None).await,
+            Err(Refused::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_ends_reuse_in_every_scope_the_id_token_held() {
+        let (fake, control_plane, _, _) = actor("every-scope", now() + 3600).await;
+        let id = id_token(600, "ana");
+        let other_scope = crate::scope::tests::lobby_named("other");
+        control_plane.exchange(&id, &lobby(), None).await.unwrap();
+        control_plane
+            .exchange(&id, &other_scope, None)
+            .await
+            .unwrap();
+        let someone_else = id_token(601, "bob");
+        control_plane
+            .exchange(&someone_else, &lobby(), None)
+            .await
+            .unwrap();
+
+        fake.user_refusals
+            .lock()
+            .unwrap()
+            .push((StatusCode::FORBIDDEN, "forbidden"));
+        assert!(control_plane.exchange(&id, &lobby(), None).await.is_err());
+
+        let down = taken_down(&control_plane).await;
+        assert!(down.exchange(&id, &other_scope, None).await.is_err());
+        assert!(down.exchange(&someone_else, &lobby(), None).await.is_ok());
+    }
+
+    #[test]
+    fn an_exchange_that_began_before_a_refusal_is_not_kept() {
+        let scope = lobby();
+        let rejoin = Rejoin::new(Duration::from_secs(900));
+        let key = Rejoin::key("id", &scope);
+        let grant = Grant {
+            felix_token: jwt(json!({ "sub": "ana", "exp": 10_000 })),
+            refresh_token: Some("r".into()),
+            principal: "ana".into(),
+            missing: vec![],
+            key: String::new(),
+            delegated: None,
+        };
+        let id = jwt(json!({ "exp": 10_000 }));
+        let began = rejoin.forgotten();
+        rejoin.forget(&key);
+        rejoin.remember(&key, &id, &grant, 1_000, began);
+        assert_eq!(rejoin.len(), 0);
+        rejoin.remember(&key, &id, &grant, 1_000, rejoin.forgotten());
+        assert_eq!(rejoin.len(), 1);
+    }
+
+    #[test]
+    fn a_kept_grant_is_capped_from_when_it_was_issued() {
+        let scope = lobby();
+        let rejoin = Rejoin::new(Duration::from_secs(100));
+        let key = Rejoin::key("id", &scope);
+        let grant = Grant {
+            felix_token: jwt(json!({ "sub": "ana", "exp": 10_000 })),
+            refresh_token: Some("r".into()),
+            principal: "ana".into(),
+            missing: vec![],
+            key: String::new(),
+            delegated: None,
+        };
+        rejoin.remember(
+            &key,
+            &jwt(json!({ "exp": 10_000 })),
+            &grant,
+            1_000,
+            rejoin.forgotten(),
+        );
+        assert!(rejoin.recall(&key, 1_060).is_some());
+        assert!(
+            rejoin
+                .recall(&key, 1_100 - rejoin::MIN_REMAINING + 1)
+                .is_none()
+        );
+
+        // A refresh re-checks the person, so the cap counts from it.
+        rejoin.remember(
+            &key,
+            &jwt(json!({ "exp": 10_000 })),
+            &grant,
+            1_000,
+            rejoin.forgotten(),
+        );
+        rejoin.refreshed(&key, &grant.felix_token, None, 1_090);
+        assert!(rejoin.recall(&key, 1_150).is_some());
+        assert!(
+            rejoin
+                .recall(&key, 1_190 - rejoin::MIN_REMAINING + 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_kept_grant_is_good_until_the_earlier_of_its_two_expiries() {
+        let scope = lobby();
+        let rejoin = Rejoin::new(Duration::from_secs(900));
+        let grant = |felix_exp| Grant {
+            felix_token: jwt(json!({ "sub": "ana", "exp": felix_exp })),
+            refresh_token: Some("r".into()),
+            principal: "ana".into(),
+            missing: vec![],
+            key: String::new(),
+            delegated: None,
+        };
+        let id = |exp| jwt(json!({ "exp": exp }));
+        let key = Rejoin::key("id", &scope);
+        let at = 1_000;
+
+        rejoin.remember(
+            &key,
+            &id(at + 500),
+            &grant(at + 900),
+            at,
+            rejoin.forgotten(),
+        );
+        assert!(
+            rejoin.recall(&key, at + 400).is_some(),
+            "the ID token ends first"
+        );
+        assert!(
+            rejoin
+                .recall(&key, at + 500 - rejoin::MIN_REMAINING + 1)
+                .is_none()
+        );
+
+        rejoin.remember(
+            &key,
+            &id(at + 900),
+            &grant(at + 500),
+            at,
+            rejoin.forgotten(),
+        );
+        assert!(
+            rejoin.recall(&key, at + 400).is_some(),
+            "the Felix token ends first"
+        );
+        assert!(
+            rejoin
+                .recall(&key, at + 500 - rejoin::MIN_REMAINING + 1)
+                .is_none()
+        );
+
+        rejoin.remember(
+            &key,
+            &jwt(json!({})),
+            &grant(at + 500),
+            at,
+            rejoin.forgotten(),
+        );
+        assert_eq!(rejoin.len(), 0, "an ID token with no expiry is never kept");
+        let no_exp = Grant {
+            felix_token: jwt(json!({ "sub": "ana" })),
+            ..grant(0)
+        };
+        rejoin.remember(&key, &id(at + 500), &no_exp, at, rejoin.forgotten());
+        assert_eq!(rejoin.len(), 0, "nor is a Felix token with none");
     }
 }
