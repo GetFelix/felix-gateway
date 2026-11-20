@@ -1219,13 +1219,24 @@ pub(crate) async fn connect(
             .await
             .map(|client| Felix::new(client, &gateway.brokers, scope, principal)),
         Some(shared) => {
-            let delegated =
-                shared.actor.delegate(&grant.felix_token).await.map_err(
-                    |refusal| match refusal {
-                        Refused::Unavailable(err) => error(ErrorCode::Unavailable, err),
-                        _ => error(ErrorCode::Unavailable, "the gateway cannot act for you"),
-                    },
-                )?;
+            let delegated = match grant.delegated.clone() {
+                Some(delegated) => delegated,
+                None => {
+                    let delegated =
+                        shared
+                            .actor
+                            .delegate(&grant.felix_token)
+                            .await
+                            .map_err(|refusal| match refusal {
+                                Refused::Unavailable(err) => error(ErrorCode::Unavailable, err),
+                                _ => {
+                                    error(ErrorCode::Unavailable, "the gateway cannot act for you")
+                                }
+                            })?;
+                    gateway.control_plane.remember_delegated(&grant, &delegated);
+                    delegated
+                }
+            };
             let tokens =
                 gateway
                     .control_plane

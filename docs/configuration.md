@@ -308,6 +308,48 @@ so a person within the gateway's rates can still get `publish_failed` or
 `subscribe_failed` from the broker. Without shared connections each session's
 own connection has the broker's per-connection limits.
 
+## When the control plane is down
+
+Every join exchanges the browser's ID token at the control plane for a Felix
+token narrowed to the scope. The brokers keep serving without the control
+plane, so the gateway lets a session that signed in before rejoin through an
+outage instead of waiting for it.
+
+When the control plane cannot be reached (no connection in 3 seconds, no
+answer in 10, or a 5xx), a join is handled this way:
+
+- The same ID token for the same scope (and namespace) that the control plane
+  accepted earlier gets the Felix token it was given then, as long as that
+  token and the ID token each have at least 30 seconds left. The gateway
+  keeps a SHA-256 of the ID token, never the token.
+- Any other join is refused at once with `unavailable` and the message
+  "new sign-ins wait for the control plane". A new person, a new scope, or an
+  ID token the gateway has not seen succeed does not get in this way: nothing
+  is granted that the control plane had not already granted.
+- A session that rejoined this way cannot renew its Felix token, so it ends
+  when the token does. The browser's next join is refused if the control plane
+  is still down.
+
+Any answer from the control plane, a refusal included, replaces what the
+gateway kept, so reuse stops the moment the control plane can say no. The
+kept token is renewed each time a session refreshes its own, which re-checks
+the person's permissions.
+
+**How long a revoked person can keep rejoining.** Only while the control
+plane is unreachable, and no longer than the earlier of two times: the expiry
+of the Felix token the gateway last got for that sign-in, and the expiry of
+the ID token. After a successful exchange or refresh that is the Felix
+token's whole lifetime, as set by the control plane, at most. A person
+removed while the control plane is down can therefore rejoin for up to that
+long, and a session already open keeps working for that long regardless,
+because the brokers accept the token until it expires. If the control plane
+is reachable, a removal takes effect at the next join or refresh, as before.
+
+The gateway keeps up to 10,000 of these in memory. A restart forgets them, so
+a gateway that restarts during an outage refuses every join until the control
+plane returns. With shared connections the delegated token is kept the same
+way.
+
 ## Felix permissions
 
 Each action needs one Felix permission on the resource:

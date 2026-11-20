@@ -503,8 +503,12 @@ pub(crate) mod tests {
     "#;
 
     pub(crate) fn lobby() -> Scope {
+        lobby_named("lobby")
+    }
+
+    pub(crate) fn lobby_named(value: &str) -> Scope {
         let config = Arc::new(ScopeConfig::parse(EXAMPLE).unwrap());
-        Scope::parse(&config, "default", "lobby").unwrap()
+        Scope::parse(&config, "default", value).unwrap()
     }
 
     #[test]
