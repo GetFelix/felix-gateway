@@ -1,1 +1,0 @@
-- Built on and tested against Felix 0.7.3: felix-client and felix-wire 0.7.3, and the dev stack runs the 0.7.3 images. Idempotent producers resume about 8.5 s after a leader election without the control plane, instead of 18 to 36 s.
